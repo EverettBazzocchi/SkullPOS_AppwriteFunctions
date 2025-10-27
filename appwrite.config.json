@@ -1,0 +1,103 @@
+{
+	"projectId": "68f2ac7b00002e7563a8",
+	"projectName": "Skullbar",
+	"settings": {
+		"services": {
+			"account": true,
+			"avatars": true,
+			"databases": true,
+			"locale": true,
+			"health": true,
+			"storage": true,
+			"teams": true,
+			"users": true,
+			"sites": true,
+			"functions": true,
+			"graphql": true,
+			"messaging": true
+		},
+		"auth": {
+			"methods": {
+				"jwt": true,
+				"phone": false,
+				"invites": false,
+				"anonymous": true,
+				"email-otp": false,
+				"magic-url": false,
+				"email-password": true
+			},
+			"security": {
+				"duration": 31536000,
+				"limit": 0,
+				"sessionsLimit": 100,
+				"passwordHistory": 0,
+				"passwordDictionary": false,
+				"personalDataCheck": false,
+				"sessionAlerts": false,
+				"mockNumbers": []
+			}
+		}
+	},
+	"functions": [
+		{
+			"$id": "68f2904a00171e8b0266",
+			"execute": [
+				"team:68e35aed00144b8cde9d",
+				"team:68ffce9a0015d2dc0b0d",
+				"team:68ffcecc0026f78f0af8"
+			],
+			"name": "stripe-getConnectionToken",
+			"enabled": true,
+			"logging": true,
+			"runtime": "node-16.0",
+			"scopes": [],
+			"events": [],
+			"schedule": "",
+			"timeout": 15,
+			"entrypoint": "src/main.js",
+			"commands": "npm i",
+			"specification": "s-1vcpu-512mb",
+			"path": "functions/stripe-getConnectionToken"
+		},
+		{
+			"$id": "68f3c860003da00f14d8",
+			"execute": [
+				"team:68e35aed00144b8cde9d",
+				"team:68ffce9a0015d2dc0b0d",
+				"team:68ffcecc0026f78f0af8"
+			],
+			"name": "Stripe-CreatePaymentIntent",
+			"enabled": true,
+			"logging": true,
+			"runtime": "node-16.0",
+			"scopes": ["users.read"],
+			"events": [],
+			"schedule": "",
+			"timeout": 15,
+			"entrypoint": "src/main.js",
+			"commands": "npm install",
+			"specification": "s-0.5vcpu-512mb",
+			"path": "functions/Stripe-CreatePaymentIntent"
+		},
+		{
+			"$id": "68f6272500160b48ee44",
+			"execute": [
+				"team:68e35aed00144b8cde9d",
+				"team:68ffce9a0015d2dc0b0d",
+				"team:68ffcecc0026f78f0af8"
+			],
+			"name": "Stripe-CancelPaymentIntent",
+			"enabled": true,
+			"logging": true,
+			"runtime": "node-16.0",
+			"scopes": ["users.read"],
+			"events": [],
+			"schedule": "",
+			"timeout": 15,
+			"entrypoint": "src/main.js",
+			"commands": "npm install",
+			"specification": "s-0.5vcpu-512mb",
+			"path": "functions/Stripe-CancelPaymentIntent"
+		}
+	]
+}
