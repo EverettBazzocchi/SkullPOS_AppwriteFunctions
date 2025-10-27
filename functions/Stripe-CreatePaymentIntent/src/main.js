@@ -9,7 +9,7 @@ export default async ({ req, res, log, error }) => {
         key = process.env.testKey;
     } else {
         log('production key used');
-        key = process.env.liveKey;
+        key = process.env.prodKey;
     }
 
     if (req.body) log(req.body);

@@ -7,7 +7,7 @@ export default async ({ req, res, log, error }) => {
     if (req.body.test && req.body.test == 'test') {
         key = process.env.testKey;
     } else {
-        key = process.env.liveKey;
+        key = process.env.prodKey;
     }
 
     if (req.body) log(req.body);
