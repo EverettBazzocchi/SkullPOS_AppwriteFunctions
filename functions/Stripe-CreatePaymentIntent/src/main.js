@@ -4,7 +4,9 @@ import Stripe from 'stripe';
 
 export default async ({ req, res, log, error }) => {
     let key;
-    if (req.body.test && req.body.test == 'test') {
+    console.log(req.body);
+    let test = JSON.parse(req.body).test;
+    if (test && test == 'test') {
         log('test key used');
         key = process.env.testKey;
     } else {
