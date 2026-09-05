@@ -1,0 +1,15 @@
+{
+  "name": "skullpos-appwrite-functions-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Test harness for the functions in ./functions -- each function still deploys independently with its own package.json; this root one exists only to run tests across all of them from one place.",
+  "scripts": {
+    "test": "jest"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.24.0",
+    "@babel/preset-env": "^7.24.0",
+    "babel-jest": "^29.7.0",
+    "jest": "^29.7.0"
+  }
+}
