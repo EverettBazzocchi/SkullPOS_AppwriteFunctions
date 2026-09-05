@@ -98,6 +98,26 @@
 			"commands": "npm install",
 			"specification": "s-0.5vcpu-512mb",
 			"path": "functions/Stripe-CancelPaymentIntent"
+		},
+		{
+			"$id": "6a9b7671df1f504a084e",
+			"execute": [
+				"team:68e35aed00144b8cde9d",
+				"team:68ffce9a0015d2dc0b0d",
+				"team:68ffcecc0026f78f0af8"
+			],
+			"name": "Stripe-RefundPayment",
+			"enabled": true,
+			"logging": true,
+			"runtime": "node-16.0",
+			"scopes": [],
+			"events": [],
+			"schedule": "",
+			"timeout": 15,
+			"entrypoint": "src/main.js",
+			"commands": "npm i",
+			"specification": "s-0.5vcpu-512mb",
+			"path": "functions/Stripe-RefundPayment"
 		}
 	]
 }
