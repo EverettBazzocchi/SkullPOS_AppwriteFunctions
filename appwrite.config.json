@@ -152,22 +152,6 @@
 			"path": "functions/Giftcard-Lookup"
 		},
 		{
-			"$id": "6a9c5c2421431904c1d0",
-			"execute": ["users"],
-			"name": "Transaction-ApplyGiftcard",
-			"enabled": true,
-			"logging": true,
-			"runtime": "node-16.0",
-			"scopes": ["documents.read", "documents.write"],
-			"events": [],
-			"schedule": "",
-			"timeout": 15,
-			"entrypoint": "src/main.js",
-			"commands": "npm i",
-			"specification": "s-0.5vcpu-512mb",
-			"path": "functions/Transaction-ApplyGiftcard"
-		},
-		{
 			"$id": "6a9c65091672e55d90b1",
 			"execute": ["users"],
 			"name": "Transaction-SetStatus",
@@ -182,22 +166,6 @@
 			"commands": "npm i",
 			"specification": "s-0.5vcpu-512mb",
 			"path": "functions/Transaction-SetStatus"
-		},
-		{
-			"$id": "6a9c6511bdde9d87944c",
-			"execute": ["users"],
-			"name": "Transaction-RecordCardPayment",
-			"enabled": true,
-			"logging": true,
-			"runtime": "node-16.0",
-			"scopes": ["documents.read", "documents.write"],
-			"events": [],
-			"schedule": "",
-			"timeout": 15,
-			"entrypoint": "src/main.js",
-			"commands": "npm i",
-			"specification": "s-0.5vcpu-512mb",
-			"path": "functions/Transaction-RecordCardPayment"
 		},
 		{
 			"$id": "6a9c687535280f239b5f",
@@ -246,6 +214,22 @@
 			"commands": "npm i",
 			"specification": "s-0.5vcpu-512mb",
 			"path": "functions/Item-SetEnabled"
+		},
+		{
+			"$id": "6a9c728a297df71f5919",
+			"execute": ["users"],
+			"name": "Transaction-RecordPayment",
+			"enabled": true,
+			"logging": true,
+			"runtime": "node-16.0",
+			"scopes": ["documents.read", "documents.write"],
+			"events": [],
+			"schedule": "",
+			"timeout": 15,
+			"entrypoint": "src/main.js",
+			"commands": "npm i",
+			"specification": "s-0.5vcpu-512mb",
+			"path": "functions/Transaction-RecordPayment"
 		}
 	]
 }

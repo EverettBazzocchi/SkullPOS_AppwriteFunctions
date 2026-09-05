@@ -1,5 +1,6 @@
 import { Databases, Users, Query } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
+import { derivePaymentLegs } from './paymentLegs.js';
 
 // Generates the sales report, server-side. The date range a caller can
 // request is clamped to the last 24 hours UNLESS the function's execution
@@ -9,6 +10,12 @@ import { createAppwriteClient } from './appwriteClient.js';
 // This is what makes the "PIN mode capped to 24h" restriction real: the
 // client has no read access to Transactions at all, so every report
 // request -- staff or not -- goes through here.
+//
+// Staff callers also get a `previous` field: the same-shape aggregate for
+// the immediately-preceding period of equal length, for the UI's
+// comparison deltas. Withheld for non-staff callers -- a delta against a
+// period further back than 24h would otherwise leak aggregate revenue
+// data the 24h clamp is supposed to hide.
 const DATABASE_ID = '67c9ffd9003d68236514';
 const TRANSACTIONS_COLLECTION_ID = '68e4cd3500179ce661c6';
 const CATEGORIES_COLLECTION_ID = '67c9ffdd0039c4e09c9a';
@@ -36,7 +43,7 @@ async function fetchAllDocuments(databases, databaseId, collectionId, extraQueri
 	return allDocuments;
 }
 
-async function isStaff(users, callerId, log, error) {
+async function isStaff(users, callerId, error) {
 	if (!callerId) return false;
 	try {
 		const result = await users.listMemberships(callerId);
@@ -65,61 +72,8 @@ function emptyReport() {
 	};
 }
 
-export default async ({ req, res, log, error }) => {
-	let body;
-	try {
-		body = JSON.parse(req.body || '{}');
-	} catch (err) {
-		return res.json({ error: 'Invalid request body' }, 400);
-	}
-
-	const client = await createAppwriteClient(req);
-	const databases = new Databases(client);
-	const users = new Users(client);
-
-	const callerId = req.headers['x-appwrite-user-id'];
-	const staff = await isStaff(users, callerId, log, error);
-
-	let endDate = body.endDate ? new Date(body.endDate) : new Date();
-	let startDate = body.startDate ? new Date(body.startDate) : null;
-
-	const earliestAllowed = new Date(endDate.getTime() - 24 * 60 * 60 * 1000);
-	if (!staff && (!startDate || startDate < earliestAllowed)) {
-		startDate = earliestAllowed;
-	}
-
-	const startIso = (startDate || new Date(0)).toISOString();
-	const endIso = endDate.toISOString();
-	const test = !!body.test;
-
-	const transactions = await fetchAllDocuments(databases, DATABASE_ID, TRANSACTIONS_COLLECTION_ID, [
-		Query.equal('status', 'complete'),
-		test ? Query.equal('testing', true) : Query.notEqual('testing', true),
-		Query.greaterThanEqual('$createdAt', startIso),
-		Query.lessThanEqual('$createdAt', endIso),
-	]);
-
-	const categories = await fetchAllDocuments(databases, DATABASE_ID, CATEGORIES_COLLECTION_ID);
-	const categoriesById = {};
-	categories.forEach((c) => {
-		categoriesById[c.$id] = c;
-	});
-
-	let ingredientCostById = {};
-	try {
-		const ingredientDocs = await fetchAllDocuments(databases, DATABASE_ID, INGREDIENTS_COLLECTION_ID);
-		ingredientDocs.forEach((ing) => {
-			const caseQty = ing.case_qty || 1;
-			const contQty = ing.cont_qty || 1;
-			ingredientCostById[ing.$id] = (ing.case_cost || 0) / (caseQty * contQty);
-		});
-	} catch (err) {
-		error('Error getting ingredients for COGS: ' + err.message);
-	}
-
-	if (transactions.length === 0) {
-		return res.json({ ...emptyReport(), restricted: !staff });
-	}
+function buildReport(transactions, categoriesById, ingredientCostById) {
+	if (transactions.length === 0) return emptyReport();
 
 	let ItemsSold = [],
 		totalSales = 0,
@@ -190,19 +144,22 @@ export default async ({ req, res, log, error }) => {
 		});
 
 		totalSales += (item.total || 0) + (item.discount || 0);
-		amountPaid += item.payment_due || 0;
 		tips += item.tip || 0;
 		discountAmount += item.discount || 0;
-		giftcardAmount += item.giftcard_amount || 0;
 
-		if (item.payment_method === 'cash') {
-			cashAmount += item.payment_due || 0;
-		} else {
-			cardAmount += item.payment_due || 0;
-		}
+		// Bucket by payment leg rather than the whole transaction's single
+		// payment_method -- a split sale (cash+card, giftcard+card, etc.)
+		// has amounts in more than one bucket.
+		derivePaymentLegs(item).forEach((leg) => {
+			const amount = parseInt(leg.amount) || 0;
+			amountPaid += amount;
+			if (leg.method === 'cash') cashAmount += amount;
+			else if (leg.method === 'stripe') cardAmount += amount;
+			else if (leg.method === 'giftcard') giftcardAmount += amount;
+		});
 	});
 
-	return res.json({
+	return {
 		ItemsSold,
 		totalSales,
 		tips,
@@ -216,6 +173,78 @@ export default async ({ req, res, log, error }) => {
 		foodAmount,
 		nonAlcoholicDrinksAmount,
 		otherAmountSold,
-		restricted: !staff,
+	};
+}
+
+export default async ({ req, res, log, error }) => {
+	let body;
+	try {
+		body = JSON.parse(req.body || '{}');
+	} catch (err) {
+		return res.json({ error: 'Invalid request body' }, 400);
+	}
+
+	const client = await createAppwriteClient(req);
+	const databases = new Databases(client);
+	const users = new Users(client);
+
+	const callerId = req.headers['x-appwrite-user-id'];
+	const staff = await isStaff(users, callerId, error);
+
+	let endDate = body.endDate ? new Date(body.endDate) : new Date();
+	let startDate = body.startDate ? new Date(body.startDate) : null;
+	const hadBoundedStart = !!startDate;
+
+	const earliestAllowed = new Date(endDate.getTime() - 24 * 60 * 60 * 1000);
+	if (!staff && (!startDate || startDate < earliestAllowed)) {
+		startDate = earliestAllowed;
+	}
+
+	const startIso = (startDate || new Date(0)).toISOString();
+	const endIso = endDate.toISOString();
+	const test = !!body.test;
+
+	const categories = await fetchAllDocuments(databases, DATABASE_ID, CATEGORIES_COLLECTION_ID);
+	const categoriesById = {};
+	categories.forEach((c) => {
+		categoriesById[c.$id] = c;
 	});
+
+	let ingredientCostById = {};
+	try {
+		const ingredientDocs = await fetchAllDocuments(databases, DATABASE_ID, INGREDIENTS_COLLECTION_ID);
+		ingredientDocs.forEach((ing) => {
+			const caseQty = ing.case_qty || 1;
+			const contQty = ing.cont_qty || 1;
+			ingredientCostById[ing.$id] = (ing.case_cost || 0) / (caseQty * contQty);
+		});
+	} catch (err) {
+		error('Error getting ingredients for COGS: ' + err.message);
+	}
+
+	async function fetchTransactionsInRange(startI, endI) {
+		return fetchAllDocuments(databases, DATABASE_ID, TRANSACTIONS_COLLECTION_ID, [
+			Query.equal('status', 'complete'),
+			test ? Query.equal('testing', true) : Query.notEqual('testing', true),
+			Query.greaterThanEqual('$createdAt', startI),
+			Query.lessThanEqual('$createdAt', endI),
+		]);
+	}
+
+	const transactions = await fetchTransactionsInRange(startIso, endIso);
+	const current = buildReport(transactions, categoriesById, ingredientCostById);
+
+	// Comparison period: staff only, and only when the request actually
+	// had a bounded start (an "All Time" request has no equal-length prior
+	// period to compare against).
+	let previous = null;
+	if (staff && hadBoundedStart) {
+		const rangeMs = endDate.getTime() - startDate.getTime();
+		const prevEnd = new Date(startDate.getTime());
+		const prevStart = new Date(startDate.getTime() - rangeMs);
+		const prevTransactions = await fetchTransactionsInRange(prevStart.toISOString(), prevEnd.toISOString());
+		previous = buildReport(prevTransactions, categoriesById, ingredientCostById);
+	}
+
+	return res.json({ ...current, previous, restricted: !staff });
 };

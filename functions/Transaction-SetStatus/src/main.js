@@ -1,19 +1,21 @@
 import { Databases } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
 
-// Sets a pending transaction's status to "complete" (cash payment
-// confirmed) or "cancelled" (staff cancelled an in-progress card attempt).
-// Never accepts "refunded" -- that's exclusively Stripe-RefundPayment's job
-// -- and only transitions out of "pending", so this can't be replayed
-// against an already-finalized transaction. The client has no write access
-// to Transactions at all (see the POS PIN-system security plan), which is
+// Sets a pending transaction's status to "cancelled" -- staff cancelling
+// an in-progress card attempt. "complete" is no longer reached here: a
+// sale (cash, card, giftcard, or any split of those) is completed by
+// Transaction-RecordPayment once its payment_due reaches 0. Never accepts
+// "refunded" -- that's exclusively Stripe-RefundPayment's job -- and only
+// transitions out of "pending", so this can't be replayed against an
+// already-finalized transaction. The client has no write access to
+// Transactions at all (see the POS PIN-system security plan), which is
 // what makes "no refunds in quick-access PIN mode" a real restriction
 // rather than a client-side flag: a cash-paid transaction can't be marked
 // refunded except through Stripe-RefundPayment, whose execute permission
 // is staff-team-only.
 const DATABASE_ID = '67c9ffd9003d68236514';
 const TRANSACTIONS_COLLECTION_ID = '68e4cd3500179ce661c6';
-const ALLOWED_STATUSES = ['complete', 'cancelled'];
+const ALLOWED_STATUSES = ['cancelled'];
 
 export default async ({ req, res, log, error }) => {
 	let body;

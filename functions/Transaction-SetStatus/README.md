@@ -1,10 +1,12 @@
 # Transaction-SetStatus
 
-Sets a pending transaction to `"complete"` (cash payment confirmed) or
-`"cancelled"` (staff cancelled an in-progress card attempt). Never accepts
-`"refunded"` -- that's exclusively `Stripe-RefundPayment`'s job -- and only
-transitions out of `"pending"`, so it can't be replayed against an
-already-finalized transaction.
+Sets a pending transaction to `"cancelled"` -- staff cancelling an
+in-progress card attempt. `"complete"` is no longer reached here: a sale
+(cash, card, giftcard, or any split of those) is completed by
+`Transaction-RecordPayment` once its `payment_due` reaches 0. Never
+accepts `"refunded"` -- that's exclusively `Stripe-RefundPayment`'s job --
+and only transitions out of `"pending"`, so it can't be replayed against
+an already-finalized transaction.
 
 The client has no write access to Transactions at all (see the POS
 PIN-system security plan), which is what makes "no refunds in quick-access
@@ -15,15 +17,13 @@ whose execute permission is staff-team-only.
 ## Request body
 
 ```json
-{ "transactionId": "...", "status": "complete" }
+{ "transactionId": "...", "status": "cancelled" }
 ```
-
-`status` must be `"complete"` or `"cancelled"`.
 
 ## Response
 
-`{ "ok": true, "status": "complete" }` or `{ "error": "<message>" }` with a
-4xx/5xx status.
+`{ "ok": true, "status": "cancelled" }` or `{ "error": "<message>" }` with
+a 4xx/5xx status.
 
 ## Configuration
 

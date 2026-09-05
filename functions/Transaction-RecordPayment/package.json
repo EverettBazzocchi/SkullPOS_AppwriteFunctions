@@ -1,5 +1,5 @@
 {
-  "name": "transaction-recordcardpayment",
+  "name": "transaction-recordpayment",
   "version": "1.0.0",
   "description": "",
   "main": "src/main.js",
