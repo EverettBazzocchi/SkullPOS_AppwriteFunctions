@@ -1,0 +1,14 @@
+{
+  "name": "verify-pin",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/main.js",
+  "type": "module",
+  "scripts": {
+    "format": "prettier --write ."
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "prettier": "^3.2.5"
+  }
+}
