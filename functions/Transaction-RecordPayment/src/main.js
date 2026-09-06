@@ -167,7 +167,15 @@ export default async ({ req, res, log, error }) => {
 	// failed, or rolled back, over a notification issue.
 	if (transaction.channel === 'membership' && newStatus === 'complete') {
 		try {
+			// Same testing-flag switch already used for the Stripe key above --
+			// a testing:true transaction (self-checkout is always run this way
+			// during development) notifies the test recipient, never finance's
+			// real inbox.
+			const financeRecipient = transaction.testing
+				? process.env.FINANCE_NOTIFICATION_EMAIL_TEST
+				: process.env.FINANCE_NOTIFICATION_EMAIL_PROD;
 			await notifyFinanceOfMembershipPayment({
+				to: financeRecipient,
 				name: transaction.member_name,
 				email: transaction.member_email,
 				amount: transaction.total,
@@ -181,7 +189,7 @@ export default async ({ req, res, log, error }) => {
 	return res.json({ ok: true, remaining: newPaymentDue, status: newStatus });
 };
 
-async function notifyFinanceOfMembershipPayment({ name, email, amount, date }) {
+async function notifyFinanceOfMembershipPayment({ to, name, email, amount, date }) {
 	const amountStr = new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(
 		(parseInt(amount) || 0) / 100,
 	);
@@ -193,7 +201,7 @@ async function notifyFinanceOfMembershipPayment({ name, email, amount, date }) {
 		},
 		body: JSON.stringify({
 			from: 'SkullPOS <receipts@mail.shotty.tech>',
-			to: [process.env.FINANCE_NOTIFICATION_EMAIL],
+			to: [to],
 			subject: `Membership dues paid: ${name || 'unknown member'}`,
 			html: `<p>A membership dues payment was just completed.</p>
 				<ul>

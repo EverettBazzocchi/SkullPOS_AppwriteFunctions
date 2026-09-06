@@ -25,7 +25,8 @@ describe("Transaction-RecordPayment", () => {
 		process.env.testKey = "sk_test_fake";
 		process.env.prodKey = "sk_live_fake";
 		process.env.RESEND_API_KEY = "re_test_key";
-		process.env.FINANCE_NOTIFICATION_EMAIL = "everett.bazzocchi@skullspace.ca";
+		process.env.FINANCE_NOTIFICATION_EMAIL_TEST = "everett.bazzocchi@skullspace.ca";
+		process.env.FINANCE_NOTIFICATION_EMAIL_PROD = "finance@skullspace.ca";
 	});
 
 	describe("cash legs", () => {
@@ -319,6 +320,23 @@ describe("Transaction-RecordPayment", () => {
 			expect(sentBody.to).toEqual(["everett.bazzocchi@skullspace.ca"]);
 			expect(sentBody.html).toContain("Jane Member");
 			expect(sentBody.html).toContain("jane@example.com");
+		});
+
+		test("a non-testing membership payment notifies finance's real address, not the test one", async () => {
+			mockDatabases.getDocument.mockResolvedValue(
+				baseTransaction({ channel: "membership", testing: false, total: 4000 }),
+			);
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockFetch.mockResolvedValue({ ok: true, text: () => Promise.resolve("{}") });
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+			});
+
+			await handler(ctx);
+
+			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+			expect(sentBody.to).toEqual(["finance@skullspace.ca"]);
 		});
 
 		test("a partial membership leg (still pending) does not notify finance yet", async () => {

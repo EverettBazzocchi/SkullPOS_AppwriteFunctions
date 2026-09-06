@@ -57,13 +57,18 @@ that (not just the kiosk never offering another button).
 ## Membership dues notification
 
 When a leg completes a transaction with `channel: "membership"`, this
-function automatically emails `FINANCE_NOTIFICATION_EMAIL` (via Resend's
-HTTP API, same pattern as `Transaction-EmailReceipt`) with the payer's
-name/email (from the transaction's `member_name`/`member_email` fields),
-the amount, and the date. Fires as a direct consequence of the payment
-completing here, not a separate client-triggered call -- and never fails
-the payment response if the notification itself fails to send (logged
-only; the payment already succeeded).
+function automatically emails finance (via Resend's HTTP API, same
+pattern as `Transaction-EmailReceipt`) with the payer's name/email (from
+the transaction's `member_name`/`member_email` fields), the amount, and
+the date. Fires as a direct consequence of the payment completing here,
+not a separate client-triggered call -- and never fails the payment
+response if the notification itself fails to send (logged only; the
+payment already succeeded).
+
+The recipient depends on the transaction's own `testing` flag -- same
+switch already used for the Stripe key above -- so a `testing:true` sale
+(the default on localhost/self-checkout during development) never
+notifies finance's real inbox.
 
 ## Configuration
 
@@ -80,8 +85,10 @@ only; the payment already succeeded).
 - `testKey` - Stripe test-mode secret key (only used for `method: "stripe"`)
 - `prodKey` - Stripe live-mode secret key
 - `RESEND_API_KEY` - Resend API key (same one used by `Transaction-EmailReceipt`)
-- `FINANCE_NOTIFICATION_EMAIL` - where membership-dues payment notifications go
-  (set to a test address until this is ready for production)
+- `FINANCE_NOTIFICATION_EMAIL_TEST` - where membership-dues notifications go for
+  a `testing:true` transaction
+- `FINANCE_NOTIFICATION_EMAIL_PROD` - where they go for a real (non-testing)
+  transaction -- finance's actual inbox
 
 ## Note on calling Appwrite's own API from within a function
 
