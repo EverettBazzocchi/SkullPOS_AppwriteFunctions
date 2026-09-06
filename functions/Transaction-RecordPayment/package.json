@@ -9,7 +9,8 @@
   },
   "dependencies": {
     "node-appwrite": "^14.1.0",
-    "stripe": "^19.1.0"
+    "stripe": "^19.1.0",
+    "node-fetch": "^3.3.2"
   },
   "devDependencies": {
     "prettier": "^3.2.5"

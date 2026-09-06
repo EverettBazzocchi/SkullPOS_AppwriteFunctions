@@ -4,6 +4,7 @@ jest.mock("./appwriteClient.js", () => ({
 
 const { mockDatabases, resetAppwriteMocks } = require("node-appwrite");
 const { mockStripe, resetStripeMocks } = require("stripe");
+const mockFetch = require("node-fetch");
 const handler = require("./main.js").default;
 const { makeContext } = require("../../../test/helpers/handlerContext");
 
@@ -20,8 +21,11 @@ describe("Transaction-RecordPayment", () => {
 	beforeEach(() => {
 		resetAppwriteMocks();
 		resetStripeMocks();
+		mockFetch.mockReset();
 		process.env.testKey = "sk_test_fake";
 		process.env.prodKey = "sk_live_fake";
+		process.env.RESEND_API_KEY = "re_test_key";
+		process.env.FINANCE_NOTIFICATION_EMAIL = "everett.bazzocchi@skullspace.ca";
 	});
 
 	describe("cash legs", () => {
@@ -262,6 +266,101 @@ describe("Transaction-RecordPayment", () => {
 			const result = await handler(ctx);
 
 			expect(result.body.ok).toBe(true);
+		});
+	});
+
+	describe("membership dues channel", () => {
+		test("rejects a cash leg against a membership transaction", async () => {
+			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "membership" }));
+			const ctx = makeContext({ body: { transactionId: "t1", method: "cash", amount: 1000 } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(/only be paid by card/i);
+		});
+
+		test("rejects a giftcard leg against a membership transaction", async () => {
+			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "membership" }));
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "giftcard", amount: 1000, giftcardId: "gc1" },
+			});
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(/only be paid by card/i);
+		});
+
+		test("a completed membership stripe leg automatically notifies finance", async () => {
+			mockDatabases.getDocument.mockResolvedValue(
+				baseTransaction({
+					channel: "membership",
+					total: 4000,
+					member_name: "Jane Member",
+					member_email: "jane@example.com",
+				}),
+			);
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockFetch.mockResolvedValue({ ok: true, text: () => Promise.resolve("{}") });
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+			});
+
+			const result = await handler(ctx);
+
+			expect(result.body).toEqual({ ok: true, remaining: 0, status: "complete" });
+			expect(mockFetch).toHaveBeenCalledWith(
+				"https://api.resend.com/emails",
+				expect.objectContaining({ method: "POST" }),
+			);
+			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+			expect(sentBody.to).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			expect(sentBody.html).toContain("Jane Member");
+			expect(sentBody.html).toContain("jane@example.com");
+		});
+
+		test("a partial membership leg (still pending) does not notify finance yet", async () => {
+			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "membership", payment_due: 4000 }));
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+			});
+
+			const result = await handler(ctx);
+
+			expect(result.body.status).toBe("pending");
+			expect(mockFetch).not.toHaveBeenCalled();
+		});
+
+		test("a finance-notification failure does not fail the payment response", async () => {
+			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "membership", total: 1000 }));
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockFetch.mockResolvedValue({ ok: false, status: 500, text: () => Promise.resolve("resend down") });
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+			});
+
+			const result = await handler(ctx);
+
+			expect(result.body).toEqual({ ok: true, remaining: 0, status: "complete" });
+		});
+
+		test("a completed non-membership transaction never triggers the finance email", async () => {
+			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "self_checkout" }));
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+			});
+
+			const result = await handler(ctx);
+
+			expect(result.body.status).toBe("complete");
+			expect(mockFetch).not.toHaveBeenCalled();
 		});
 	});
 

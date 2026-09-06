@@ -47,6 +47,24 @@ Older transactions written before this existed have no `payments` array
 UI) fall back to synthesizing one leg from the legacy `stripe_id`/
 `giftcard_amount`/`payment_method` fields instead.
 
+## Channel-based restrictions
+
+A transaction with `channel: "self_checkout"` or `channel: "membership"`
+can only ever be paid by a `stripe` leg -- both are kiosk-originated with
+no cash/giftcard handling in their UI, and this is the real enforcement of
+that (not just the kiosk never offering another button).
+
+## Membership dues notification
+
+When a leg completes a transaction with `channel: "membership"`, this
+function automatically emails `FINANCE_NOTIFICATION_EMAIL` (via Resend's
+HTTP API, same pattern as `Transaction-EmailReceipt`) with the payer's
+name/email (from the transaction's `member_name`/`member_email` fields),
+the amount, and the date. Fires as a direct consequence of the payment
+completing here, not a separate client-triggered call -- and never fails
+the payment response if the notification itself fails to send (logged
+only; the payment already succeeded).
+
 ## Configuration
 
 | Setting     | Value                                        |
@@ -61,6 +79,9 @@ UI) fall back to synthesizing one leg from the legacy `stripe_id`/
 
 - `testKey` - Stripe test-mode secret key (only used for `method: "stripe"`)
 - `prodKey` - Stripe live-mode secret key
+- `RESEND_API_KEY` - Resend API key (same one used by `Transaction-EmailReceipt`)
+- `FINANCE_NOTIFICATION_EMAIL` - where membership-dues payment notifications go
+  (set to a test address until this is ready for production)
 
 ## Note on calling Appwrite's own API from within a function
 

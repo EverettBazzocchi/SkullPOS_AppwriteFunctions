@@ -1,5 +1,6 @@
 import Stripe from 'stripe';
 import { Databases } from 'node-appwrite';
+import fetch from 'node-fetch';
 import { createAppwriteClient } from './appwriteClient.js';
 
 // Records one payment leg (cash amount, verified card charge, or giftcard
@@ -54,11 +55,12 @@ export default async ({ req, res, log, error }) => {
 		return res.json({ error: `Transaction is not pending (status: ${transaction.status})` }, 400);
 	}
 
-	// A self-checkout kiosk sale can only ever be paid by card -- enforced
-	// here, not just by the kiosk UI never offering another option, since
-	// `channel` is only ever set at transaction-creation time and can't be
-	// overridden by a payment-leg request itself.
-	if (transaction.channel === 'self_checkout' && method !== 'stripe') {
+	// A self-checkout kiosk sale (or a membership-dues payment, also kiosk-
+	// originated) can only ever be paid by card -- enforced here, not just
+	// by the kiosk UI never offering another option, since `channel` is
+	// only ever set at transaction-creation time and can't be overridden by
+	// a payment-leg request itself.
+	if ((transaction.channel === 'self_checkout' || transaction.channel === 'membership') && method !== 'stripe') {
 		return res.json({ error: 'Self-checkout transactions can only be paid by card' }, 400);
 	}
 
@@ -156,5 +158,59 @@ export default async ({ req, res, log, error }) => {
 	}
 
 	log(`Recorded ${method} leg of ${amount} on ${transactionId}: ${newPaymentDue} remaining, status ${newStatus}`);
+
+	// A completed membership-dues payment automatically notifies finance --
+	// this fires as a direct consequence of the payment completing here,
+	// not a separate client-triggered call that could be skipped if the
+	// kiosk loses connectivity right after the card is charged. Never
+	// fatal: the payment already succeeded and must not be reported as
+	// failed, or rolled back, over a notification issue.
+	if (transaction.channel === 'membership' && newStatus === 'complete') {
+		try {
+			await notifyFinanceOfMembershipPayment({
+				name: transaction.member_name,
+				email: transaction.member_email,
+				amount: transaction.total,
+				date: new Date().toLocaleString('en-CA'),
+			});
+		} catch (err) {
+			error('Failed to notify finance of membership payment (payment still recorded): ' + err.message);
+		}
+	}
+
 	return res.json({ ok: true, remaining: newPaymentDue, status: newStatus });
 };
+
+async function notifyFinanceOfMembershipPayment({ name, email, amount, date }) {
+	const amountStr = new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(
+		(parseInt(amount) || 0) / 100,
+	);
+	const response = await fetch('https://api.resend.com/emails', {
+		method: 'POST',
+		headers: {
+			Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+			'Content-Type': 'application/json',
+		},
+		body: JSON.stringify({
+			from: 'SkullPOS <receipts@mail.shotty.tech>',
+			to: [process.env.FINANCE_NOTIFICATION_EMAIL],
+			subject: `Membership dues paid: ${name || 'unknown member'}`,
+			html: `<p>A membership dues payment was just completed.</p>
+				<ul>
+					<li><strong>Name:</strong> ${escapeHtml(name || '(not provided)')}</li>
+					<li><strong>Email:</strong> ${escapeHtml(email || '(not provided)')}</li>
+					<li><strong>Amount:</strong> ${amountStr}</li>
+					<li><strong>Date:</strong> ${escapeHtml(date)}</li>
+				</ul>`,
+		}),
+	});
+
+	if (!response.ok) {
+		const detail = await response.text();
+		throw new Error(`Resend API returned ${response.status}: ${detail}`);
+	}
+}
+
+function escapeHtml(value) {
+	return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
