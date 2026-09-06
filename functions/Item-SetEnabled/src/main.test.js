@@ -33,6 +33,25 @@ describe("Item-SetEnabled", () => {
 		expect(result.body).toEqual({ ok: true, enabled: false });
 	});
 
+	test("writes enabled_pos when field is given", async () => {
+		mockDatabases.updateDocument.mockResolvedValue({});
+		const ctx = makeContext({ body: { itemId: "item-1", enabled: true, field: "enabled_pos" } });
+
+		await handler(ctx);
+
+		const [, , , data] = mockDatabases.updateDocument.mock.calls[0];
+		expect(data).toEqual({ enabled_pos: true });
+	});
+
+	test("rejects an unrecognized field", async () => {
+		const ctx = makeContext({ body: { itemId: "item-1", enabled: true, field: "price" } });
+
+		const result = await handler(ctx);
+
+		expect(result.statusCode).toBe(400);
+		expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+	});
+
 	test("rejects a missing itemId", async () => {
 		const ctx = makeContext({ body: { enabled: true } });
 
