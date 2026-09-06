@@ -9,5 +9,6 @@ module.exports = {
 	moduleNameMapper: {
 		"^node-appwrite$": "<rootDir>/test/mocks/node-appwrite.js",
 		"^stripe$": "<rootDir>/test/mocks/stripe.js",
+		"^node-fetch$": "<rootDir>/test/mocks/node-fetch.js",
 	},
 };
