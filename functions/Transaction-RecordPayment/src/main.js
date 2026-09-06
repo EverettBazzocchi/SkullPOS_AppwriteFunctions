@@ -54,6 +54,14 @@ export default async ({ req, res, log, error }) => {
 		return res.json({ error: `Transaction is not pending (status: ${transaction.status})` }, 400);
 	}
 
+	// A self-checkout kiosk sale can only ever be paid by card -- enforced
+	// here, not just by the kiosk UI never offering another option, since
+	// `channel` is only ever set at transaction-creation time and can't be
+	// overridden by a payment-leg request itself.
+	if (transaction.channel === 'self_checkout' && method !== 'stripe') {
+		return res.json({ error: 'Self-checkout transactions can only be paid by card' }, 400);
+	}
+
 	const paymentDue = parseInt(transaction.payment_due) || 0;
 	if (amount > paymentDue) {
 		return res.json({ error: `Amount ${amount} exceeds remaining balance ${paymentDue}` }, 400);

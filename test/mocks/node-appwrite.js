@@ -18,6 +18,10 @@ const mockUsers = {
 	listMemberships: jest.fn(),
 };
 
+const mockTeams = {
+	createMembership: jest.fn(),
+};
+
 class Client {
 	setEndpoint() {
 		return this;
@@ -42,6 +46,12 @@ class Users {
 	}
 }
 
+class Teams {
+	constructor() {
+		return mockTeams;
+	}
+}
+
 // Simple pass-through query builders -- good enough for asserting "was
 // called with a query mentioning this field", not meant to byte-match
 // Appwrite's real wire format.
@@ -59,6 +69,7 @@ const Query = {
 function resetAppwriteMocks() {
 	Object.values(mockDatabases).forEach((fn) => fn.mockReset());
 	Object.values(mockUsers).forEach((fn) => fn.mockReset());
+	Object.values(mockTeams).forEach((fn) => fn.mockReset());
 }
 
-module.exports = { Client, Databases, Users, Query, mockDatabases, mockUsers, resetAppwriteMocks };
+module.exports = { Client, Databases, Users, Teams, Query, mockDatabases, mockUsers, mockTeams, resetAppwriteMocks };

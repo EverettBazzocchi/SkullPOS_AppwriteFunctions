@@ -222,12 +222,17 @@ export default async ({ req, res, log, error }) => {
 		error('Error getting ingredients for COGS: ' + err.message);
 	}
 
+	// `channel` ("pos" | "self_checkout") lets staff compare kiosk sales
+	// against regular POS sales -- omitted entirely (no filter, all
+	// channels combined) when the caller doesn't ask for one, so every
+	// existing caller is unaffected.
 	async function fetchTransactionsInRange(startI, endI) {
 		return fetchAllDocuments(databases, DATABASE_ID, TRANSACTIONS_COLLECTION_ID, [
 			Query.equal('status', 'complete'),
 			test ? Query.equal('testing', true) : Query.notEqual('testing', true),
 			Query.greaterThanEqual('$createdAt', startI),
 			Query.lessThanEqual('$createdAt', endI),
+			...(body.channel ? [Query.equal('channel', body.channel)] : []),
 		]);
 	}
 

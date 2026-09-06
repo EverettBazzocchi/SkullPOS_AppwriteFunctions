@@ -295,4 +295,58 @@ describe("Sales-Report", () => {
 		call = mockDatabases.listDocuments.mock.calls.find((c) => c[1] === TRANSACTIONS_ID);
 		expect(call[2]).toContain('notEqual("testing", true)');
 	});
+
+	describe("channel filter (self-checkout vs POS comparison)", () => {
+		test("channel:'self_checkout' in the request adds a matching query filter", async () => {
+			wireCollections({ transactionsByRangeStart: {} });
+			mockUsers.listMemberships.mockResolvedValue({ memberships: [] });
+			await handler(
+				makeContext({
+					body: {
+						startDate: "2026-01-01T00:00:00.000Z",
+						endDate: "2026-01-02T00:00:00.000Z",
+						test: true,
+						channel: "self_checkout",
+					},
+					headers: { "x-appwrite-user-id": "u1" },
+				}),
+			);
+
+			const call = mockDatabases.listDocuments.mock.calls.find((c) => c[1] === TRANSACTIONS_ID);
+			expect(call[2]).toContain('equal("channel", "self_checkout")');
+		});
+
+		test("channel:'pos' in the request adds the matching filter", async () => {
+			wireCollections({ transactionsByRangeStart: {} });
+			mockUsers.listMemberships.mockResolvedValue({ memberships: [] });
+			await handler(
+				makeContext({
+					body: {
+						startDate: "2026-01-01T00:00:00.000Z",
+						endDate: "2026-01-02T00:00:00.000Z",
+						test: true,
+						channel: "pos",
+					},
+					headers: { "x-appwrite-user-id": "u1" },
+				}),
+			);
+
+			const call = mockDatabases.listDocuments.mock.calls.find((c) => c[1] === TRANSACTIONS_ID);
+			expect(call[2]).toContain('equal("channel", "pos")');
+		});
+
+		test("omitting channel adds no channel filter -- all channels combined (regression guard)", async () => {
+			wireCollections({ transactionsByRangeStart: {} });
+			mockUsers.listMemberships.mockResolvedValue({ memberships: [] });
+			await handler(
+				makeContext({
+					body: { startDate: "2026-01-01T00:00:00.000Z", endDate: "2026-01-02T00:00:00.000Z", test: true },
+					headers: { "x-appwrite-user-id": "u1" },
+				}),
+			);
+
+			const call = mockDatabases.listDocuments.mock.calls.find((c) => c[1] === TRANSACTIONS_ID);
+			expect(call[2].some((q) => q.startsWith("equal(\"channel\""))).toBe(false);
+		});
+	});
 });

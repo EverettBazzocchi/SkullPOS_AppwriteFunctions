@@ -216,6 +216,55 @@ describe("Transaction-RecordPayment", () => {
 		});
 	});
 
+	describe("self-checkout channel enforcement", () => {
+		test("rejects a cash leg against a self_checkout transaction", async () => {
+			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "self_checkout" }));
+			const ctx = makeContext({ body: { transactionId: "t1", method: "cash", amount: 500 } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(/only be paid by card/i);
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("rejects a giftcard leg against a self_checkout transaction", async () => {
+			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "self_checkout" }));
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "giftcard", amount: 500, giftcardId: "gc1" },
+			});
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(/only be paid by card/i);
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("allows a stripe leg against a self_checkout transaction", async () => {
+			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "self_checkout" }));
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+			});
+
+			const result = await handler(ctx);
+
+			expect(result.body.ok).toBe(true);
+		});
+
+		test("a transaction with no channel field (pre-migration) or channel:'pos' is unaffected", async () => {
+			mockDatabases.getDocument.mockResolvedValue(baseTransaction());
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: { transactionId: "t1", method: "cash", amount: 1000 } });
+
+			const result = await handler(ctx);
+
+			expect(result.body.ok).toBe(true);
+		});
+	});
+
 	describe("general validation and idempotency", () => {
 		test("rejects an unknown payment method", async () => {
 			const ctx = makeContext({ body: { transactionId: "t1", method: "bitcoin", amount: 1000 } });
