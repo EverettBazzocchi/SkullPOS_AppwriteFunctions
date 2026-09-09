@@ -9,7 +9,12 @@ const { makeContext } = require("../../../test/helpers/handlerContext");
 const CATEGORIES_ID = "67c9ffdd0039c4e09c9a";
 const INGREDIENTS_ID = "ingredients";
 const TRANSACTIONS_ID = "68e4cd3500179ce661c6";
-const STAFF_TEAM_ID = "68e35aed00144b8cde9d";
+const ADMIN_TEAM_ID = "68e35aed00144b8cde9d";
+// A POS-team (non-admin) membership -- confirms POS team membership alone
+// no longer counts as unrestricted here (see POS/src/App.js's three-tier
+// mapping this mirrors: admin is full access, POS is the same 24h-clamped
+// view as a PIN cashier or a no-team account).
+const POS_TEAM_ID = "68ffcecc0026f78f0af8";
 
 const cartJson = (items) => JSON.stringify(items);
 
@@ -76,7 +81,7 @@ describe("Sales-Report", () => {
 				],
 			},
 		});
-		mockUsers.listMemberships.mockResolvedValue({ memberships: [] }); // non-staff
+		mockUsers.listMemberships.mockResolvedValue({ memberships: [] }); // non-admin
 		const ctx = makeContext({
 			body: { startDate: start, endDate: end, test: true },
 			headers: { "x-appwrite-user-id": "u1" },
@@ -104,7 +109,7 @@ describe("Sales-Report", () => {
 		);
 	});
 
-	test("clamps a non-staff caller's start date to 24h before the end date, ignoring what was requested", async () => {
+	test("clamps a non-admin caller's start date to 24h before the end date, ignoring what was requested", async () => {
 		const end = "2026-01-10T00:00:00.000Z";
 		const requestedStart = "2020-01-01T00:00:00.000Z"; // years back
 		const clampedStart = new Date(new Date(end).getTime() - 24 * 60 * 60 * 1000).toISOString();
@@ -126,16 +131,16 @@ describe("Sales-Report", () => {
 		expect(transactionCalls.some((c) => c[2].some((q) => q.includes(requestedStart)))).toBe(false);
 	});
 
-	test("a confirmed staff team member is not clamped and gets the exact requested range", async () => {
+	test("a confirmed admin team member is not clamped and gets the exact requested range", async () => {
 		const start = "2020-01-01T00:00:00.000Z";
 		const end = "2026-01-10T00:00:00.000Z";
 		wireCollections({ transactionsByRangeStart: { [start]: [] } });
 		mockUsers.listMemberships.mockResolvedValue({
-			memberships: [{ teamId: STAFF_TEAM_ID, confirm: true }],
+			memberships: [{ teamId: ADMIN_TEAM_ID, confirm: true }],
 		});
 		const ctx = makeContext({
 			body: { startDate: start, endDate: end, test: true },
-			headers: { "x-appwrite-user-id": "staff-1" },
+			headers: { "x-appwrite-user-id": "admin-1" },
 		});
 
 		const result = await handler(ctx);
@@ -145,10 +150,31 @@ describe("Sales-Report", () => {
 		expect(transactionCalls.some((c) => c[2].some((q) => q.includes(start)))).toBe(true);
 	});
 
-	test("an unconfirmed (pending invite) team membership does not count as staff", async () => {
+	test("a confirmed POS (non-admin) team member is still clamped, same as no team at all", async () => {
+		const end = "2026-01-10T00:00:00.000Z";
+		const requestedStart = "2020-01-01T00:00:00.000Z";
+		const clampedStart = new Date(new Date(end).getTime() - 24 * 60 * 60 * 1000).toISOString();
+		wireCollections({ transactionsByRangeStart: { [clampedStart]: [] } });
+		mockUsers.listMemberships.mockResolvedValue({
+			memberships: [{ teamId: POS_TEAM_ID, confirm: true }],
+		});
+		const ctx = makeContext({
+			body: { startDate: requestedStart, endDate: end, test: true },
+			headers: { "x-appwrite-user-id": "pos-1" },
+		});
+
+		const result = await handler(ctx);
+
+		expect(result.body.restricted).toBe(true);
+		const transactionCalls = mockDatabases.listDocuments.mock.calls.filter((c) => c[1] === TRANSACTIONS_ID);
+		expect(transactionCalls.some((c) => c[2].some((q) => q.includes(clampedStart)))).toBe(true);
+		expect(transactionCalls.some((c) => c[2].some((q) => q.includes(requestedStart)))).toBe(false);
+	});
+
+	test("an unconfirmed (pending invite) team membership does not count as admin", async () => {
 		wireCollections({ transactionsByRangeStart: {} });
 		mockUsers.listMemberships.mockResolvedValue({
-			memberships: [{ teamId: STAFF_TEAM_ID, confirm: false }],
+			memberships: [{ teamId: ADMIN_TEAM_ID, confirm: false }],
 		});
 		const ctx = makeContext({
 			body: { endDate: "2026-01-10T00:00:00.000Z", test: true },
@@ -160,7 +186,7 @@ describe("Sales-Report", () => {
 		expect(result.body.restricted).toBe(true);
 	});
 
-	test("a Users API failure fails CLOSED (treated as non-staff), not open", async () => {
+	test("a Users API failure fails CLOSED (treated as non-admin), not open", async () => {
 		wireCollections({ transactionsByRangeStart: {} });
 		mockUsers.listMemberships.mockRejectedValue(new Error("service unavailable"));
 		const ctx = makeContext({
@@ -173,7 +199,7 @@ describe("Sales-Report", () => {
 		expect(result.body.restricted).toBe(true);
 	});
 
-	test("no caller id at all is treated as non-staff", async () => {
+	test("no caller id at all is treated as non-admin", async () => {
 		wireCollections({ transactionsByRangeStart: {} });
 		const ctx = makeContext({ body: { endDate: "2026-01-10T00:00:00.000Z", test: true }, headers: {} });
 
@@ -184,7 +210,7 @@ describe("Sales-Report", () => {
 	});
 
 	describe("the `previous` comparison period", () => {
-		test("staff with a bounded range gets a previous-period comparison", async () => {
+		test("admin with a bounded range gets a previous-period comparison", async () => {
 			const start = "2026-01-08T00:00:00.000Z";
 			const end = "2026-01-09T00:00:00.000Z"; // 1 day range
 			const prevStart = "2026-01-07T00:00:00.000Z"; // the equal-length period right before
@@ -194,10 +220,10 @@ describe("Sales-Report", () => {
 					[prevStart]: [{ cart: "[]", total: 200, discount: 0, tip: 0, payments: JSON.stringify([{ method: "cash", amount: 200 }]) }],
 				},
 			});
-			mockUsers.listMemberships.mockResolvedValue({ memberships: [{ teamId: STAFF_TEAM_ID, confirm: true }] });
+			mockUsers.listMemberships.mockResolvedValue({ memberships: [{ teamId: ADMIN_TEAM_ID, confirm: true }] });
 			const ctx = makeContext({
 				body: { startDate: start, endDate: end, test: true },
-				headers: { "x-appwrite-user-id": "staff-1" },
+				headers: { "x-appwrite-user-id": "admin-1" },
 			});
 
 			const result = await handler(ctx);
@@ -207,7 +233,7 @@ describe("Sales-Report", () => {
 			expect(result.body.previous.totalSales).toBe(200);
 		});
 
-		test("a non-staff (restricted) caller never gets a previous period, even with the same shape of request", async () => {
+		test("a non-admin (restricted) caller never gets a previous period, even with the same shape of request", async () => {
 			const start = "2026-01-08T00:00:00.000Z";
 			const end = "2026-01-09T00:00:00.000Z";
 			wireCollections({ transactionsByRangeStart: { [start]: [] } });
@@ -222,12 +248,12 @@ describe("Sales-Report", () => {
 			expect(result.body.previous).toBeNull();
 		});
 
-		test("staff requesting 'All Time' (no startDate) gets no previous period either -- nothing equal-length to compare", async () => {
+		test("admin requesting 'All Time' (no startDate) gets no previous period either -- nothing equal-length to compare", async () => {
 			wireCollections({ transactionsByRangeStart: {} });
-			mockUsers.listMemberships.mockResolvedValue({ memberships: [{ teamId: STAFF_TEAM_ID, confirm: true }] });
+			mockUsers.listMemberships.mockResolvedValue({ memberships: [{ teamId: ADMIN_TEAM_ID, confirm: true }] });
 			const ctx = makeContext({
 				body: { endDate: "2026-01-10T00:00:00.000Z", test: true },
-				headers: { "x-appwrite-user-id": "staff-1" },
+				headers: { "x-appwrite-user-id": "admin-1" },
 			});
 
 			const result = await handler(ctx);

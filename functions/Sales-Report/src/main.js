@@ -4,23 +4,29 @@ import { derivePaymentLegs } from './paymentLegs.js';
 
 // Generates the sales report, server-side. The date range a caller can
 // request is clamped to the last 24 hours UNLESS the function's execution
-// context says the caller is a member of a staff team -- checked via the
-// Users API against req.headers['x-appwrite-user-id'], which Appwrite sets
-// itself from the verified session and can't be spoofed by the client.
-// This is what makes the "PIN mode capped to 24h" restriction real: the
-// client has no read access to Transactions at all, so every report
-// request -- staff or not -- goes through here.
+// context says the caller is a member of the admin team -- checked via
+// the Users API against req.headers['x-appwrite-user-id'], which Appwrite
+// sets itself from the verified session and can't be spoofed by the
+// client. This is what makes the "PIN mode capped to 24h" restriction
+// real: the client has no read access to Transactions at all, so every
+// report request -- admin or not -- goes through here.
 //
-// Staff callers also get a `previous` field: the same-shape aggregate for
+// Only admin-team members count as unrestricted here -- POS-team members
+// get the exact same 24h clamp as a quick-access PIN cashier or a
+// no-team Google account (see POS/src/App.js's three-tier mapping this
+// mirrors). POS team membership still grants other things (e.g. refund
+// execute-permission on Stripe-RefundPayment), just not this.
+//
+// Admin callers also get a `previous` field: the same-shape aggregate for
 // the immediately-preceding period of equal length, for the UI's
-// comparison deltas. Withheld for non-staff callers -- a delta against a
+// comparison deltas. Withheld for everyone else -- a delta against a
 // period further back than 24h would otherwise leak aggregate revenue
 // data the 24h clamp is supposed to hide.
 const DATABASE_ID = '67c9ffd9003d68236514';
 const TRANSACTIONS_COLLECTION_ID = '68e4cd3500179ce661c6';
 const CATEGORIES_COLLECTION_ID = '67c9ffdd0039c4e09c9a';
 const INGREDIENTS_COLLECTION_ID = 'ingredients';
-const STAFF_TEAM_IDS = ['68e35aed00144b8cde9d', '68ffce9a0015d2dc0b0d', '68ffcecc0026f78f0af8'];
+const ADMIN_TEAM_ID = '68e35aed00144b8cde9d';
 const PAGE_SIZE = 100;
 
 async function fetchAllDocuments(databases, databaseId, collectionId, extraQueries = []) {
@@ -43,13 +49,13 @@ async function fetchAllDocuments(databases, databaseId, collectionId, extraQueri
 	return allDocuments;
 }
 
-async function isStaff(users, callerId, error) {
+async function isAdmin(users, callerId, error) {
 	if (!callerId) return false;
 	try {
 		const result = await users.listMemberships(callerId);
-		return (result.memberships || []).some((m) => STAFF_TEAM_IDS.includes(m.teamId) && m.confirm);
+		return (result.memberships || []).some((m) => m.teamId === ADMIN_TEAM_ID && m.confirm);
 	} catch (err) {
-		error('Failed to check team membership (treating as non-staff): ' + err.message);
+		error('Failed to check team membership (treating as non-admin): ' + err.message);
 		return false;
 	}
 }
@@ -189,14 +195,14 @@ export default async ({ req, res, log, error }) => {
 	const users = new Users(client);
 
 	const callerId = req.headers['x-appwrite-user-id'];
-	const staff = await isStaff(users, callerId, error);
+	const admin = await isAdmin(users, callerId, error);
 
 	let endDate = body.endDate ? new Date(body.endDate) : new Date();
 	let startDate = body.startDate ? new Date(body.startDate) : null;
 	const hadBoundedStart = !!startDate;
 
 	const earliestAllowed = new Date(endDate.getTime() - 24 * 60 * 60 * 1000);
-	if (!staff && (!startDate || startDate < earliestAllowed)) {
+	if (!admin && (!startDate || startDate < earliestAllowed)) {
 		startDate = earliestAllowed;
 	}
 
@@ -239,11 +245,11 @@ export default async ({ req, res, log, error }) => {
 	const transactions = await fetchTransactionsInRange(startIso, endIso);
 	const current = buildReport(transactions, categoriesById, ingredientCostById);
 
-	// Comparison period: staff only, and only when the request actually
+	// Comparison period: admin only, and only when the request actually
 	// had a bounded start (an "All Time" request has no equal-length prior
 	// period to compare against).
 	let previous = null;
-	if (staff && hadBoundedStart) {
+	if (admin && hadBoundedStart) {
 		const rangeMs = endDate.getTime() - startDate.getTime();
 		const prevEnd = new Date(startDate.getTime());
 		const prevStart = new Date(startDate.getTime() - rangeMs);
@@ -251,5 +257,5 @@ export default async ({ req, res, log, error }) => {
 		previous = buildReport(prevTransactions, categoriesById, ingredientCostById);
 	}
 
-	return res.json({ ...current, previous, restricted: !staff });
+	return res.json({ ...current, previous, restricted: !admin });
 };
