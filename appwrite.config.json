@@ -105,9 +105,7 @@
 		{
 			"$id": "6a9b7671df1f504a084e",
 			"execute": [
-				"team:68e35aed00144b8cde9d",
-				"team:68ffce9a0015d2dc0b0d",
-				"team:68ffcecc0026f78f0af8"
+				"team:68e35aed00144b8cde9d"
 			],
 			"name": "Stripe-RefundPayment",
 			"enabled": true,
