@@ -94,6 +94,17 @@ describe("buildEventSales", () => {
 		expect(sales.profit).toBe(1400);
 	});
 
+	test("rounds cogs (and profit, which subtracts it) to whole cents -- Appwrite's cogs attribute is a strict integer", () => {
+		// 100/3 is not a whole number -- this must not produce a fractional cogs value.
+		const ingredientCostById = { "ing-1": 100 / 3 };
+		const transactions = [
+			{ cart: cartJson([{ name: "Cocktail", price: 500, quantity: 1, ingredients: ["ing-1"] }]), tip: 0, discount: 0, payment_due: 500 },
+		];
+		const sales = buildEventSales(transactions, {}, ingredientCostById);
+		expect(Number.isInteger(sales.cogs)).toBe(true);
+		expect(Number.isInteger(sales.profit)).toBe(true);
+	});
+
 	test("tolerates an unparseable cart without throwing", () => {
 		const transactions = [{ cart: "{not json", tip: 50, discount: 0, payment_due: 1000 }];
 		const sales = buildEventSales(transactions, {}, {});

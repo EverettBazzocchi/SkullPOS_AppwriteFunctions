@@ -102,17 +102,21 @@ export function buildEventSales(transactions, categoriesById, ingredientCostById
 		});
 	});
 
+	// Every one of these Events attributes is a strict Appwrite integer -- cogs (a per-unit cost
+	// divided across quantity/case size) is the one value here that can come out fractional, and
+	// profit inherits that through the subtraction, so round everything on the way out rather
+	// than special-casing just those two.
 	return {
-		alcohol_sales: alcoholAmount,
-		food_sales: foodAmount + otherAmountSold,
-		drink_sales: nonAlcoholicDrinksAmount,
-		discount_amount: discountAmount,
-		gift_card_amount: giftcardAmount,
-		tips_earned: tips,
-		cash_sales: cashAmount,
-		card_sales: cardAmount,
-		revenue: amountPaid,
-		cogs,
-		profit: amountPaid - cogs,
+		alcohol_sales: Math.round(alcoholAmount),
+		food_sales: Math.round(foodAmount + otherAmountSold),
+		drink_sales: Math.round(nonAlcoholicDrinksAmount),
+		discount_amount: Math.round(discountAmount),
+		gift_card_amount: Math.round(giftcardAmount),
+		tips_earned: Math.round(tips),
+		cash_sales: Math.round(cashAmount),
+		card_sales: Math.round(cardAmount),
+		revenue: Math.round(amountPaid),
+		cogs: Math.round(cogs),
+		profit: Math.round(amountPaid - cogs),
 	};
 }
