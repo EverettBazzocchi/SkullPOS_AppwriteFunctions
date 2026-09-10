@@ -274,6 +274,38 @@
 			"commands": "npm i",
 			"specification": "s-0.5vcpu-512mb",
 			"path": "functions/Admin-GeneratePin"
+		},
+		{
+			"$id": "admin-purge-anonymous-users",
+			"execute": ["team:68e35aed00144b8cde9d"],
+			"name": "Admin-PurgeAnonymousUsers",
+			"enabled": true,
+			"logging": true,
+			"runtime": "node-16.0",
+			"scopes": ["users.read", "users.write"],
+			"events": [],
+			"schedule": "0 3 * * 0",
+			"timeout": 60,
+			"entrypoint": "src/main.js",
+			"commands": "npm i",
+			"specification": "s-0.5vcpu-512mb",
+			"path": "functions/Admin-PurgeAnonymousUsers"
+		},
+		{
+			"$id": "admin-cancel-stale-transactions",
+			"execute": ["team:68e35aed00144b8cde9d"],
+			"name": "Admin-CancelStaleTransactions",
+			"enabled": true,
+			"logging": true,
+			"runtime": "node-16.0",
+			"scopes": ["documents.read", "documents.write"],
+			"events": [],
+			"schedule": "0 4 * * *",
+			"timeout": 60,
+			"entrypoint": "src/main.js",
+			"commands": "npm i",
+			"specification": "s-0.5vcpu-512mb",
+			"path": "functions/Admin-CancelStaleTransactions"
 		}
 	]
 }
