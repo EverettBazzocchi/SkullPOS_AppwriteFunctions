@@ -3,30 +3,32 @@
  * @description Appwrite Serverless Function: Quick Access Login
  *
  * Lets Door POS staff sign in with a short PIN instead of a password baked into the client app.
- * The PIN is compared against QUICK_ACCESS_PIN (an environment variable on this function - it is
- * never shipped to the client, unlike a hardcoded password would be). On a correct PIN, this
- * function mints a short-lived custom token for the shared door-staff account
- * (QUICK_ACCESS_USER_ID) via Appwrite's Users API and returns { userId, secret }. The client then
- * exchanges that token for a real session via POST /account/sessions/token.
+ * The submitted PIN is hashed and matched against active system:'ticketing' rows in the shared
+ * `pins` collection (managed by the admin app's Admin-GeneratePin function -- see Verify-Pin
+ * for the same pattern applied to POS/self-checkout PINs). On a correct PIN, this function mints
+ * a short-lived custom token for the shared door-staff account (QUICK_ACCESS_USER_ID) via
+ * Appwrite's Users API and returns { userId, secret }. The client then exchanges that token for
+ * a real session via POST /account/sessions/token.
  *
- * QUICK_ACCESS_REVIEWER_PIN is an optional second PIN accepted alongside the real one - a fixed
- * credential to hand to Stripe's app reviewer (see the "Fixed authentication code that remains
- * valid indefinitely" requirement in Stripe's Apps on Devices review guidelines), so real staff
- * PINs never need to be shared with or rotated because of a review.
+ * Formerly a single QUICK_ACCESS_PIN environment variable plus an optional
+ * QUICK_ACCESS_REVIEWER_PIN (a fixed credential for Stripe's app reviewer, see the "Fixed
+ * authentication code that remains valid indefinitely" requirement in Stripe's Apps on Devices
+ * review guidelines) -- moved to the `pins` collection so multiple named door codes (including
+ * the reviewer's, now just another permanently-active row) can be generated/rotated/revoked from
+ * a client instead of hand-edited via the console/CLI, and so the PIN is hashed at rest instead
+ * of stored in plaintext.
  *
  * Failed attempts are throttled per source IP (see _shared/rateLimit.js) and persisted in the
  * 'rate_limits' collection, since a short PIN on a public endpoint is otherwise brute-forceable.
  *
  * Ported from ShottyTicketing's own standalone project, now that it shares SkullPOS's Appwrite
- * project: DB_ID points at the shared database's 'rate_limits' collection, and
+ * project: DB_ID points at the shared database's 'rate_limits'/'pins' collections, and
  * QUICK_ACCESS_USER_ID names a fresh door-staff user created directly in the shared project
  * (Appwrite user ids are project-scoped, so Ticketing's old standalone door-staff account id
  * doesn't carry over).
  *
  * Required environment variables on this function:
- *   QUICK_ACCESS_PIN    - the PIN staff enter for quick access
  *   QUICK_ACCESS_USER_ID - the Appwrite user ID of the shared door-staff account
- *   QUICK_ACCESS_REVIEWER_PIN - optional, additional PIN reserved for Stripe's app reviewer
  *   APPWRITE_API_KEY - optional; falls back to the function's own per-execution dynamic key
  *     (req.headers['x-appwrite-key']), granted by this function's configured scopes
  *     (users.write, documents.read, documents.write)
@@ -35,11 +37,31 @@
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
+const dns = require('dns');
 const { getAppwriteEndpoints, needsHostOverride } = require('./_shared/appwriteEndpoints');
 const { checkLockout, recordFailedAttempt, resetState } = require('./_shared/rateLimit');
 
+// This self-hosted instance's function-execution sandbox can't resolve its own public
+// hostname via the normal getaddrinfo path (used internally by Node's http/https modules) --
+// dns.resolve4 (talks to nameservers directly, bypassing getaddrinfo) works fine though. Same
+// workaround as the ESM functions' appwriteClient.js, needed here too since this function talks
+// to the public endpoint directly via Node's http/https rather than the Appwrite SDK.
+let patchedHost = null;
+async function ensureDnsPatched(hostname) {
+  if (patchedHost === hostname) return;
+  const [ip] = await dns.promises.resolve4(hostname);
+  const origLookup = dns.lookup;
+  dns.lookup = (host, options, callback) => {
+    if (typeof options === 'function') callback = options;
+    if (host === hostname) return callback(null, ip, 4);
+    return origLookup(host, options, callback);
+  };
+  patchedHost = hostname;
+}
+
 const DB_ID = '67c9ffd9003d68236514';
 const RATE_LIMIT_COLLECTION = 'rate_limits';
+const PINS_COLLECTION_ID = 'pins';
 
 /**
  * Universal HTTP REST Client for internal Appwrite API requests.
@@ -141,11 +163,60 @@ async function saveRateLimitState(endpoint, headers, docId, existed, data, log) 
   }
 }
 
+function encodeQuery(method, values, attribute) {
+  return encodeURIComponent(JSON.stringify({ method, attribute, values }));
+}
+
+/**
+ * Looks up an active 'ticketing' PIN row matching the given hash in the shared `pins`
+ * collection (managed by the admin app's Admin-GeneratePin function). Unlike the rate-limit
+ * lookup above, this does NOT fail open -- if every endpoint is unreachable, the login is
+ * rejected, since there is no way to verify a PIN without it.
+ *
+ * `preferredEndpoint` (the endpoint the rate-limit lookup above already found reachable, if
+ * any) is tried first -- without this, every internal Docker candidate that 404s/times out
+ * gets retried from scratch on top of the rate-limit lookup's own retries, and the combined
+ * latency can blow past this function's timeout before ever reaching the real endpoint.
+ */
+async function findTicketingPin(headersBase, pinHash, log, preferredEndpoint) {
+  const queryString = [
+    encodeQuery('equal', ['ticketing'], 'system'),
+    encodeQuery('equal', [pinHash], 'hash'),
+    encodeQuery('equal', [true], 'active'),
+    encodeQuery('limit', [1]),
+  ]
+    .map((q) => `queries[]=${q}`)
+    .join('&');
+
+  const allEndpoints = getAppwriteEndpoints();
+  const endpointsToTry = preferredEndpoint
+    ? [preferredEndpoint, ...allEndpoints.filter((e) => e !== preferredEndpoint)]
+    : allEndpoints;
+
+  for (const endpoint of endpointsToTry) {
+    const headers = { ...headersBase };
+    if (needsHostOverride(endpoint)) headers['Host'] = 'api.cloud.shotty.tech';
+
+    try {
+      const result = await httpRequest(`${endpoint}/databases/${DB_ID}/collections/${PINS_COLLECTION_ID}/documents?${queryString}`, 'GET', headers);
+      if (result.ok) {
+        return { found: true, doc: (result.data.documents || [])[0] || null };
+      }
+      throw new Error(`[HTTP ${result.status}] ${JSON.stringify(result.data)}`);
+    } catch (err) {
+      if (log) log(`Pins lookup via ${endpoint} failed: ${err.message}. Trying next...`);
+    }
+  }
+  return { found: false, doc: null };
+}
+
 module.exports = async function (context) {
   const req = context ? context.req : arguments[0];
   const res = context ? context.res : arguments[1];
   const log = context ? context.log : console.log;
   const error = context ? context.error : console.error;
+
+  await ensureDnsPatched('api.cloud.shotty.tech');
 
   let payload = {};
   try {
@@ -161,14 +232,15 @@ module.exports = async function (context) {
   }
 
   const submittedPin = String(payload.pin || '').trim();
-  const expectedPin = process.env.QUICK_ACCESS_PIN;
-  const reviewerPin = process.env.QUICK_ACCESS_REVIEWER_PIN;
   const quickAccessUserId = process.env.QUICK_ACCESS_USER_ID;
 
-  if (!expectedPin || !quickAccessUserId) {
-    const msg = 'Quick access is not configured on the server (missing QUICK_ACCESS_PIN or QUICK_ACCESS_USER_ID).';
+  if (!quickAccessUserId) {
+    const msg = 'Quick access is not configured on the server (missing QUICK_ACCESS_USER_ID).';
     if (error) error(msg);
     return res.json({ error: msg }, 500);
+  }
+  if (!submittedPin) {
+    return res.json({ error: 'Incorrect PIN' }, 401);
   }
 
   const apiKey = process.env.APPWRITE_API_KEY || (req.headers && req.headers['x-appwrite-key']);
@@ -197,7 +269,14 @@ module.exports = async function (context) {
     log('⚠️ Could not reach Appwrite Database to check rate limit - proceeding without throttling for this request.');
   }
 
-  const pinIsValid = !!submittedPin && (submittedPin === expectedPin || (!!reviewerPin && submittedPin === reviewerPin));
+  const submittedPinHash = crypto.createHash('sha256').update(submittedPin).digest('hex');
+  const pinLookup = await findTicketingPin(headersBase, submittedPinHash, log, rateLimitLookup ? rateLimitLookup.endpoint : null);
+  if (!pinLookup.found) {
+    const msg = 'Failed to verify PIN across all available endpoints.';
+    if (error) error(msg);
+    return res.json({ error: msg }, 500);
+  }
+  const pinIsValid = !!pinLookup.doc;
 
   if (!pinIsValid) {
     if (rateLimitLookup) {

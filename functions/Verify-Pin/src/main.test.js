@@ -3,37 +3,39 @@ jest.mock("./appwriteClient.js", () => ({
 }));
 
 const crypto = require("crypto");
-const { mockTeams, resetAppwriteMocks } = require("node-appwrite");
+const { mockDatabases, mockTeams, resetAppwriteMocks } = require("node-appwrite");
 const handler = require("./main.js").default;
 const { makeContext } = require("../../../test/helpers/handlerContext");
 
 const hash = (pin) => crypto.createHash("sha256").update(String(pin)).digest("hex");
 const PIN_PAYMENT_TEAM_ID = "6a9cbb1c95ea7d59dd8c";
 
-describe("Verify-Pin", () => {
-	const OLD_ENV = process.env;
+function mockPinRow({ label = "Bartender", system = "pos", pin = "1234" } = {}) {
+	return { system, label, hash: hash(pin), active: true };
+}
 
+describe("Verify-Pin", () => {
 	beforeEach(() => {
-		process.env = { ...OLD_ENV };
 		resetAppwriteMocks();
 		mockTeams.createMembership.mockResolvedValue({});
 	});
 
-	afterAll(() => {
-		process.env = OLD_ENV;
-	});
-
 	test("correct, active PIN returns ok:true with its label", async () => {
-		process.env.PINS_JSON = JSON.stringify([{ hash: hash("1234"), label: "Bartender", active: true }]);
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [mockPinRow({ label: "Bartender", pin: "1234" })] });
 		const ctx = makeContext({ body: { pin: "1234" } });
 
 		const result = await handler(ctx);
 
 		expect(result).toEqual({ statusCode: 200, body: { ok: true, label: "Bartender", selfCheckout: false } });
+		expect(mockDatabases.listDocuments).toHaveBeenCalledWith(
+			expect.any(String),
+			"pins",
+			expect.arrayContaining([expect.stringContaining(hash("1234"))])
+		);
 	});
 
 	test("wrong PIN returns ok:false and never reveals why", async () => {
-		process.env.PINS_JSON = JSON.stringify([{ hash: hash("1234"), label: "Bartender", active: true }]);
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
 		const ctx = makeContext({ body: { pin: "9999" } });
 
 		const result = await handler(ctx);
@@ -41,8 +43,8 @@ describe("Verify-Pin", () => {
 		expect(result).toEqual({ statusCode: 200, body: { ok: false } });
 	});
 
-	test("a PIN marked inactive is treated as no match", async () => {
-		process.env.PINS_JSON = JSON.stringify([{ hash: hash("1234"), label: "Bartender", active: false }]);
+	test("a PIN marked inactive is treated as no match (query already filters active:true)", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
 		const ctx = makeContext({ body: { pin: "1234" } });
 
 		const result = await handler(ctx);
@@ -50,19 +52,10 @@ describe("Verify-Pin", () => {
 		expect(result.body).toEqual({ ok: false });
 	});
 
-	test("a PIN with no active field defaults to active", async () => {
-		process.env.PINS_JSON = JSON.stringify([{ hash: hash("1234"), label: "Bartender" }]);
-		const ctx = makeContext({ body: { pin: "1234" } });
-
-		const result = await handler(ctx);
-
-		expect(result.body).toEqual({ ok: true, label: "Bartender", selfCheckout: false });
-	});
-
-	test("a PIN flagged selfCheckout:true reports it in the response", async () => {
-		process.env.PINS_JSON = JSON.stringify([
-			{ hash: hash("1234"), label: "Self-Checkout Kiosk 1", active: true, selfCheckout: true },
-		]);
+	test("a system:self_checkout row reports selfCheckout:true in the response", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({
+			documents: [mockPinRow({ label: "Self-Checkout Kiosk 1", system: "self_checkout", pin: "1234" })],
+		});
 		const ctx = makeContext({ body: { pin: "1234" } });
 
 		const result = await handler(ctx);
@@ -70,8 +63,8 @@ describe("Verify-Pin", () => {
 		expect(result.body).toEqual({ ok: true, label: "Self-Checkout Kiosk 1", selfCheckout: true });
 	});
 
-	test("a PIN with no selfCheckout field reports selfCheckout:false (ordinary staff PIN)", async () => {
-		process.env.PINS_JSON = JSON.stringify([{ hash: hash("1234"), label: "Bartender", active: true }]);
+	test("a system:pos row reports selfCheckout:false (ordinary staff PIN)", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [mockPinRow({ label: "Bartender", system: "pos", pin: "1234" })] });
 		const ctx = makeContext({ body: { pin: "1234" } });
 
 		const result = await handler(ctx);
@@ -81,7 +74,7 @@ describe("Verify-Pin", () => {
 
 	describe("payment-team membership grant", () => {
 		test("grants payment-team membership to the caller on a successful match", async () => {
-			process.env.PINS_JSON = JSON.stringify([{ hash: hash("1234"), label: "Bartender", active: true }]);
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [mockPinRow({ pin: "1234" })] });
 			const ctx = makeContext({ body: { pin: "1234" }, headers: { "x-appwrite-user-id": "u1" } });
 
 			const result = await handler(ctx);
@@ -91,7 +84,7 @@ describe("Verify-Pin", () => {
 		});
 
 		test("still succeeds even if granting membership fails", async () => {
-			process.env.PINS_JSON = JSON.stringify([{ hash: hash("1234"), label: "Bartender", active: true }]);
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [mockPinRow({ pin: "1234" })] });
 			mockTeams.createMembership.mockRejectedValue(new Error("team API down"));
 			const ctx = makeContext({ body: { pin: "1234" }, headers: { "x-appwrite-user-id": "u1" } });
 
@@ -101,7 +94,7 @@ describe("Verify-Pin", () => {
 		});
 
 		test("does not attempt to grant membership when no caller id is present", async () => {
-			process.env.PINS_JSON = JSON.stringify([{ hash: hash("1234"), label: "Bartender", active: true }]);
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [mockPinRow({ pin: "1234" })] });
 			const ctx = makeContext({ body: { pin: "1234" } });
 
 			const result = await handler(ctx);
@@ -111,7 +104,7 @@ describe("Verify-Pin", () => {
 		});
 
 		test("does not attempt to grant membership when the PIN doesn't match", async () => {
-			process.env.PINS_JSON = JSON.stringify([{ hash: hash("1234"), label: "Bartender", active: true }]);
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
 			const ctx = makeContext({ body: { pin: "9999" }, headers: { "x-appwrite-user-id": "u1" } });
 
 			const result = await handler(ctx);
@@ -122,13 +115,13 @@ describe("Verify-Pin", () => {
 	});
 
 	test("missing pin is rejected with 400", async () => {
-		process.env.PINS_JSON = "[]";
 		const ctx = makeContext({ body: {} });
 
 		const result = await handler(ctx);
 
 		expect(result.statusCode).toBe(400);
 		expect(result.body.ok).toBe(false);
+		expect(mockDatabases.listDocuments).not.toHaveBeenCalled();
 	});
 
 	test("invalid JSON request body is rejected with 400", async () => {
@@ -140,22 +133,13 @@ describe("Verify-Pin", () => {
 		expect(result.statusCode).toBe(400);
 	});
 
-	test("malformed PINS_JSON env var fails closed with 500, not a crash", async () => {
-		process.env.PINS_JSON = "{not valid json";
+	test("a database error fails closed with 500, not a crash", async () => {
+		mockDatabases.listDocuments.mockRejectedValue(new Error("db down"));
 		const ctx = makeContext({ body: { pin: "1234" } });
 
 		const result = await handler(ctx);
 
 		expect(result.statusCode).toBe(500);
 		expect(result.body.ok).toBe(false);
-	});
-
-	test("missing PINS_JSON env var (unset) behaves as no PINs configured", async () => {
-		delete process.env.PINS_JSON;
-		const ctx = makeContext({ body: { pin: "1234" } });
-
-		const result = await handler(ctx);
-
-		expect(result.body).toEqual({ ok: false });
 	});
 });

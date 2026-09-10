@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { Teams } from 'node-appwrite';
+import { Databases, Teams, Query } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
 
 function hashPin(pin) {
@@ -16,15 +16,20 @@ function hashPin(pin) {
 // keeps the 24h report clamp and no-refunds restriction real.
 const PIN_PAYMENT_TEAM_ID = '6a9cbb1c95ea7d59dd8c';
 
+const DATABASE_ID = '67c9ffd9003d68236514';
+const PINS_COLLECTION_ID = 'pins';
+
 // Verifies a quick-access PIN for the POS's restricted "cashier mode" (no
 // refunds, sales reports capped at 24 hours) or the self-checkout kiosk
-// mode (selfCheckout:true PIN records -- no refunds/history/reporting at
+// mode (system:'self_checkout' rows -- no refunds/history/reporting at
 // all, card-only payment).
 //
-// PINs are stored as sha256(pin) in the PINS_JSON environment variable
-// (a secret var, e.g. [{"hash":"...","label":"Bartender"}]) -- not in a
-// database collection, since an env var needs no network call at all and
-// gets the same write-only protection as the Stripe keys.
+// PINs are stored as sha256(pin) rows in the shared `pins` collection
+// (system in ['pos','self_checkout'], plus 'ticketing' for
+// quick-access-login's own separate PIN pool) -- managed by the admin app
+// via Admin-GeneratePin. Formerly a PINS_JSON environment variable; moved
+// to a database collection so PINs can be generated/rotated/revoked from a
+// client instead of hand-edited via the console/CLI.
 export default async ({ req, res, log, error }) => {
     let body;
     try {
@@ -38,16 +43,23 @@ export default async ({ req, res, log, error }) => {
         return res.json({ ok: false, error: 'Missing pin' }, 400);
     }
 
-    let pins;
-    try {
-        pins = JSON.parse(process.env.PINS_JSON || '[]');
-    } catch (err) {
-        error('PINS_JSON env var is not valid JSON');
-        return res.json({ ok: false, error: 'Server not configured' }, 500);
-    }
+    const client = await createAppwriteClient(req);
+    const databases = new Databases(client);
 
     const pinHash = hashPin(pin);
-    const match = pins.find((p) => p.hash === pinHash && p.active !== false);
+    let match;
+    try {
+        const result = await databases.listDocuments(DATABASE_ID, PINS_COLLECTION_ID, [
+            Query.equal('system', ['pos', 'self_checkout']),
+            Query.equal('hash', pinHash),
+            Query.equal('active', true),
+            Query.limit(1),
+        ]);
+        match = result.documents[0];
+    } catch (err) {
+        error('Failed to query pins: ' + err.message);
+        return res.json({ ok: false, error: 'Server not configured' }, 500);
+    }
 
     if (!match) {
         log('PIN verification failed (no match)');
@@ -65,7 +77,6 @@ export default async ({ req, res, log, error }) => {
     const callerId = req.headers['x-appwrite-user-id'];
     if (callerId) {
         try {
-            const client = await createAppwriteClient(req);
             const teams = new Teams(client);
             await teams.createMembership(PIN_PAYMENT_TEAM_ID, [], undefined, callerId);
         } catch (err) {
@@ -75,5 +86,5 @@ export default async ({ req, res, log, error }) => {
         error('No caller id on the request -- session must be created before verifying the PIN');
     }
 
-    return res.json({ ok: true, label: match.label || null, selfCheckout: !!match.selfCheckout });
+    return res.json({ ok: true, label: match.label || null, selfCheckout: match.system === 'self_checkout' });
 };
