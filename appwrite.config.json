@@ -62,12 +62,7 @@
 		},
 		{
 			"$id": "68f3c860003da00f14d8",
-			"execute": [
-				"team:68e35aed00144b8cde9d",
-				"team:68ffce9a0015d2dc0b0d",
-				"team:68ffcecc0026f78f0af8",
-				"team:6a9cbb1c95ea7d59dd8c"
-			],
+			"execute": ["users"],
 			"name": "Stripe-CreatePaymentIntent",
 			"enabled": true,
 			"logging": true,
@@ -247,6 +242,22 @@
 			"commands": "npm i",
 			"specification": "s-0.5vcpu-512mb",
 			"path": "functions/Transaction-EmailReceipt"
+		},
+		{
+			"$id": "quick-access-login",
+			"execute": ["any"],
+			"name": "quick-access-login",
+			"enabled": true,
+			"logging": true,
+			"runtime": "node-16.0",
+			"scopes": ["users.write", "documents.read", "documents.write"],
+			"events": [],
+			"schedule": "",
+			"timeout": 15,
+			"entrypoint": "index.js",
+			"commands": "npm i",
+			"specification": "s-0.5vcpu-512mb",
+			"path": "functions/quick-access-login"
 		}
 	]
 }

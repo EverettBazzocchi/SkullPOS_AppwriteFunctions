@@ -1,0 +1,7 @@
+{
+  "name": "quick-access-login",
+  "version": "1.0.0",
+  "description": "Appwrite function to exchange a door-staff PIN for a one-time session token",
+  "main": "index.js",
+  "dependencies": {}
+}
