@@ -15,6 +15,43 @@ const DATABASE_ID = '67c9ffd9003d68236514';
 const TRANSACTIONS_COLLECTION_ID = '68e4cd3500179ce661c6';
 const GIFTCARDS_COLLECTION_ID = 'giftcards';
 
+// ShottyTicketing's door-sale refunds have no server-side transaction record
+// to look up (its orders live client-side against Stripe alone) -- it calls
+// this shared function with a bare `paymentIntentId` instead of SkullPOS's
+// `transactionId`. Same Stripe account, so one function branches on which
+// field the caller sent rather than running two near-identical functions.
+
+// The app also generates synthetic `pi_tkt_...` IDs for card_present
+// placeholder/offline cases, which look like real PaymentIntent ids (same
+// `pi_` prefix) but were never created against the Stripe API -- refunding
+// one would just be a confusing Stripe error, so reject it up front.
+function isRefundablePaymentIntentId(paymentIntentId) {
+	return typeof paymentIntentId === 'string' && paymentIntentId.startsWith('pi_') && !paymentIntentId.startsWith('pi_tkt_');
+}
+
+async function handleTicketingRefund({ body, res, log, error }) {
+	const { paymentIntentId } = body;
+	const isLive = body.isLive === true || body.environment === 'live';
+
+	if (!isRefundablePaymentIntentId(paymentIntentId)) {
+		const msg = `No real Stripe payment intent on file for this order (got "${paymentIntentId}") -- cannot refund automatically.`;
+		error(msg);
+		return res.json({ error: msg }, 400);
+	}
+
+	const stripeKey = isLive ? process.env.prodKey : process.env.testKey;
+	const stripe = new Stripe(stripeKey);
+
+	try {
+		const refund = await stripe.refunds.create({ payment_intent: paymentIntentId });
+		log(`Stripe refund created for ${paymentIntentId} (${refund.id})`);
+		return res.json({ refundId: refund.id, status: refund.status, mode: isLive ? 'live' : 'test' });
+	} catch (err) {
+		error('Error refunding Stripe Payment Intent: ' + err.message);
+		return res.json({ error: err.message }, 500);
+	}
+}
+
 export default async ({ req, res, log, error }) => {
 	let body;
 	try {
@@ -22,6 +59,10 @@ export default async ({ req, res, log, error }) => {
 	} catch (err) {
 		error('Invalid JSON body: ' + err.message);
 		return res.json({ error: 'Invalid request body' }, 400);
+	}
+
+	if (body.paymentIntentId && !body.transactionId) {
+		return handleTicketingRefund({ body, res, log, error });
 	}
 
 	const transactionId = body.transactionId;

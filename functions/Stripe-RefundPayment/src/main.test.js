@@ -201,4 +201,69 @@ describe("Stripe-RefundPayment", () => {
 		expect(result.statusCode).toBe(400);
 		expect(mockDatabases.getDocument).not.toHaveBeenCalled();
 	});
+
+	describe("ShottyTicketing's paymentIntentId-shaped refunds", () => {
+		test("refunds a real PaymentIntent in test mode, without touching the transactions database", async () => {
+			mockStripe.refunds.create.mockResolvedValue({ id: "re_tkt_1", status: "succeeded" });
+			const ctx = makeContext({ body: { paymentIntentId: "pi_real123" } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(200);
+			expect(result.body).toEqual({ refundId: "re_tkt_1", status: "succeeded", mode: "test" });
+			expect(mockStripe.refunds.create).toHaveBeenCalledWith({ payment_intent: "pi_real123" });
+			expect(mockStripe.lastConstructedWithKey).toBe("sk_test_fake");
+			expect(mockDatabases.getDocument).not.toHaveBeenCalled();
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("refunds in live mode when isLive is true", async () => {
+			mockStripe.refunds.create.mockResolvedValue({ id: "re_tkt_2", status: "succeeded" });
+			const ctx = makeContext({ body: { paymentIntentId: "pi_real456", isLive: true } });
+
+			const result = await handler(ctx);
+
+			expect(result.body.mode).toBe("live");
+			expect(mockStripe.lastConstructedWithKey).toBe("sk_live_fake");
+		});
+
+		test("refunds in live mode when environment is 'live'", async () => {
+			mockStripe.refunds.create.mockResolvedValue({ id: "re_tkt_3", status: "succeeded" });
+			const ctx = makeContext({ body: { paymentIntentId: "pi_real789", environment: "live" } });
+
+			const result = await handler(ctx);
+
+			expect(result.body.mode).toBe("live");
+			expect(mockStripe.lastConstructedWithKey).toBe("sk_live_fake");
+		});
+
+		test("rejects a synthetic pi_tkt_ placeholder id instead of calling Stripe", async () => {
+			const ctx = makeContext({ body: { paymentIntentId: "pi_tkt_offline1" } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(/cannot refund automatically/);
+			expect(mockStripe.refunds.create).not.toHaveBeenCalled();
+		});
+
+		test("rejects a missing paymentIntentId", async () => {
+			const ctx = makeContext({ body: { paymentIntentId: undefined, isLive: true } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(400);
+			expect(mockStripe.refunds.create).not.toHaveBeenCalled();
+		});
+
+		test("a Stripe API failure returns a 500 with the error message", async () => {
+			mockStripe.refunds.create.mockRejectedValue(new Error("card network down"));
+			const ctx = makeContext({ body: { paymentIntentId: "pi_real999" } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(500);
+			expect(result.body.error).toBe("card network down");
+		});
+	});
 });

@@ -13,6 +13,11 @@ const mockStripe = {
 	refunds: {
 		create: jest.fn(),
 	},
+	terminal: {
+		connectionTokens: {
+			create: jest.fn(),
+		},
+	},
 };
 
 class Stripe {
@@ -26,6 +31,7 @@ function resetStripeMocks() {
 	mockStripe.paymentIntents.retrieve.mockReset();
 	mockStripe.paymentIntents.create.mockReset();
 	mockStripe.refunds.create.mockReset();
+	mockStripe.terminal.connectionTokens.create.mockReset();
 	mockStripe.lastConstructedWithKey = undefined;
 }
 

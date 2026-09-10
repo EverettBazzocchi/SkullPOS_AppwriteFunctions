@@ -1,30 +1,42 @@
-import { Client, Users } from 'node-appwrite';
-
 import Stripe from 'stripe';
 
+// Shared by SkullPOS and ShottyTicketing (same Stripe account) -- both
+// apps' Stripe Terminal connection-token needs are identical, so this is
+// the one place that logic lives instead of two near-duplicate functions.
+// The two clients use different request shapes for the same test/live
+// choice: SkullPOS sends `{ test: "test" }` (or omits the field for
+// prod), ShottyTicketing sends `{ isLive: true|false }` or
+// `{ environment: "live" }`. Normalize both to one boolean rather than
+// requiring either client to change its call shape.
+function resolveIsLive(body) {
+	if ('isLive' in body || 'environment' in body) {
+		return body.isLive === true || body.environment === 'live';
+	}
+	return !(body.test && body.test === 'test');
+}
+
 export default async ({ req, res, log, error }) => {
-    let key;
-    log(req.body);
-    let test = JSON.parse(req.body).test;
-    if (test && test == 'test') {
-        log('test key used');
-        key = process.env.testKey;
-    } else {
-        log('production key used');
-        key = process.env.prodKey;
-    }
+	let body = {};
+	try {
+		body = JSON.parse(req.body || '{}');
+	} catch (err) {
+		// Both callers sometimes send an empty body for the prod/live
+		// default -- an empty/unparseable body isn't an error here.
+	}
 
-    const stripe = new Stripe(key);
-    let connectionToken = await stripe.terminal.connectionTokens.create();
+	const isLive = resolveIsLive(body);
+	log(isLive ? 'production key used' : 'test key used');
+	const key = isLive ? process.env.prodKey : process.env.testKey;
 
-    if (connectionToken.error) {
-        log.error(connectionToken.error);
-        return res
-            .status(500)
-            .json({ error: 'Failed to create Stripe connection token' });
-    }
-    log('Stripe connection token created successfully');
-    log(connectionToken);
+	const stripe = new Stripe(key);
+	let connectionToken;
+	try {
+		connectionToken = await stripe.terminal.connectionTokens.create();
+	} catch (err) {
+		error('Error creating Stripe connection token: ' + err.message);
+		return res.json({ error: err.message }, 500);
+	}
 
-    return res.json({ secret: connectionToken.secret });
+	log('Stripe connection token created successfully');
+	return res.json({ secret: connectionToken.secret, mode: isLive ? 'live' : 'test' });
 };
