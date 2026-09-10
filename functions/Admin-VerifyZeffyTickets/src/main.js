@@ -1,12 +1,20 @@
 import { Databases, Query } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
 import { persistZeffyPayment, DATABASE_ID, FAILED_WEBHOOKS_COLLECTION_ID } from './zeffyPersist.js';
+import { fetchAllZeffySucceededPayments, parsedFromZeffyPayment } from './zeffyApi.js';
 
-// Backstop for Zeffy-Webhook: whenever that function can't persist an order/ticket (a DB hiccup,
-// an unexpected payload shape), it dead-letters the already-parsed payload into failed_webhooks
-// instead of losing it. This runs every 12 hours, retries every ZEFFY-sourced dead-letter row
-// through the exact same idempotent write path the webhook itself uses, and clears any row that
-// succeeds -- so a transient failure eventually self-heals without a human replaying it by hand.
+// Runs every 12 hours in two phases, both against the exact same idempotent write path
+// (zeffyPersist.js) Zeffy-Webhook itself uses:
+//
+// 1. Retries every dead-lettered ZEFFY row in failed_webhooks (populated when the live webhook
+//    couldn't persist an order/ticket -- a DB hiccup, an unexpected payload shape) and clears any
+//    row that succeeds.
+// 2. A full reconciliation against Zeffy's own Payments API
+//    (https://www.zeffy.com/api/docs#tag/payments/GET/api/v1/payments) -- every succeeded
+//    payment Zeffy has on record, not just what a webhook happened to deliver here. This is what
+//    actually verifies every Zeffy ticket is in the database, independent of whether the webhook
+//    ever fired at all (e.g. an outage on Zeffy's side, a misconfigured/undelivered webhook,
+//    Zeffy's own retry window expiring).
 const PAGE_SIZE = 100;
 
 async function listZeffyFailedWebhooks(databases) {
@@ -29,16 +37,13 @@ async function listZeffyFailedWebhooks(databases) {
 	return all;
 }
 
-export default async ({ req, res, log, error }) => {
-	const client = await createAppwriteClient(req);
-	const databases = new Databases(client);
-
+async function retryFailedWebhooks(databases, log, error) {
 	let deadLettered;
 	try {
 		deadLettered = await listZeffyFailedWebhooks(databases);
 	} catch (err) {
 		error('Failed to list failed_webhooks: ' + err.message);
-		return res.json({ error: 'Failed to list failed_webhooks' }, 500);
+		return { retried: 0, succeeded: 0, stillFailing: [], listError: 'Failed to list failed_webhooks' };
 	}
 
 	let succeeded = 0;
@@ -65,5 +70,50 @@ export default async ({ req, res, log, error }) => {
 	}
 
 	log(`Retried ${deadLettered.length} dead-lettered Zeffy webhook(s): ${succeeded} succeeded, ${stillFailing.length} still failing.`);
-	return res.json({ retried: deadLettered.length, succeeded, stillFailing });
+	return { retried: deadLettered.length, succeeded, stillFailing };
+}
+
+async function reconcileAgainstZeffyApi(databases, log, error) {
+	const apiKey = process.env.ZEFFY_API_KEY;
+	if (!apiKey) {
+		log('ZEFFY_API_KEY is not configured -- skipping the full Zeffy API reconciliation pass.');
+		return { skipped: true, checked: 0, ordersCreated: 0, ticketsSaved: 0, failures: [] };
+	}
+
+	let payments;
+	try {
+		payments = await fetchAllZeffySucceededPayments(apiKey, log);
+	} catch (err) {
+		error('Failed to fetch payments from the Zeffy API: ' + err.message);
+		return { skipped: false, checked: 0, ordersCreated: 0, ticketsSaved: 0, failures: [{ error: 'Failed to fetch Zeffy payments: ' + err.message }] };
+	}
+
+	let ordersCreated = 0;
+	let ticketsSaved = 0;
+	const failures = [];
+
+	for (const payment of payments) {
+		try {
+			const parsed = parsedFromZeffyPayment(payment);
+			const result = await persistZeffyPayment(databases, parsed, log);
+			if (result.orderCreated) ordersCreated++;
+			ticketsSaved += result.ticketsSaved || 0;
+		} catch (err) {
+			error(`Failed to reconcile Zeffy payment ${payment.id}: ` + err.message);
+			failures.push({ id: payment.id, error: err.message });
+		}
+	}
+
+	log(`Checked ${payments.length} succeeded Zeffy payment(s): ${ordersCreated} order(s) and ${ticketsSaved} ticket(s) were missing and have been created.`);
+	return { skipped: false, checked: payments.length, ordersCreated, ticketsSaved, failures };
+}
+
+export default async ({ req, res, log, error }) => {
+	const client = await createAppwriteClient(req);
+	const databases = new Databases(client);
+
+	const failedWebhookRetry = await retryFailedWebhooks(databases, log, error);
+	const zeffyApiReconciliation = await reconcileAgainstZeffyApi(databases, log, error);
+
+	return res.json({ failedWebhookRetry, zeffyApiReconciliation });
 };
