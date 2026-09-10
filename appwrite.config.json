@@ -258,6 +258,22 @@
 			"commands": "npm i",
 			"specification": "s-0.5vcpu-512mb",
 			"path": "functions/quick-access-login"
+		},
+		{
+			"$id": "admin-generate-pin",
+			"execute": ["team:68e35aed00144b8cde9d"],
+			"name": "Admin-GeneratePin",
+			"enabled": true,
+			"logging": true,
+			"runtime": "node-16.0",
+			"scopes": ["documents.read", "documents.write"],
+			"events": [],
+			"schedule": "",
+			"timeout": 15,
+			"entrypoint": "src/main.js",
+			"commands": "npm i",
+			"specification": "s-0.5vcpu-512mb",
+			"path": "functions/Admin-GeneratePin"
 		}
 	]
 }
