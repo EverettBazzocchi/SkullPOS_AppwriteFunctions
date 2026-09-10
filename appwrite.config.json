@@ -338,6 +338,22 @@
 			"commands": "npm i",
 			"specification": "s-0.5vcpu-512mb",
 			"path": "functions/Admin-VerifyZeffyTickets"
+		},
+		{
+			"$id": "admin-rollup-event-sales",
+			"execute": ["team:68e35aed00144b8cde9d"],
+			"name": "Admin-RollupEventSales",
+			"enabled": true,
+			"logging": true,
+			"runtime": "node-16.0",
+			"scopes": ["documents.read", "documents.write"],
+			"events": [],
+			"schedule": "0 6 * * *",
+			"timeout": 120,
+			"entrypoint": "src/main.js",
+			"commands": "npm i",
+			"specification": "s-0.5vcpu-512mb",
+			"path": "functions/Admin-RollupEventSales"
 		}
 	]
 }
