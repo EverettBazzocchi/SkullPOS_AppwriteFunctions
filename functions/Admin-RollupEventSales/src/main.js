@@ -2,14 +2,20 @@ import { Databases, Query } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
 import { eventSalesWindow } from './eventWindow.js';
 import { buildEventSales } from './eventSales.js';
+import { fetchEventTicketRevenue } from './ticketRevenue.js';
 
 // Runs daily. For every event whose computed window (see eventWindow.js) has already ended,
 // (re)computes its sales figures from live (non-test), complete Transactions created within
-// that window and writes them onto the Events document -- alcohol_sales, food_sales,
-// drink_sales, discount_amount, gift_card_amount, tips_earned, cash_sales, card_sales, revenue,
-// cogs, profit. Recomputes every past event on every run (idempotent overwrite) rather than
-// tracking a "already rolled up" flag -- correctness (a late-arriving transaction, a refund,
-// keeps the numbers fresh) matters more than the trivial cost of re-aggregating at this data
+// that window, plus ticket sales for that event (matched by name, live/non-test only), and
+// writes them onto the Events document:
+//   - alcohol_sales/food_sales/drink_sales/discount_amount/gift_card_amount/tips_earned/
+//     cash_sales/card_sales/cogs -- POS-only, from buildEventSales()
+//   - pos_revenue -- POS-only revenue (what buildEventSales calls "revenue")
+//   - revenue -- pos_revenue + ticket sales combined (the event's actual total take)
+//   - profit -- revenue (combined) - cogs (POS-only; tickets have no COGS concept here)
+// Recomputes every past event on every run (idempotent overwrite) rather than tracking a
+// "already rolled up" flag -- correctness (a late-arriving transaction, a refund, a ticket sale
+// recorded after the fact) matters more than the trivial cost of re-aggregating at this data
 // volume. inventory, sales, and djs are deliberately left untouched.
 const DATABASE_ID = '67c9ffd9003d68236514';
 const EVENTS_COLLECTION_ID = '68e400210008d19bb5c9';
@@ -93,7 +99,15 @@ export default async ({ req, res, log, error }) => {
 				Query.lessThanEqual('$createdAt', window.end.toISOString()),
 			]);
 
-			const sales = buildEventSales(transactions, categoriesById, ingredientCostById);
+			const posSales = buildEventSales(transactions, categoriesById, ingredientCostById);
+			const ticketRevenue = await fetchEventTicketRevenue(databases, DATABASE_ID, event.name, fetchAllDocuments);
+
+			const sales = {
+				...posSales,
+				pos_revenue: posSales.revenue,
+				revenue: posSales.revenue + ticketRevenue,
+				profit: posSales.revenue + ticketRevenue - posSales.cogs,
+			};
 			await databases.updateDocument(DATABASE_ID, EVENTS_COLLECTION_ID, event.$id, sales);
 			updated.push(event.$id);
 		} catch (err) {
