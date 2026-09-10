@@ -11,11 +11,14 @@ const mockDatabases = {
 	getDocument: jest.fn(),
 	updateDocument: jest.fn(),
 	createDocument: jest.fn(),
+	deleteDocument: jest.fn(),
 	listDocuments: jest.fn(),
 };
 
 const mockUsers = {
 	listMemberships: jest.fn(),
+	list: jest.fn(),
+	delete: jest.fn(),
 };
 
 const mockTeams = {
