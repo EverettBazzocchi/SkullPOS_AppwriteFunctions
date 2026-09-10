@@ -1,15 +1,29 @@
-import { Databases, Query } from 'node-appwrite';
+import { Databases, Users, Query } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
 
 // Returns raw transaction documents (every status, not just "complete")
-// from the last 24 hours -- always, regardless of caller -- for the
-// transactions/refund view. This range is fixed server-side (not
-// client-adjustable) rather than gated by team membership, since the UI
-// never offers a wider range to anyone; the client has no read access to
-// Transactions at all, so this is the only way to see this list.
+// for the transactions/refund view. The requested date range is clamped
+// to the last 24 hours UNLESS the caller is a member of the admin team --
+// checked the same way Sales-Report already does, via the Users API
+// against req.headers['x-appwrite-user-id'] (Appwrite-verified, can't be
+// spoofed by the client). The client has no read access to Transactions
+// at all, so this clamp is what makes the restriction real for the new
+// admin app's transaction browser as much as for the POS's own staff view.
 const DATABASE_ID = '67c9ffd9003d68236514';
 const TRANSACTIONS_COLLECTION_ID = '68e4cd3500179ce661c6';
+const ADMIN_TEAM_ID = '68e35aed00144b8cde9d';
 const PAGE_SIZE = 100;
+
+async function isAdmin(users, callerId, error) {
+	if (!callerId) return false;
+	try {
+		const result = await users.listMemberships(callerId);
+		return (result.memberships || []).some((m) => m.teamId === ADMIN_TEAM_ID && m.confirm);
+	} catch (err) {
+		error('Failed to check team membership (treating as non-admin): ' + err.message);
+		return false;
+	}
+}
 
 async function fetchAllDocuments(databases, databaseId, collectionId, extraQueries = []) {
 	let allDocuments = [];
@@ -40,18 +54,31 @@ export default async ({ req, res, log, error }) => {
 	}
 
 	const test = !!body.test;
-	const now = new Date();
-	const start = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
 	const client = await createAppwriteClient(req);
 	const databases = new Databases(client);
+	const users = new Users(client);
+
+	const callerId = req.headers['x-appwrite-user-id'];
+	const admin = await isAdmin(users, callerId, error);
+
+	let endDate = body.endDate ? new Date(body.endDate) : new Date();
+	let startDate = body.startDate ? new Date(body.startDate) : null;
+
+	const earliestAllowed = new Date(endDate.getTime() - 24 * 60 * 60 * 1000);
+	if (!admin && (!startDate || startDate < earliestAllowed)) {
+		startDate = earliestAllowed;
+	}
+	if (!startDate) {
+		startDate = earliestAllowed;
+	}
 
 	let docs;
 	try {
 		docs = await fetchAllDocuments(databases, DATABASE_ID, TRANSACTIONS_COLLECTION_ID, [
 			test ? Query.equal('testing', true) : Query.notEqual('testing', true),
-			Query.greaterThanEqual('$createdAt', start.toISOString()),
-			Query.lessThanEqual('$createdAt', now.toISOString()),
+			Query.greaterThanEqual('$createdAt', startDate.toISOString()),
+			Query.lessThanEqual('$createdAt', endDate.toISOString()),
 		]);
 	} catch (err) {
 		error('Failed to list transactions: ' + err.message);
@@ -60,6 +87,6 @@ export default async ({ req, res, log, error }) => {
 
 	docs.sort((a, b) => new Date(b.$createdAt) - new Date(a.$createdAt));
 
-	log(`Listed ${docs.length} transactions from the last 24 hours`);
-	return res.json({ documents: docs });
+	log(`Listed ${docs.length} transactions from ${startDate.toISOString()} to ${endDate.toISOString()} (admin: ${admin})`);
+	return res.json({ documents: docs, restricted: !admin });
 };
