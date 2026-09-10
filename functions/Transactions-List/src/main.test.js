@@ -14,15 +14,15 @@ describe("Transactions-List", () => {
 		resetAppwriteMocks();
 	});
 
-	test("returns transactions sorted newest first", async () => {
-		mockDatabases.listDocuments.mockResolvedValue({
-			documents: [doc("old", "2026-01-01T00:00:00.000Z"), doc("new", "2026-01-02T00:00:00.000Z")],
-		});
+	test("orders by $createdAt desc (newest first) and limits+1 to detect another page", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
 		const ctx = makeContext({ body: { test: true } });
 
-		const result = await handler(ctx);
+		await handler(ctx);
 
-		expect(result.body.documents.map((d) => d.$id)).toEqual(["new", "old"]);
+		const queries = mockDatabases.listDocuments.mock.calls[0][2];
+		expect(queries).toContain('orderDesc("$createdAt")');
+		expect(queries).toContain("limit(31)"); // default limit 30 + 1
 	});
 
 	test("filters by testing:true when test is requested", async () => {
@@ -45,16 +45,48 @@ describe("Transactions-List", () => {
 		expect(queries).toContain('notEqual("testing", true)');
 	});
 
-	test("pages through more than one page of results", async () => {
-		const page1 = Array.from({ length: 100 }, (_, i) => doc(`p1-${i}`, "2026-01-01T00:00:00.000Z"));
-		const page2 = [doc("p2-0", "2026-01-02T00:00:00.000Z")];
-		mockDatabases.listDocuments.mockResolvedValueOnce({ documents: page1 }).mockResolvedValueOnce({ documents: page2 });
+	test("returns hasMore:true and a nextCursor when an extra document comes back", async () => {
+		const docs = Array.from({ length: 31 }, (_, i) => doc(`t${i}`, "2026-01-01T00:00:00.000Z"));
+		mockDatabases.listDocuments.mockResolvedValue({ documents: docs });
 		const ctx = makeContext({ body: { test: true } });
 
 		const result = await handler(ctx);
 
-		expect(mockDatabases.listDocuments).toHaveBeenCalledTimes(2);
-		expect(result.body.documents).toHaveLength(101);
+		expect(result.body.documents).toHaveLength(30);
+		expect(result.body.hasMore).toBe(true);
+		expect(result.body.nextCursor).toBe("t29");
+	});
+
+	test("returns hasMore:false and nextCursor:null when there's no extra document", async () => {
+		const docs = Array.from({ length: 5 }, (_, i) => doc(`t${i}`, "2026-01-01T00:00:00.000Z"));
+		mockDatabases.listDocuments.mockResolvedValue({ documents: docs });
+		const ctx = makeContext({ body: { test: true } });
+
+		const result = await handler(ctx);
+
+		expect(result.body.documents).toHaveLength(5);
+		expect(result.body.hasMore).toBe(false);
+		expect(result.body.nextCursor).toBeNull();
+	});
+
+	test("passes a provided cursor into Query.cursorAfter", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
+		const ctx = makeContext({ body: { test: true, cursor: "some-id" } });
+
+		await handler(ctx);
+
+		const queries = mockDatabases.listDocuments.mock.calls[0][2];
+		expect(queries).toContain('cursorAfter("some-id")');
+	});
+
+	test("honors a requested limit, capped at 100", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
+		const ctx = makeContext({ body: { test: true, limit: 500 } });
+
+		await handler(ctx);
+
+		const queries = mockDatabases.listDocuments.mock.calls[0][2];
+		expect(queries).toContain("limit(101)"); // capped at MAX_LIMIT (100) + 1
 	});
 
 	test("surfaces a 500 if the query fails", async () => {
