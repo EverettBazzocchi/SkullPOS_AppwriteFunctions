@@ -277,6 +277,22 @@
 			"path": "functions/Admin-GeneratePin"
 		},
 		{
+			"$id": "ticketing-active-event",
+			"execute": ["users"],
+			"name": "Ticketing-ActiveEvent",
+			"enabled": true,
+			"logging": true,
+			"runtime": "node-16.0",
+			"scopes": ["documents.read"],
+			"events": [],
+			"schedule": "",
+			"timeout": 15,
+			"entrypoint": "src/main.js",
+			"commands": "npm i",
+			"specification": "s-0.5vcpu-512mb",
+			"path": "functions/Ticketing-ActiveEvent"
+		},
+		{
 			"$id": "bartender-sales",
 			"execute": ["users"],
 			"name": "Bartender-Sales",
