@@ -1,5 +1,6 @@
-import { Query } from 'node-appwrite';
+import { ID } from 'node-appwrite';
 import { generateFallbackTicketCode } from './ticketId.js';
+import { deriveDeterministicId } from './deterministicId.js';
 
 /**
  * Kept in sync by hand with the identical copy in
@@ -13,10 +14,20 @@ export const ORDERS_COLLECTION_ID = 'orders';
 export const TICKETS_COLLECTION_ID = 'tickets';
 export const FAILED_WEBHOOKS_COLLECTION_ID = 'failed_webhooks';
 
+// Appwrite's own document-uniqueness constraint reports a conflict as a 409. Treating that as
+// "already recorded" (rather than only ever checking-then-creating) is what makes a genuine
+// duplicate webhook delivery -- which Zeffy's own retry policy can produce -- land on the same
+// document instead of racing a separate existence check.
+function isConflict(err) {
+	return err && (err.code === 409 || err.type === 'document_already_exists');
+}
+
 /**
  * Idempotently writes one `orders` document and one `tickets` document per line item for a
  * parsed Zeffy `payment.completed` payload -- safe to call more than once for the same
- * transaction (checks `orderId`/`ticketId` before creating either).
+ * transaction. Each document's id is deterministically derived from the Zeffy transaction/ticket
+ * id (see deterministicId.js), so a duplicate `createDocument` call fails atomically on
+ * Appwrite's own uniqueness constraint instead of racing a separate `listDocuments` check.
  */
 export async function persistZeffyPayment(databases, parsed, log) {
 	if (parsed.eventType !== 'payment.completed') {
@@ -26,14 +37,9 @@ export async function persistZeffyPayment(databases, parsed, log) {
 	const { eventName, amount, currency, buyerName, email, paymentMethodType, items } = parsed;
 	const transactionId = String(parsed.transactionId);
 
-	const existingOrders = await databases.listDocuments(DATABASE_ID, ORDERS_COLLECTION_ID, [
-		Query.equal('orderId', transactionId),
-		Query.limit(1),
-	]);
-
 	let orderCreated = false;
-	if (existingOrders.documents.length === 0) {
-		await databases.createDocument(DATABASE_ID, ORDERS_COLLECTION_ID, 'unique()', {
+	try {
+		await databases.createDocument(DATABASE_ID, ORDERS_COLLECTION_ID, ID.custom(deriveDeterministicId('zfo', transactionId)), {
 			orderId: transactionId,
 			source: 'ZEFFY',
 			customerName: buyerName,
@@ -46,38 +52,35 @@ export async function persistZeffyPayment(databases, parsed, log) {
 			createdAt: new Date().toISOString(),
 		});
 		orderCreated = true;
-	} else if (log) {
-		log(`Order ${transactionId} already recorded -- skipping duplicate.`);
+	} catch (err) {
+		if (!isConflict(err)) throw err;
+		if (log) log(`Order ${transactionId} already recorded -- skipping duplicate.`);
 	}
 
 	let ticketsSaved = 0;
 	for (const item of items) {
 		const ticketCode = String(item.id || generateFallbackTicketCode(transactionId));
 
-		const existingTickets = await databases.listDocuments(DATABASE_ID, TICKETS_COLLECTION_ID, [
-			Query.equal('ticketId', ticketCode),
-			Query.limit(1),
-		]);
-		if (existingTickets.documents.length > 0) {
+		try {
+			await databases.createDocument(DATABASE_ID, TICKETS_COLLECTION_ID, ID.custom(deriveDeterministicId('zft', ticketCode)), {
+				ticketId: ticketCode,
+				orderId: transactionId,
+				source: 'ZEFFY',
+				eventName,
+				ticketType: item.type || 'Standard Ticket',
+				attendeeName: buyerName,
+				attendeeEmail: email,
+				price: parseInt(item.amount || amount, 10),
+				currency,
+				status: 'VALID',
+				paymentMode: 'LIVE',
+				createdAt: new Date().toISOString(),
+			});
+			ticketsSaved++;
+		} catch (err) {
+			if (!isConflict(err)) throw err;
 			if (log) log(`Ticket ${ticketCode} already recorded -- skipping.`);
-			continue;
 		}
-
-		await databases.createDocument(DATABASE_ID, TICKETS_COLLECTION_ID, 'unique()', {
-			ticketId: ticketCode,
-			orderId: transactionId,
-			source: 'ZEFFY',
-			eventName,
-			ticketType: item.type || 'Standard Ticket',
-			attendeeName: buyerName,
-			attendeeEmail: email,
-			price: parseInt(item.amount || amount, 10),
-			currency,
-			status: 'VALID',
-			paymentMode: 'LIVE',
-			createdAt: new Date().toISOString(),
-		});
-		ticketsSaved++;
 	}
 
 	return { orderCreated, ticketsSaved };

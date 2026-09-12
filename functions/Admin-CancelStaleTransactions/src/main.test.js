@@ -84,4 +84,91 @@ describe("Admin-CancelStaleTransactions", () => {
 
 		expect(result.statusCode).toBe(500);
 	});
+
+	describe("reversing already-recorded payment legs on auto-cancel", () => {
+		function docWithLegs(id, payments) {
+			return { $id: id, status: "pending", payments: JSON.stringify(payments) };
+		}
+
+		test("a transaction with no recorded legs is a plain no-op cancel", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [doc("t1", "pending")] });
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.cancelled).toBe(1);
+			expect(result.body.needsManualReview).toEqual([]);
+			// only the transaction's own status update -- no giftcards collection touched
+			expect(mockDatabases.updateDocument).toHaveBeenCalledTimes(1);
+			expect(mockDatabases.getDocument).not.toHaveBeenCalled();
+		});
+
+		test("restores a recorded giftcard leg's balance when auto-cancelling", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({
+				documents: [docWithLegs("t1", [{ method: "giftcard", amount: 400, giftcardId: "gc1" }])],
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockDatabases.getDocument.mockResolvedValue({ balance: 100 });
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.cancelled).toBe(1);
+			const giftcardCall = mockDatabases.updateDocument.mock.calls.find((c) => c[2] === "gc1");
+			expect(giftcardCall[3]).toEqual({ balance: 500 });
+		});
+
+		test("skips auto-cancelling a transaction with an already-captured stripe leg, reporting it for manual review", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({
+				documents: [docWithLegs("t1", [{ method: "stripe", amount: 1000, stripeId: "pi_1" }])],
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.cancelled).toBe(0);
+			expect(result.body.needsManualReview).toEqual([
+				{ transactionId: "t1", reason: expect.stringMatching(/captured stripe leg/i) },
+			]);
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("a mixed run: one plain cancel, one giftcard reversal, one skipped stripe leg", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({
+				documents: [
+					doc("plain", "pending"),
+					docWithLegs("giftcard-tx", [{ method: "giftcard", amount: 250, giftcardId: "gc1" }]),
+					docWithLegs("stripe-tx", [{ method: "stripe", amount: 1000, stripeId: "pi_1" }]),
+				],
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockDatabases.getDocument.mockResolvedValue({ balance: 0 });
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.staleFound).toBe(3);
+			expect(result.body.cancelled).toBe(2);
+			expect(result.body.needsManualReview).toEqual([{ transactionId: "stripe-tx", reason: expect.any(String) }]);
+			expect(mockDatabases.updateDocument.mock.calls.find((c) => c[2] === "gc1")[3]).toEqual({ balance: 250 });
+		});
+
+		test("reports a failed giftcard reversal in `failures` (transaction is still cancelled)", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({
+				documents: [docWithLegs("t1", [{ method: "giftcard", amount: 400, giftcardId: "gc1" }])],
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockDatabases.getDocument.mockRejectedValue(new Error("giftcard read failed"));
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.cancelled).toBe(1);
+			expect(result.body.failures).toEqual([
+				{ transactionId: "t1", error: expect.stringContaining("giftcard read failed") },
+			]);
+		});
+	});
 });

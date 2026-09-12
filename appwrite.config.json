@@ -122,7 +122,7 @@
 			"enabled": true,
 			"logging": true,
 			"runtime": "node-16.0",
-			"scopes": ["documents.read", "teams.write", "teams.read"],
+			"scopes": ["documents.read", "documents.write", "teams.write", "teams.read"],
 			"events": [],
 			"schedule": "",
 			"timeout": 15,
@@ -197,7 +197,7 @@
 		},
 		{
 			"$id": "6a9c6aad6d4a29ab66ee",
-			"execute": ["users"],
+			"execute": ["team:68e35aed00144b8cde9d"],
 			"name": "Item-SetEnabled",
 			"enabled": true,
 			"logging": true,

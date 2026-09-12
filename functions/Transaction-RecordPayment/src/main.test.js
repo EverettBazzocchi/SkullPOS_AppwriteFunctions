@@ -213,6 +213,7 @@ describe("Transaction-RecordPayment", () => {
 				status: "succeeded",
 				amount: 1000,
 				amount_details: { tip: { amount: 150 } },
+				metadata: { transactionId: "t1" },
 			});
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
@@ -229,7 +230,12 @@ describe("Transaction-RecordPayment", () => {
 		test("uses the test Stripe key for a testing transaction", async () => {
 			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ testing: true }));
 			mockDatabases.updateDocument.mockResolvedValue({});
-			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({
+				id: "pi_1",
+				status: "succeeded",
+				amount: 1000,
+				metadata: { transactionId: "t1" },
+			});
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
 			});
@@ -242,7 +248,12 @@ describe("Transaction-RecordPayment", () => {
 		test("uses the live Stripe key for a real (non-testing) transaction", async () => {
 			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ testing: false }));
 			mockDatabases.updateDocument.mockResolvedValue({});
-			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({
+				id: "pi_1",
+				status: "succeeded",
+				amount: 1000,
+				metadata: { transactionId: "t1" },
+			});
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
 			});
@@ -299,6 +310,99 @@ describe("Transaction-RecordPayment", () => {
 
 			expect(result.statusCode).toBe(400);
 		});
+
+		describe("anti-replay: PaymentIntent must belong to this transaction", () => {
+			test("rejects a PaymentIntent with no metadata at all", async () => {
+				mockDatabases.getDocument.mockResolvedValue(baseTransaction());
+				mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+				const ctx = makeContext({
+					body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+				});
+
+				const result = await handler(ctx);
+
+				expect(result.statusCode).toBe(400);
+				expect(result.body.error).toMatch(/not created for this transaction/i);
+				expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+			});
+
+			test("rejects a PaymentIntent whose metadata.transactionId points at a different transaction", async () => {
+				mockDatabases.getDocument.mockResolvedValue(baseTransaction());
+				mockStripe.paymentIntents.retrieve.mockResolvedValue({
+					id: "pi_1",
+					status: "succeeded",
+					amount: 1000,
+					metadata: { transactionId: "some-other-transaction" },
+				});
+				const ctx = makeContext({
+					body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+				});
+
+				const result = await handler(ctx);
+
+				expect(result.statusCode).toBe(400);
+				expect(result.body.error).toMatch(/not created for this transaction/i);
+				expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+			});
+
+			test("rejects a PaymentIntent already recorded against a different transaction", async () => {
+				mockDatabases.getDocument.mockResolvedValue(baseTransaction());
+				mockStripe.paymentIntents.retrieve.mockResolvedValue({
+					id: "pi_1",
+					status: "succeeded",
+					amount: 1000,
+					metadata: { transactionId: "t1" },
+				});
+				mockDatabases.listDocuments.mockResolvedValue({ documents: [{ $id: "t-other", stripe_id: "pi_1" }] });
+				const ctx = makeContext({
+					body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+				});
+
+				const result = await handler(ctx);
+
+				expect(result.statusCode).toBe(400);
+				expect(result.body.error).toMatch(/already been used on another transaction/i);
+				expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+			});
+
+			test("does not treat this same transaction showing up in the reuse-check results as reuse", async () => {
+				mockDatabases.getDocument.mockResolvedValue(baseTransaction());
+				mockDatabases.updateDocument.mockResolvedValue({});
+				mockStripe.paymentIntents.retrieve.mockResolvedValue({
+					id: "pi_1",
+					status: "succeeded",
+					amount: 1000,
+					metadata: { transactionId: "t1" },
+				});
+				mockDatabases.listDocuments.mockResolvedValue({ documents: [{ $id: "t1", stripe_id: "pi_1" }] });
+				const ctx = makeContext({
+					body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+				});
+
+				const result = await handler(ctx);
+
+				expect(result.body.ok).toBe(true);
+			});
+
+			test("keeps stripe_id in sync on the transaction so a future reuse check can find this leg", async () => {
+				mockDatabases.getDocument.mockResolvedValue(baseTransaction());
+				mockDatabases.updateDocument.mockResolvedValue({});
+				mockStripe.paymentIntents.retrieve.mockResolvedValue({
+					id: "pi_1",
+					status: "succeeded",
+					amount: 1000,
+					metadata: { transactionId: "t1" },
+				});
+				const ctx = makeContext({
+					body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+				});
+
+				await handler(ctx);
+
+				const [, , , data] = mockDatabases.updateDocument.mock.calls[0];
+				expect(data.stripe_id).toBe("pi_1");
+			});
+		});
 	});
 
 	describe("self-checkout channel enforcement", () => {
@@ -329,7 +433,12 @@ describe("Transaction-RecordPayment", () => {
 		test("allows a stripe leg against a self_checkout transaction", async () => {
 			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "self_checkout" }));
 			mockDatabases.updateDocument.mockResolvedValue({});
-			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({
+				id: "pi_1",
+				status: "succeeded",
+				amount: 1000,
+				metadata: { transactionId: "t1" },
+			});
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
 			});
@@ -383,7 +492,12 @@ describe("Transaction-RecordPayment", () => {
 				}),
 			);
 			mockDatabases.updateDocument.mockResolvedValue({});
-			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({
+				id: "pi_1",
+				status: "succeeded",
+				amount: 1000,
+				metadata: { transactionId: "t1" },
+			});
 			mockFetch.mockResolvedValue({ ok: true, text: () => Promise.resolve("{}") });
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
@@ -407,7 +521,12 @@ describe("Transaction-RecordPayment", () => {
 		test("does not cc the member when no valid member_email is on the transaction", async () => {
 			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "membership", total: 4000 }));
 			mockDatabases.updateDocument.mockResolvedValue({});
-			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({
+				id: "pi_1",
+				status: "succeeded",
+				amount: 1000,
+				metadata: { transactionId: "t1" },
+			});
 			mockFetch.mockResolvedValue({ ok: true, text: () => Promise.resolve("{}") });
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
@@ -424,7 +543,12 @@ describe("Transaction-RecordPayment", () => {
 				baseTransaction({ channel: "membership", testing: false, total: 4000 }),
 			);
 			mockDatabases.updateDocument.mockResolvedValue({});
-			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({
+				id: "pi_1",
+				status: "succeeded",
+				amount: 1000,
+				metadata: { transactionId: "t1" },
+			});
 			mockFetch.mockResolvedValue({ ok: true, text: () => Promise.resolve("{}") });
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
@@ -439,7 +563,12 @@ describe("Transaction-RecordPayment", () => {
 		test("a partial membership leg (still pending) does not notify finance yet", async () => {
 			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "membership", payment_due: 4000 }));
 			mockDatabases.updateDocument.mockResolvedValue({});
-			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({
+				id: "pi_1",
+				status: "succeeded",
+				amount: 1000,
+				metadata: { transactionId: "t1" },
+			});
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
 			});
@@ -453,7 +582,12 @@ describe("Transaction-RecordPayment", () => {
 		test("a finance-notification failure does not fail the payment response", async () => {
 			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "membership", total: 1000 }));
 			mockDatabases.updateDocument.mockResolvedValue({});
-			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({
+				id: "pi_1",
+				status: "succeeded",
+				amount: 1000,
+				metadata: { transactionId: "t1" },
+			});
 			mockFetch.mockResolvedValue({ ok: false, status: 500, text: () => Promise.resolve("resend down") });
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
@@ -467,7 +601,12 @@ describe("Transaction-RecordPayment", () => {
 		test("a completed non-membership transaction never triggers the finance email", async () => {
 			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "self_checkout" }));
 			mockDatabases.updateDocument.mockResolvedValue({});
-			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({
+				id: "pi_1",
+				status: "succeeded",
+				amount: 1000,
+				metadata: { transactionId: "t1" },
+			});
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
 			});

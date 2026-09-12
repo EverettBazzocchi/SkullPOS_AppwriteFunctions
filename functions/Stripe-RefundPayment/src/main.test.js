@@ -5,7 +5,14 @@ jest.mock("./appwriteClient.js", () => ({
 const { mockDatabases, resetAppwriteMocks } = require("node-appwrite");
 const { mockStripe, resetStripeMocks } = require("stripe");
 const handler = require("./main.js").default;
-const { makeContext } = require("../../../test/helpers/handlerContext");
+const { makeContext: makeRawContext } = require("../../../test/helpers/handlerContext");
+
+// Every test below represents a real, session-authenticated caller (this function's execute
+// scope is admin-team-only) unless a test explicitly needs to exercise the no-caller-identity
+// rejection path itself -- that one test uses makeRawContext directly instead.
+function makeContext(opts = {}) {
+	return makeRawContext({ ...opts, headers: { "x-appwrite-user-id": "admin-caller", ...(opts.headers || {}) } });
+}
 
 describe("Stripe-RefundPayment", () => {
 	beforeEach(() => {
@@ -181,6 +188,7 @@ describe("Stripe-RefundPayment", () => {
 			testing: true,
 			payments: null,
 			stripe_id: "pi_legacy",
+			total: 800,
 			payment_due: 800,
 		});
 		mockDatabases.updateDocument.mockResolvedValue({});
@@ -264,6 +272,17 @@ describe("Stripe-RefundPayment", () => {
 
 			expect(result.statusCode).toBe(500);
 			expect(result.body.error).toBe("card network down");
+		});
+	});
+
+	describe("caller identity (defense-in-depth)", () => {
+		test("rejects a call with no x-appwrite-user-id header, even with an otherwise-valid body", async () => {
+			const ctx = makeRawContext({ body: { paymentIntentId: "pi_real999" } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(403);
+			expect(mockStripe.refunds.create).not.toHaveBeenCalled();
 		});
 	});
 });

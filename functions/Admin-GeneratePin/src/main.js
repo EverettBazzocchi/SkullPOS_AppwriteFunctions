@@ -11,9 +11,12 @@ import { createAppwriteClient } from './appwriteClient.js';
 // Stripe-RefundPayment).
 //
 // The raw 4-digit code is generated server-side (crypto.randomInt, never
-// client-supplied) and returned to the caller exactly once, in this
-// response -- only its sha256 hash is ever persisted, matching the hashing
-// convention Verify-Pin's PINS_JSON already used.
+// client-supplied). Verify-Pin only ever checks the sha256 hash (`hash`,
+// matching the hashing convention its old PINS_JSON used) -- but the
+// plaintext `pin` is deliberately persisted alongside it too, so the admin
+// app can display/re-display a pin to staff after creation without this
+// function having to hand it back over a fresh channel each time. Treat
+// `pins` as containing sensitive plaintext, not just hashes.
 const DATABASE_ID = '67c9ffd9003d68236514';
 const PINS_COLLECTION_ID = 'pins';
 const VALID_SYSTEMS = ['pos', 'self_checkout', 'ticketing'];

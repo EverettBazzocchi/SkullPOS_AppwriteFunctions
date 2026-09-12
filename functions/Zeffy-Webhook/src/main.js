@@ -14,11 +14,17 @@ import { persistZeffyPayment, DATABASE_ID, FAILED_WEBHOOKS_COLLECTION_ID } from 
 // If persistence fails (DB hiccup, unexpected payload shape), the payload is dead-lettered into
 // `failed_webhooks` instead of being lost -- Admin-VerifyZeffyTickets (12h cron) retries those
 // through this exact same idempotent write path (see zeffyPersist.js).
+// Fails CLOSED: this endpoint is `execute:["any"]` (no Appwrite auth at all), so the
+// Zeffy-Signature HMAC check below is the ONLY authentication it has. A missing/unset signing
+// secret must reject every request, not silently accept them as authenticated -- the previous
+// behaviour (log a warning, then treat the request as verified) meant simply forgetting to set
+// the env var turned this into a fully open, unauthenticated endpoint able to write arbitrary
+// orders/tickets.
 function verifySignature(req, log, error) {
 	const secret = process.env.ZEFFY_WEBHOOK_SIGNING_SECRET;
 	if (!secret) {
-		if (log) log('ZEFFY_WEBHOOK_SIGNING_SECRET is not configured -- this webhook is currently unauthenticated.');
-		return true;
+		if (error) error('ZEFFY_WEBHOOK_SIGNING_SECRET is not configured -- rejecting all webhook requests (fail closed).');
+		return { ok: false, statusCode: 500, message: 'Webhook is not configured to verify requests' };
 	}
 
 	const headers = req.headers || {};
@@ -26,9 +32,9 @@ function verifySignature(req, log, error) {
 
 	if (!isZeffySignatureValid(req.body || '', signatureHeader, secret)) {
 		if (error) error('Rejected Zeffy webhook request: missing or invalid Zeffy-Signature.');
-		return false;
+		return { ok: false, statusCode: 401, message: 'Unauthorized' };
 	}
-	return true;
+	return { ok: true };
 }
 
 /** Best-effort record of a webhook that couldn't be persisted, so Admin-VerifyZeffyTickets can
@@ -50,8 +56,9 @@ async function recordFailedWebhook(databases, log, error, parsed, errorMessage) 
 }
 
 export default async ({ req, res, log, error }) => {
-	if (!verifySignature(req, log, error)) {
-		return res.json({ success: false, error: 'Unauthorized' }, 401);
+	const verification = verifySignature(req, log, error);
+	if (!verification.ok) {
+		return res.json({ success: false, error: verification.message }, verification.statusCode);
 	}
 
 	let payload = {};

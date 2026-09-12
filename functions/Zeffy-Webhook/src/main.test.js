@@ -6,6 +6,13 @@ const crypto = require("crypto");
 const { mockDatabases, resetAppwriteMocks } = require("node-appwrite");
 const handler = require("./main.js").default;
 const { makeContext } = require("../../../test/helpers/handlerContext");
+const { deriveDeterministicId } = require("./deterministicId.js");
+
+function conflictError() {
+	const err = new Error("Document already exists");
+	err.code = 409;
+	return err;
+}
 
 const SECRET = "whsec_test_secret_value";
 
@@ -39,7 +46,6 @@ describe("Zeffy-Webhook", () => {
 	beforeEach(() => {
 		resetAppwriteMocks();
 		process.env.ZEFFY_WEBHOOK_SIGNING_SECRET = SECRET;
-		mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
 		mockDatabases.createDocument.mockResolvedValue({});
 	});
 
@@ -60,12 +66,23 @@ describe("Zeffy-Webhook", () => {
 		expect(result.statusCode).toBe(401);
 	});
 
-	test("allows the request through with a warning when no secret is configured", async () => {
+	test("fails closed with a 500 when no signing secret is configured, even with no signature header at all", async () => {
 		delete process.env.ZEFFY_WEBHOOK_SIGNING_SECRET;
 		const ctx = makeContext({ body: completedPayload });
 		const result = await handler(ctx);
-		expect(result.statusCode).toBe(200);
-		expect(result.body.success).toBe(true);
+		expect(result.statusCode).toBe(500);
+		expect(result.body.success).toBe(false);
+		expect(mockDatabases.createDocument).not.toHaveBeenCalled();
+	});
+
+	test("fails closed with a 500 when no signing secret is configured, even if a signature header is present", async () => {
+		delete process.env.ZEFFY_WEBHOOK_SIGNING_SECRET;
+		// Signed against some secret the (unset) env var can never match -- must still be
+		// rejected up front rather than accepted because "a signature was present".
+		const ctx = signedContext(completedPayload, { secret: "whatever_secret" });
+		const result = await handler(ctx);
+		expect(result.statusCode).toBe(500);
+		expect(result.body.success).toBe(false);
 	});
 
 	test("creates one order and one ticket per line item for a fresh payment.completed event", async () => {
@@ -78,25 +95,24 @@ describe("Zeffy-Webhook", () => {
 		expect(mockDatabases.createDocument).toHaveBeenCalledWith(
 			expect.any(String),
 			"orders",
-			"unique()",
+			deriveDeterministicId("zfo", "txn_123"),
 			expect.objectContaining({ orderId: "txn_123", source: "ZEFFY", customerEmail: "jane@example.com" })
 		);
 		expect(mockDatabases.createDocument).toHaveBeenCalledWith(
 			expect.any(String),
 			"tickets",
-			"unique()",
+			deriveDeterministicId("zft", "item_1"),
 			expect.objectContaining({ ticketId: "item_1", orderId: "txn_123", source: "ZEFFY", status: "VALID" })
 		);
 	});
 
-	test("skips creating a duplicate order and ticket on a retried delivery", async () => {
-		mockDatabases.listDocuments.mockResolvedValue({ documents: [{ $id: "existing" }] });
+	test("skips creating a duplicate order and ticket on a retried delivery (deterministic id already exists)", async () => {
+		mockDatabases.createDocument.mockRejectedValue(conflictError());
 		const ctx = signedContext(completedPayload);
 
 		const result = await handler(ctx);
 
 		expect(result.body).toMatchObject({ orderCreated: false, ticketsSaved: 0 });
-		expect(mockDatabases.createDocument).not.toHaveBeenCalled();
 	});
 
 	test("does not persist a non-payment.completed event", async () => {

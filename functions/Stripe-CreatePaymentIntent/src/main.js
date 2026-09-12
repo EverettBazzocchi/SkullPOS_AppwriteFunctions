@@ -63,6 +63,11 @@ export default async ({ req, res, log, error }) => {
             currency: 'cad',
             payment_method_types: ['card_present', 'interac_present'],
             capture_method: 'automatic',
+            // Stamped so Transaction-RecordPayment's stripe leg can verify this
+            // PaymentIntent was actually created for THIS transaction before
+            // accepting it as payment -- otherwise a PaymentIntent that succeeded
+            // against one sale could be replayed to "pay" a second, unrelated one.
+            ...(body.transactionId ? { metadata: { transactionId: body.transactionId } } : {}),
         });
 
         log('Stripe payment intent created successfully');

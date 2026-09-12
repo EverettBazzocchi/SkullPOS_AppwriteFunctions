@@ -26,6 +26,27 @@ describe("Stripe-CreatePaymentIntent", () => {
 			expect(mockStripe.lastConstructedWithKey).toBe("sk_test_fake");
 		});
 
+		test("passes transactionId through as PaymentIntent metadata when provided", async () => {
+			mockStripe.paymentIntents.create.mockResolvedValue({ id: "pi_1", client_secret: "secret_1" });
+			const ctx = makeContext({ body: { test: "test", amount: 500, transactionId: "txn_abc" } });
+
+			await handler(ctx);
+
+			expect(mockStripe.paymentIntents.create).toHaveBeenCalledWith(
+				expect.objectContaining({ metadata: { transactionId: "txn_abc" } }),
+			);
+		});
+
+		test("omits metadata entirely when no transactionId is provided", async () => {
+			mockStripe.paymentIntents.create.mockResolvedValue({ id: "pi_1", client_secret: "secret_1" });
+			const ctx = makeContext({ body: { test: "test", amount: 500 } });
+
+			await handler(ctx);
+
+			const callArgs = mockStripe.paymentIntents.create.mock.calls[0][0];
+			expect(callArgs.metadata).toBeUndefined();
+		});
+
 		test("an empty test flag uses the live key", async () => {
 			mockStripe.paymentIntents.create.mockResolvedValue({ id: "pi_2", client_secret: "secret_2" });
 			const ctx = makeContext({ body: { test: "", amount: 1200 } });

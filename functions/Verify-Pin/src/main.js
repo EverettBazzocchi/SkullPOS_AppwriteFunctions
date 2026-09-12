@@ -2,9 +2,60 @@ import crypto from 'crypto';
 import { Databases, Teams, Query } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
 import { computeEventWindow } from './eventWindow.js';
+import { checkLockout, recordFailedAttempt, resetState } from './rateLimit.js';
 
 function hashPin(pin) {
     return crypto.createHash('sha256').update(String(pin)).digest('hex');
+}
+
+// Same shared `rate_limits` collection quick-access-login already uses for the identical
+// problem (a short PIN on an unauthenticated `execute:["any"]` endpoint -- 10,000 possible
+// 4-digit combinations, brute-forceable without this). Keyed by caller IP, not by the PIN
+// itself, so a lockout can't be used to probe which PINs exist.
+const RATE_LIMIT_COLLECTION_ID = 'rate_limits';
+
+function extractClientIp(req) {
+    const forwarded = (req.headers && (req.headers['x-forwarded-for'] || req.headers['x-real-ip'])) || '';
+    return String(forwarded).split(',')[0].trim() || 'unknown';
+}
+
+// Appwrite document IDs must be a restricted charset -- a short hash keeps this valid
+// regardless of the raw IP format (IPv4, IPv6, or a comma-separated x-forwarded-for chain).
+// Prefixed distinctly from quick-access-login's own `qa_...` docs in the same collection, since
+// the two functions throttle independently.
+function rateLimitDocId(ip) {
+    return 'pin_' + crypto.createHash('sha1').update(ip).digest('hex').slice(0, 16);
+}
+
+function minutesFromMs(ms) {
+    return Math.max(1, Math.ceil(ms / 60000));
+}
+
+// Best-effort load: any failure (including the expected 404 for a caller with no prior failed
+// attempts) is treated as "no state on record" rather than blocking PIN verification entirely --
+// a rate-limit storage hiccup must never lock staff out of the till.
+async function loadRateLimitState(databases, databaseId, docId, error) {
+    try {
+        const doc = await databases.getDocument(databaseId, RATE_LIMIT_COLLECTION_ID, docId);
+        return doc || null;
+    } catch (err) {
+        if (err && err.code !== 404) {
+            error('Rate-limit lookup failed (proceeding without throttling for this request): ' + err.message);
+        }
+        return null;
+    }
+}
+
+async function saveRateLimitState(databases, databaseId, docId, existed, data, error) {
+    try {
+        if (existed) {
+            await databases.updateDocument(databaseId, RATE_LIMIT_COLLECTION_ID, docId, data);
+        } else {
+            await databases.createDocument(databaseId, RATE_LIMIT_COLLECTION_ID, docId, data);
+        }
+    } catch (err) {
+        error('Failed to persist rate-limit state (continuing): ' + err.message);
+    }
 }
 
 // The narrower team a verified PIN session (staff cashier or self-checkout
@@ -69,6 +120,39 @@ export default async ({ req, res, log, error }) => {
     const client = await createAppwriteClient(req);
     const databases = new Databases(client);
 
+    const ip = extractClientIp(req);
+    const rateLimitKey = rateLimitDocId(ip);
+    const now = Date.now();
+    const rateLimitState = await loadRateLimitState(databases, DATABASE_ID, rateLimitKey, error);
+
+    const lockout = checkLockout(rateLimitState, now);
+    if (lockout.locked) {
+        log(`PIN verification locked out for ${ip} -- ${Math.ceil(lockout.retryAfterMs / 1000)}s remaining`);
+        return res.json(
+            { ok: false, error: `Too many incorrect PIN attempts. Try again in ${minutesFromMs(lockout.retryAfterMs)} minute(s).` },
+            429,
+        );
+    }
+
+    // Records a failed attempt against this IP and returns the response to send back -- the
+    // normal "no match" response unless this failure just tipped the caller into a lockout, in
+    // which case the lockout message takes over (communicating a real, different signal --
+    // "you're locked out" -- from "that PIN was wrong", without ever confirming *which* PINs
+    // came close).
+    async function rejectWithFailedAttempt(plainResponseBody) {
+        const nextState = recordFailedAttempt(rateLimitState, now);
+        await saveRateLimitState(databases, DATABASE_ID, rateLimitKey, !!rateLimitState, nextState, error);
+        if (nextState.justLocked) {
+            log(`PIN verification now locked out for ${ip} after repeated incorrect attempts`);
+            const retryAfterMs = Date.parse(nextState.lockedUntil) - now;
+            return res.json(
+                { ok: false, error: `Too many incorrect PIN attempts. Try again in ${minutesFromMs(retryAfterMs)} minute(s).` },
+                429,
+            );
+        }
+        return res.json(plainResponseBody);
+    }
+
     const pinHash = hashPin(pin);
     let match;
     try {
@@ -108,18 +192,24 @@ export default async ({ req, res, log, error }) => {
 
         if (!bartender) {
             log('PIN verification failed (no match)');
-            return res.json({ ok: false });
+            return rejectWithFailedAttempt({ ok: false });
         }
 
         if (!isWithinAnyEventWindow(bartender.events)) {
             log(`Bartender pin for ${bartender.name} rejected -- outside its event's 1-hour window`);
-            return res.json({ ok: false, error: "This pin is only valid within 1 hour of your event's start time" });
+            return rejectWithFailedAttempt({ ok: false, error: "This pin is only valid within 1 hour of your event's start time" });
         }
 
         resolved = { label: bartender.name || null, selfCheckout: false, bartenderId: bartender.$id };
     }
 
     log('PIN verified: ' + (resolved.label || 'unlabeled'));
+
+    // A correct PIN clears any accumulated failed attempts for this IP -- only worth a write if
+    // there was actually prior state to clear.
+    if (rateLimitState) {
+        await saveRateLimitState(databases, DATABASE_ID, rateLimitKey, true, resetState(), error);
+    }
 
     // Grant this session's user (the anonymous account the client creates
     // BEFORE calling this function -- see api.js's loginWithPin) membership

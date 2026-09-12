@@ -53,6 +53,16 @@ async function handleTicketingRefund({ body, res, log, error }) {
 }
 
 export default async ({ req, res, log, error }) => {
+	// Defense-in-depth: this function's execute scope is restricted to the admin/staff team, but a
+	// project API key with `execution.write` scope can invoke a function directly with no
+	// Appwrite user session at all, bypassing that team-based allowlist entirely. Refuse any
+	// caller that isn't coming from a real Appwrite user session (Appwrite sets this header
+	// itself for a session-authenticated call -- it can't be spoofed by the request body).
+	if (!req.headers['x-appwrite-user-id']) {
+		error('Refused refund attempt with no caller identity (missing x-appwrite-user-id).');
+		return res.json({ error: 'Unauthorized' }, 403);
+	}
+
 	let body;
 	try {
 		body = JSON.parse(req.body || '{}');

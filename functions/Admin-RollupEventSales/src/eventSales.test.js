@@ -10,8 +10,8 @@ describe("buildEventSales", () => {
 	test("classifies alcohol via the cart item's own flag or its category's alcohol flag", () => {
 		const categoriesById = { "cat-beer": { $id: "cat-beer", name: "Beer", alcohol: true } };
 		const transactions = [
-			{ cart: cartJson([{ name: "Beer", price: 500, quantity: 2, categories: "cat-beer" }]), tip: 0, discount: 0, payment_due: 1000 },
-			{ cart: cartJson([{ name: "Shot", price: 300, quantity: 1, alcohol: true }]), tip: 0, discount: 0, payment_due: 300 },
+			{ cart: cartJson([{ name: "Beer", price: 500, quantity: 2, categories: "cat-beer" }]), tip: 0, discount: 0, total: 1000, payment_due: 1000 },
+			{ cart: cartJson([{ name: "Shot", price: 300, quantity: 1, alcohol: true }]), tip: 0, discount: 0, total: 300, payment_due: 300 },
 		];
 		const sales = buildEventSales(transactions, categoriesById, {});
 		expect(sales.alcohol_sales).toBe(500 * 2 + 300);
@@ -31,6 +31,7 @@ describe("buildEventSales", () => {
 				]),
 				tip: 0,
 				discount: 0,
+				total: 2700,
 				payment_due: 2700,
 			},
 		];
@@ -49,6 +50,7 @@ describe("buildEventSales", () => {
 				]),
 				tip: 0,
 				discount: 0,
+				total: 4500,
 				payment_due: 4500,
 			},
 		];
@@ -72,10 +74,37 @@ describe("buildEventSales", () => {
 	});
 
 	test("falls back to legacy single-method fields when payments is absent", () => {
-		const transactions = [{ cart: cartJson([]), tip: 0, discount: 0, payment_due: 800 }];
+		const transactions = [{ cart: cartJson([]), tip: 0, discount: 0, total: 800, payment_due: 800 }];
 		const sales = buildEventSales(transactions, {}, {});
 		expect(sales.cash_sales).toBe(800);
 		expect(sales.revenue).toBe(800);
+	});
+
+	test("legacy fallback derives card revenue from `total`, not the always-zeroed `payment_due`", () => {
+		const transactions = [{ cart: cartJson([]), tip: 0, discount: 0, total: 800, stripe_id: "pi_1", payment_due: 0 }];
+		const sales = buildEventSales(transactions, {}, {});
+		expect(sales.card_sales).toBe(800);
+		expect(sales.revenue).toBe(800);
+	});
+
+	test("legacy fallback: a giftcard + card + cash 3-way split rolls up into all three buckets", () => {
+		const transactions = [
+			{
+				cart: cartJson([]),
+				tip: 0,
+				discount: 0,
+				total: 1000,
+				giftcards: ["gc1"],
+				giftcard_amount: 300,
+				stripe_id: "pi_1",
+				payment_due: 400,
+			},
+		];
+		const sales = buildEventSales(transactions, {}, {});
+		expect(sales.gift_card_amount).toBe(300);
+		expect(sales.card_sales).toBe(400);
+		expect(sales.cash_sales).toBe(300);
+		expect(sales.revenue).toBe(1000);
 	});
 
 	test("profit is revenue minus cogs", () => {
@@ -85,6 +114,7 @@ describe("buildEventSales", () => {
 				cart: cartJson([{ name: "Cocktail", price: 1500, quantity: 1, ingredients: ["ing-1"] }]),
 				tip: 0,
 				discount: 0,
+				total: 1500,
 				payment_due: 1500,
 			},
 		];
@@ -98,7 +128,7 @@ describe("buildEventSales", () => {
 		// 100/3 is not a whole number -- this must not produce a fractional cogs value.
 		const ingredientCostById = { "ing-1": 100 / 3 };
 		const transactions = [
-			{ cart: cartJson([{ name: "Cocktail", price: 500, quantity: 1, ingredients: ["ing-1"] }]), tip: 0, discount: 0, payment_due: 500 },
+			{ cart: cartJson([{ name: "Cocktail", price: 500, quantity: 1, ingredients: ["ing-1"] }]), tip: 0, discount: 0, total: 500, payment_due: 500 },
 		];
 		const sales = buildEventSales(transactions, {}, ingredientCostById);
 		expect(Number.isInteger(sales.cogs)).toBe(true);
@@ -106,7 +136,7 @@ describe("buildEventSales", () => {
 	});
 
 	test("tolerates an unparseable cart without throwing", () => {
-		const transactions = [{ cart: "{not json", tip: 50, discount: 0, payment_due: 1000 }];
+		const transactions = [{ cart: "{not json", tip: 50, discount: 0, total: 1000, payment_due: 1000 }];
 		const sales = buildEventSales(transactions, {}, {});
 		expect(sales.revenue).toBe(1000);
 		expect(sales.tips_earned).toBe(50);

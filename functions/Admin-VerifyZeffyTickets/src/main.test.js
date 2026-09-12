@@ -6,6 +6,13 @@ const { mockDatabases, resetAppwriteMocks } = require("node-appwrite");
 const fetchMock = require("node-fetch");
 const handler = require("./main.js").default;
 const { makeContext } = require("../../../test/helpers/handlerContext");
+const { deriveDeterministicId } = require("./deterministicId.js");
+
+function conflictError() {
+	const err = new Error("Document already exists");
+	err.code = 409;
+	return err;
+}
 
 const parsedPayload = {
 	eventType: "payment.completed",
@@ -77,10 +84,7 @@ describe("Admin-VerifyZeffyTickets", () => {
 		});
 
 		test("replays a dead-lettered payload and deletes the row once it succeeds", async () => {
-			mockDatabases.listDocuments
-				.mockResolvedValueOnce({ documents: [failedWebhookDoc("fw1")] })
-				// persistZeffyPayment's own internal listDocuments calls (orders, tickets existence checks)
-				.mockResolvedValue({ documents: [] });
+			mockDatabases.listDocuments.mockResolvedValueOnce({ documents: [failedWebhookDoc("fw1")] });
 			mockDatabases.createDocument.mockResolvedValue({});
 			mockDatabases.deleteDocument.mockResolvedValue({});
 			const ctx = makeContext({ body: {} });
@@ -91,7 +95,7 @@ describe("Admin-VerifyZeffyTickets", () => {
 			expect(mockDatabases.createDocument).toHaveBeenCalledWith(
 				expect.any(String),
 				"orders",
-				"unique()",
+				deriveDeterministicId("zfo", "txn_123"),
 				expect.objectContaining({ orderId: "txn_123" })
 			);
 			expect(mockDatabases.deleteDocument).toHaveBeenCalledWith(expect.any(String), "failed_webhooks", "fw1");
@@ -177,21 +181,27 @@ describe("Admin-VerifyZeffyTickets", () => {
 			expect(mockDatabases.createDocument).toHaveBeenCalledWith(
 				expect.any(String),
 				"orders",
-				"unique()",
+				deriveDeterministicId("zfo", "pay_1"),
 				expect.objectContaining({ orderId: "pay_1", customerEmail: "jane@example.com" })
 			);
 		});
 
-		test("does not recreate a payment that's already recorded", async () => {
+		test("does not recreate a payment that's already recorded (deterministic id already exists)", async () => {
 			process.env.ZEFFY_API_KEY = "test_key";
-			mockDatabases.listDocuments.mockResolvedValue({ documents: [{ $id: "existing" }] });
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
+			mockDatabases.createDocument.mockRejectedValue(conflictError());
 			fetchMock.mockResolvedValueOnce(apiPaymentsPage([zeffyPayment("pay_1")]));
 			const ctx = makeContext({ body: {} });
 
 			const result = await handler(ctx);
 
 			expect(result.body.zeffyApiReconciliation).toEqual({ skipped: false, checked: 1, ordersCreated: 0, ticketsSaved: 0, failures: [] });
-			expect(mockDatabases.createDocument).not.toHaveBeenCalled();
+			expect(mockDatabases.createDocument).toHaveBeenCalledWith(
+				expect.any(String),
+				"orders",
+				deriveDeterministicId("zfo", "pay_1"),
+				expect.objectContaining({ orderId: "pay_1" })
+			);
 		});
 
 		test("pages through more than one page of Zeffy payments", async () => {

@@ -71,6 +71,7 @@ describe("Admin-RollupEventSales", () => {
 				cart: JSON.stringify([{ name: "Beer", price: 500, quantity: 2, alcohol: true }]),
 				tip: 100,
 				discount: 0,
+				total: 1100,
 				payment_due: 1100,
 			},
 		];
@@ -92,7 +93,7 @@ describe("Admin-RollupEventSales", () => {
 	});
 
 	test("combines ticket sales into revenue and profit, keeping pos_revenue as the POS-only figure", async () => {
-		const transactions = [{ cart: JSON.stringify([]), tip: 0, discount: 0, payment_due: 1000 }];
+		const transactions = [{ cart: JSON.stringify([]), tip: 0, discount: 0, total: 1000, payment_due: 1000 }];
 		const tickets = [
 			{ eventName: "Past Event", status: "VALID", price: 2000 },
 			{ eventName: "Past Event", status: "USED", price: 1500 },

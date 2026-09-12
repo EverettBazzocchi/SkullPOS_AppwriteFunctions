@@ -160,6 +160,37 @@ export default async ({ req, res, log, error }) => {
 			return res.json({ error: 'PaymentIntent amount does not match this payment leg' }, 400);
 		}
 
+		// Anti-replay: Stripe-CreatePaymentIntent stamps `metadata.transactionId`
+		// at creation time -- require it to match THIS transaction, otherwise a
+		// PaymentIntent that succeeded against one sale could be replayed here to
+		// "pay" a second, unrelated transaction for free.
+		if (!paymentIntent.metadata || paymentIntent.metadata.transactionId !== transactionId) {
+			error(
+				`PaymentIntent ${paymentIntent.id} metadata.transactionId (${paymentIntent.metadata?.transactionId}) does not match transaction ${transactionId}`,
+			);
+			return res.json({ error: 'PaymentIntent was not created for this transaction' }, 400);
+		}
+
+		// Anti-reuse: even with matching metadata, confirm this exact
+		// PaymentIntent hasn't already been recorded as a leg on some OTHER
+		// transaction. `stripe_id` is kept in sync below whenever a stripe leg
+		// is recorded, so this Query.equal lookup catches reuse regardless of
+		// which transaction the id was originally recorded against.
+		let reuseCheck;
+		try {
+			reuseCheck = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION_ID, [
+				Query.equal('stripe_id', paymentIntent.id),
+			]);
+		} catch (err) {
+			error('Failed to check PaymentIntent reuse: ' + err.message);
+			return res.json({ error: 'Failed to verify payment' }, 500);
+		}
+		const reusedElsewhere = (reuseCheck?.documents || []).some((doc) => doc.$id !== transactionId);
+		if (reusedElsewhere) {
+			error(`PaymentIntent ${paymentIntent.id} has already been recorded against a different transaction`);
+			return res.json({ error: 'This payment has already been used on another transaction' }, 400);
+		}
+
 		tipDelta = parseInt(paymentIntent.amount_details?.tip?.amount || 0);
 		leg.stripeId = paymentIntent.id;
 		leg.tip = tipDelta;
@@ -187,6 +218,9 @@ export default async ({ req, res, log, error }) => {
 			status: newStatus,
 			payment_method: newPaymentMethod,
 			tip: (parseInt(transaction.tip) || 0) + tipDelta,
+			// Kept in sync (not just appended into `payments`) so the reuse-guard
+			// Query.equal lookup above can find this leg from a future request.
+			...(method === 'stripe' ? { stripe_id: leg.stripeId } : {}),
 		});
 	} catch (err) {
 		error('Failed to record payment leg: ' + err.message);

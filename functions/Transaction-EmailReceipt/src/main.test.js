@@ -159,6 +159,23 @@ describe("Transaction-EmailReceipt", () => {
 		expect(sentBody.html).toContain("Card");
 	});
 
+	test("a legacy transaction shows the real card amount, not $0.00, even when payment_due was left at 0", async () => {
+		// The actual bug: a completed legacy transaction's payment_due had gone stale at 0 --
+		// the receipt must still show the real (non-zero) amount, derived from `total`.
+		mockDatabases.getDocument.mockResolvedValue(
+			baseTransaction({ payments: null, stripe_id: "pi_legacy", total: 1400, payment_due: 0 }),
+		);
+		mockResendSuccess();
+		const ctx = makeContext({ body: { transactionId: "t1", email: "customer@example.com" } });
+
+		await handler(ctx);
+
+		const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+		expect(sentBody.html).toContain("Card");
+		expect(sentBody.html).not.toContain("$0.00");
+		expect(sentBody.html).toContain("$14.00");
+	});
+
 	test("malformed cart JSON doesn't crash -- renders with no line items", async () => {
 		mockDatabases.getDocument.mockResolvedValue(baseTransaction({ cart: "{not valid json" }));
 		mockResendSuccess();
