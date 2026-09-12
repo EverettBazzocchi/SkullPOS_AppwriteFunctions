@@ -14,8 +14,13 @@ import { derivePaymentLegs } from './paymentLegs.js';
 // rather than pulling in a full HTTP client/SDK.
 const DATABASE_ID = '67c9ffd9003d68236514';
 const TRANSACTIONS_COLLECTION_ID = '68e4cd3500179ce661c6';
-const RECEIPT_SENDER = 'SkullPOS <receipts@mail.shotty.tech>';
+const RECEIPT_SENDER = 'SkullPOS <SkullPOS@mail.shotty.tech>';
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Every email this system sends CCs this address and closes with the same contact line --
+// see the identical constants in Transaction-RecordPayment/Admin-EmailDj/Admin-EmailBartender/
+// Admin-EmailCoordinator (each function stays self-contained, no shared email module).
+const ALWAYS_CC = 'everett.bazzocchi@skullspace.ca';
+const FOOTER_HTML = '<p style="color:#999;font-size:0.8em;margin-top:24px;">Questions or concerns? Email <a href="mailto:admin@skullspace.ca">admin@skullspace.ca</a>.</p>';
 
 const PAYMENT_METHOD_LABELS = {
 	cash: 'Cash',
@@ -87,6 +92,7 @@ function buildReceiptHtml(transaction, items, legs) {
 			<h3 style="margin-bottom:4px;">Paid by</h3>
 			<table style="width:100%;border-collapse:collapse;">${legRows}</table>
 			<p style="color:#999;font-size:0.85em;margin-top:24px;">Thank you for your purchase!</p>
+			${FOOTER_HTML}
 		</div>`;
 }
 
@@ -144,6 +150,7 @@ export default async ({ req, res, log, error }) => {
 			body: JSON.stringify({
 				from: RECEIPT_SENDER,
 				to: [email],
+				cc: [ALWAYS_CC],
 				subject: 'Your receipt from SkullPOS',
 				html,
 			}),

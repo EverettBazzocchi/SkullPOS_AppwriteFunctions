@@ -26,7 +26,7 @@ describe("Verify-Pin", () => {
 
 		const result = await handler(ctx);
 
-		expect(result).toEqual({ statusCode: 200, body: { ok: true, label: "Bartender", selfCheckout: false } });
+		expect(result).toEqual({ statusCode: 200, body: { ok: true, label: "Bartender", selfCheckout: false, bartenderId: null } });
 		expect(mockDatabases.listDocuments).toHaveBeenCalledWith(
 			expect.any(String),
 			"pins",
@@ -60,7 +60,7 @@ describe("Verify-Pin", () => {
 
 		const result = await handler(ctx);
 
-		expect(result.body).toEqual({ ok: true, label: "Self-Checkout Kiosk 1", selfCheckout: true });
+		expect(result.body).toEqual({ ok: true, label: "Self-Checkout Kiosk 1", selfCheckout: true, bartenderId: null });
 	});
 
 	test("a system:pos row reports selfCheckout:false (ordinary staff PIN)", async () => {
@@ -90,7 +90,7 @@ describe("Verify-Pin", () => {
 
 			const result = await handler(ctx);
 
-			expect(result.body).toEqual({ ok: true, label: "Bartender", selfCheckout: false });
+			expect(result.body).toEqual({ ok: true, label: "Bartender", selfCheckout: false, bartenderId: null });
 		});
 
 		test("does not attempt to grant membership when no caller id is present", async () => {
@@ -111,6 +111,99 @@ describe("Verify-Pin", () => {
 
 			expect(result.body).toEqual({ ok: false });
 			expect(mockTeams.createMembership).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("bartender pins", () => {
+		function mockBartenderRow({ name = "Alex", pin = "5678", events = [] } = {}) {
+			return { $id: "bt1", name, hash: hash(pin), active: true, events };
+		}
+
+		test("a bartender pin whose event is happening right now succeeds with its bartenderId", async () => {
+			mockDatabases.listDocuments
+				.mockResolvedValueOnce({ documents: [] }) // pins: no match
+				.mockResolvedValueOnce({ documents: [mockBartenderRow({ pin: "5678", events: [{ date: new Date().toISOString() }] })] });
+			const ctx = makeContext({ body: { pin: "5678" } });
+
+			const result = await handler(ctx);
+
+			expect(result.body).toEqual({ ok: true, label: "Alex", selfCheckout: false, bartenderId: "bt1" });
+			const [, collectionId, queries] = mockDatabases.listDocuments.mock.calls[1];
+			expect(collectionId).toBe("bartenders");
+			expect(queries.some((q) => q.includes("select"))).toBe(true);
+		});
+
+		test("accepts right at the 1-hour edge before an event starts", async () => {
+			const eventDate = new Date(Date.now() + 59 * 60 * 1000).toISOString();
+			mockDatabases.listDocuments
+				.mockResolvedValueOnce({ documents: [] })
+				.mockResolvedValueOnce({ documents: [mockBartenderRow({ pin: "5678", events: [{ date: eventDate }] })] });
+			const ctx = makeContext({ body: { pin: "5678" } });
+
+			const result = await handler(ctx);
+
+			expect(result.body.ok).toBe(true);
+		});
+
+		test("rejects a bartender pin more than 1 hour from its event, with a specific message", async () => {
+			const eventDate = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+			mockDatabases.listDocuments
+				.mockResolvedValueOnce({ documents: [] })
+				.mockResolvedValueOnce({ documents: [mockBartenderRow({ pin: "5678", events: [{ date: eventDate }] })] });
+			const ctx = makeContext({ body: { pin: "5678" } });
+
+			const result = await handler(ctx);
+
+			expect(result.body.ok).toBe(false);
+			expect(result.body.error).toMatch(/only valid within 1 hour/i);
+		});
+
+		test("accepts a pin well into a multi-hour shift, past the old fixed 1-hour-from-start cutoff", async () => {
+			// Event started 3.5 hours ago with a 4-hour (10pm-2am) bar window -- well outside a
+			// flat ±1h-from-start window, but still inside the actual shift + 1h buffer.
+			const eventDate = new Date(Date.now() - 3.5 * 60 * 60 * 1000).toISOString();
+			mockDatabases.listDocuments
+				.mockResolvedValueOnce({ documents: [] })
+				.mockResolvedValueOnce({
+					documents: [mockBartenderRow({ pin: "5678", events: [{ date: eventDate, barOpenTime: "2200", barCloseTime: "02:00" }] })],
+				});
+			const ctx = makeContext({ body: { pin: "5678" } });
+
+			const result = await handler(ctx);
+
+			expect(result.body.ok).toBe(true);
+		});
+
+		test("rejects a bartender with no assigned events at all", async () => {
+			mockDatabases.listDocuments
+				.mockResolvedValueOnce({ documents: [] })
+				.mockResolvedValueOnce({ documents: [mockBartenderRow({ pin: "5678", events: [] })] });
+			const ctx = makeContext({ body: { pin: "5678" } });
+
+			const result = await handler(ctx);
+
+			expect(result.body.ok).toBe(false);
+		});
+
+		test("a pin matching neither pins nor bartenders returns the same plain ok:false", async () => {
+			mockDatabases.listDocuments.mockResolvedValueOnce({ documents: [] }).mockResolvedValueOnce({ documents: [] });
+			const ctx = makeContext({ body: { pin: "0000" } });
+
+			const result = await handler(ctx);
+
+			expect(result).toEqual({ statusCode: 200, body: { ok: false } });
+		});
+
+		test("still grants payment-team membership for a valid bartender pin", async () => {
+			mockDatabases.listDocuments
+				.mockResolvedValueOnce({ documents: [] })
+				.mockResolvedValueOnce({ documents: [mockBartenderRow({ pin: "5678", events: [{ date: new Date().toISOString() }] })] });
+			const ctx = makeContext({ body: { pin: "5678" }, headers: { "x-appwrite-user-id": "u1" } });
+
+			const result = await handler(ctx);
+
+			expect(result.body.ok).toBe(true);
+			expect(mockTeams.createMembership).toHaveBeenCalledWith(PIN_PAYMENT_TEAM_ID, [], undefined, "u1");
 		});
 	});
 

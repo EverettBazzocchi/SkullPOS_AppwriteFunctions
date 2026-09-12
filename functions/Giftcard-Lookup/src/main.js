@@ -52,5 +52,16 @@ export default async ({ req, res, log, error }) => {
 	}
 
 	log('Giftcard found: ' + found.$id);
-	return res.json({ found: true, id: found.$id, balance: found.balance || 0 });
+	return res.json({
+		found: true,
+		id: found.$id,
+		balance: found.balance || 0,
+		// DJ-voucher signals -- absent/false for every standing customer gift card. `events`/`djs`
+		// are relationship attributes that come back as plain related-document IDs (not nested
+		// objects) on a direct getDocument/listDocuments call. The authoritative event/discount/
+		// revocation checks happen at payment time in Transaction-RecordPayment, not here -- this
+		// is informational only, so POS can show the right message before checkout is attempted.
+		eventId: found.events?.$id || found.events || null,
+		active: found.active !== false,
+	});
 };

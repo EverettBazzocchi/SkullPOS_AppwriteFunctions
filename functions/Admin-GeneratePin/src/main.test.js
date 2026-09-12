@@ -28,9 +28,11 @@ describe("Admin-GeneratePin", () => {
 			expect(data.system).toBe("pos");
 			expect(data.label).toBe("Bartender");
 			expect(data.active).toBe(true);
-			// the raw pin is never persisted, only its hash
+			// the hash is still stored for verification, and the raw pin is now ALSO stored
+			// (encrypted at rest) so the admin app can show it persistently, not just once.
 			expect(data.hash).not.toBe(result.body.pin);
 			expect(data.hash).toMatch(/^[0-9a-f]{64}$/);
+			expect(data.pin).toBe(result.body.pin);
 		});
 
 		test("rejects an invalid system", async () => {
@@ -71,7 +73,11 @@ describe("Admin-GeneratePin", () => {
 				expect.any(String),
 				"pins",
 				"pin1",
-				expect.objectContaining({ active: true, hash: expect.stringMatching(/^[0-9a-f]{64}$/) })
+				expect.objectContaining({
+					active: true,
+					hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+					pin: expect.stringMatching(/^\d{4}$/),
+				})
 			);
 		});
 

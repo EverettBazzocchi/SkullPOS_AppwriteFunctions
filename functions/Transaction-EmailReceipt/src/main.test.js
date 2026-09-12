@@ -47,10 +47,12 @@ describe("Transaction-EmailReceipt", () => {
 		);
 		const [, options] = mockFetch.mock.calls[0];
 		const sentBody = JSON.parse(options.body);
-		expect(sentBody.from).toBe("SkullPOS <receipts@mail.shotty.tech>");
+		expect(sentBody.from).toBe("SkullPOS <SkullPOS@mail.shotty.tech>");
 		expect(sentBody.to).toEqual(["customer@example.com"]);
+		expect(sentBody.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
 		expect(sentBody.html).toContain("Beer");
 		expect(sentBody.html).toContain("$14.00");
+		expect(sentBody.html).toContain("admin@skullspace.ca");
 	});
 
 	test("sends a receipt for a refunded transaction, noting the refund", async () => {

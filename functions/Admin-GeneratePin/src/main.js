@@ -73,7 +73,7 @@ export default async ({ req, res, log, error }) => {
 
 		const pin = generatePin();
 		try {
-			await databases.updateDocument(DATABASE_ID, PINS_COLLECTION_ID, pinId, { hash: hashPin(pin), active: true });
+			await databases.updateDocument(DATABASE_ID, PINS_COLLECTION_ID, pinId, { hash: hashPin(pin), pin, active: true });
 		} catch (err) {
 			error('Failed to regenerate pin: ' + err.message);
 			return res.json({ error: `Failed to regenerate pin: ${err.message}` }, 500);
@@ -97,6 +97,7 @@ export default async ({ req, res, log, error }) => {
 			system,
 			label,
 			hash: hashPin(pin),
+			pin,
 			active: true,
 		});
 	} catch (err) {

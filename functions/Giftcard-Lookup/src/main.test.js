@@ -19,7 +19,29 @@ describe("Giftcard-Lookup", () => {
 
 		const result = await handler(ctx);
 
-		expect(result.body).toEqual({ found: true, id: "gc1", balance: 500 });
+		expect(result.body).toEqual({ found: true, id: "gc1", balance: 500, eventId: null, active: true });
+	});
+
+	test("surfaces DJ-voucher fields for a card linked to an event", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({
+			documents: [{ $id: "gc9", UPC: "75855999", balance: 2000, events: "event1", active: true }],
+		});
+		const ctx = makeContext({ body: { code: "75855999" } });
+
+		const result = await handler(ctx);
+
+		expect(result.body).toEqual({ found: true, id: "gc9", balance: 2000, eventId: "event1", active: true });
+	});
+
+	test("a revoked voucher reports active:false", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({
+			documents: [{ $id: "gc10", UPC: "75855111", balance: 1000, events: "event1", active: false }],
+		});
+		const ctx = makeContext({ body: { code: "75855111" } });
+
+		const result = await handler(ctx);
+
+		expect(result.body.active).toBe(false);
 	});
 
 	test("finds a card whose UPC is stored as an array", async () => {
@@ -30,7 +52,7 @@ describe("Giftcard-Lookup", () => {
 
 		const result = await handler(ctx);
 
-		expect(result.body).toEqual({ found: true, id: "gc2", balance: 1000 });
+		expect(result.body).toEqual({ found: true, id: "gc2", balance: 1000, eventId: null, active: true });
 	});
 
 	test("never returns more than the one matched card, even if others come back", async () => {
@@ -44,7 +66,7 @@ describe("Giftcard-Lookup", () => {
 
 		const result = await handler(ctx);
 
-		expect(result.body).toEqual({ found: true, id: "gc1", balance: 500 });
+		expect(result.body).toEqual({ found: true, id: "gc1", balance: 500, eventId: null, active: true });
 		expect(result.body.balance).not.toBe(999999);
 	});
 

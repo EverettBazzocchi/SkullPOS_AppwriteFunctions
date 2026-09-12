@@ -25,6 +25,10 @@ const mockTeams = {
 	createMembership: jest.fn(),
 };
 
+const mockStorage = {
+	createFile: jest.fn().mockResolvedValue({ $id: "file1" }),
+};
+
 class Client {
 	setEndpoint() {
 		return this;
@@ -55,6 +59,17 @@ class Teams {
 	}
 }
 
+class Storage {
+	constructor() {
+		return mockStorage;
+	}
+}
+
+// Fixed (not random) so a test can assert on the exact generated barcode/file URL.
+const ID = {
+	unique: () => "unique-id-1",
+};
+
 // Simple pass-through query builders -- good enough for asserting "was
 // called with a query mentioning this field", not meant to byte-match
 // Appwrite's real wire format.
@@ -67,12 +82,28 @@ const Query = {
 	orderDesc: (attr) => `orderDesc("${attr}")`,
 	limit: (n) => `limit(${n})`,
 	cursorAfter: (id) => `cursorAfter("${id}")`,
+	select: (values) => `select(${JSON.stringify(values)})`,
 };
 
 function resetAppwriteMocks() {
 	Object.values(mockDatabases).forEach((fn) => fn.mockReset());
 	Object.values(mockUsers).forEach((fn) => fn.mockReset());
 	Object.values(mockTeams).forEach((fn) => fn.mockReset());
+	mockStorage.createFile.mockReset();
+	mockStorage.createFile.mockResolvedValue({ $id: "file1" });
 }
 
-module.exports = { Client, Databases, Users, Teams, Query, mockDatabases, mockUsers, mockTeams, resetAppwriteMocks };
+module.exports = {
+	Client,
+	Databases,
+	Users,
+	Teams,
+	Storage,
+	ID,
+	Query,
+	mockDatabases,
+	mockUsers,
+	mockTeams,
+	mockStorage,
+	resetAppwriteMocks,
+};

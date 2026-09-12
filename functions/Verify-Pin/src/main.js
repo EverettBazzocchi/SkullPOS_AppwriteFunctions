@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { Databases, Teams, Query } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
+import { computeEventWindow } from './eventWindow.js';
 
 function hashPin(pin) {
     return crypto.createHash('sha256').update(String(pin)).digest('hex');
@@ -18,11 +19,26 @@ const PIN_PAYMENT_TEAM_ID = '6a9cbb1c95ea7d59dd8c';
 
 const DATABASE_ID = '67c9ffd9003d68236514';
 const PINS_COLLECTION_ID = 'pins';
+const BARTENDERS_COLLECTION_ID = 'bartenders';
+const PIN_VALID_WINDOW_MS = 60 * 60 * 1000; // buffer on each side of the event's actual window
+
+// True if `now` falls within 1 hour of any of this bartender's assigned events' actual
+// start-to-close window (see eventWindow.js) -- a bartender pin only works for the event(s)
+// they're actually scheduled for, covering their whole shift, not permanently like a
+// POS/self-checkout pin.
+function isWithinAnyEventWindow(events, now = Date.now()) {
+	if (!Array.isArray(events)) return false;
+	return events.some((event) => {
+		const window = computeEventWindow(event);
+		if (!window) return false;
+		return now >= window.startMs - PIN_VALID_WINDOW_MS && now <= window.endMs + PIN_VALID_WINDOW_MS;
+	});
+}
 
 // Verifies a quick-access PIN for the POS's restricted "cashier mode" (no
-// refunds, sales reports capped at 24 hours) or the self-checkout kiosk
-// mode (system:'self_checkout' rows -- no refunds/history/reporting at
-// all, card-only payment).
+// refunds, sales reports capped at 24 hours), the self-checkout kiosk mode
+// (system:'self_checkout' rows -- no refunds/history/reporting at all,
+// card-only payment), or a bartender's own event-scoped pin.
 //
 // PINs are stored as sha256(pin) rows in the shared `pins` collection
 // (system in ['pos','self_checkout'], plus 'ticketing' for
@@ -30,6 +46,13 @@ const PINS_COLLECTION_ID = 'pins';
 // via Admin-GeneratePin. Formerly a PINS_JSON environment variable; moved
 // to a database collection so PINs can be generated/rotated/revoked from a
 // client instead of hand-edited via the console/CLI.
+//
+// Bartender pins are a separate `bartenders` collection (own hash, not
+// mixed into `pins`) -- checked only if nothing in `pins` matched, since a
+// bartender pin has an extra rule none of the others do (only valid within
+// 1 hour of one of their assigned events' `date`) and resolves to a real
+// bartender document id (`bartenderId`) rather than just a display label,
+// so POS can attribute every sale they make back to their own row.
 export default async ({ req, res, log, error }) => {
     let body;
     try {
@@ -61,12 +84,42 @@ export default async ({ req, res, log, error }) => {
         return res.json({ ok: false, error: 'Server not configured' }, 500);
     }
 
-    if (!match) {
-        log('PIN verification failed (no match)');
-        return res.json({ ok: false });
+    // Resolves to what the rest of this function needs regardless of which collection matched:
+    // a display label, whether it's the self-checkout kiosk mode, and (bartenders only) the
+    // bartender's own document id, so POS can attribute every sale they make back to them.
+    let resolved;
+
+    if (match) {
+        resolved = { label: match.label || null, selfCheckout: match.system === 'self_checkout', bartenderId: null };
+    } else {
+        let bartender;
+        try {
+            const result = await databases.listDocuments(DATABASE_ID, BARTENDERS_COLLECTION_ID, [
+                Query.equal('hash', pinHash),
+                Query.equal('active', true),
+                Query.select(['*', 'events.*']),
+                Query.limit(1),
+            ]);
+            bartender = result.documents[0];
+        } catch (err) {
+            error('Failed to query bartenders: ' + err.message);
+            return res.json({ ok: false, error: 'Server not configured' }, 500);
+        }
+
+        if (!bartender) {
+            log('PIN verification failed (no match)');
+            return res.json({ ok: false });
+        }
+
+        if (!isWithinAnyEventWindow(bartender.events)) {
+            log(`Bartender pin for ${bartender.name} rejected -- outside its event's 1-hour window`);
+            return res.json({ ok: false, error: "This pin is only valid within 1 hour of your event's start time" });
+        }
+
+        resolved = { label: bartender.name || null, selfCheckout: false, bartenderId: bartender.$id };
     }
 
-    log('PIN verified: ' + (match.label || 'unlabeled'));
+    log('PIN verified: ' + (resolved.label || 'unlabeled'));
 
     // Grant this session's user (the anonymous account the client creates
     // BEFORE calling this function -- see api.js's loginWithPin) membership
@@ -86,5 +139,5 @@ export default async ({ req, res, log, error }) => {
         error('No caller id on the request -- session must be created before verifying the PIN');
     }
 
-    return res.json({ ok: true, label: match.label || null, selfCheckout: match.system === 'self_checkout' });
+    return res.json({ ok: true, label: resolved.label, selfCheckout: resolved.selfCheckout, bartenderId: resolved.bartenderId });
 };

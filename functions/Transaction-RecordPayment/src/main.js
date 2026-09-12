@@ -1,5 +1,5 @@
 import Stripe from 'stripe';
-import { Databases } from 'node-appwrite';
+import { Databases, Query } from 'node-appwrite';
 import fetch from 'node-fetch';
 import { createAppwriteClient } from './appwriteClient.js';
 
@@ -19,7 +19,14 @@ import { createAppwriteClient } from './appwriteClient.js';
 const DATABASE_ID = '67c9ffd9003d68236514';
 const TRANSACTIONS_COLLECTION_ID = '68e4cd3500179ce661c6';
 const GIFTCARDS_COLLECTION_ID = 'giftcards';
+const EVENTS_COLLECTION_ID = '68e400210008d19bb5c9';
 const ALLOWED_METHODS = ['cash', 'stripe', 'giftcard'];
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Every email this system sends CCs this address and closes with the same contact line -- see
+// the identical constants in Transaction-EmailReceipt/Admin-EmailDj/Admin-EmailBartender/
+// Admin-EmailCoordinator (each function stays self-contained, no shared email module).
+const ALWAYS_CC = 'everett.bazzocchi@skullspace.ca';
+const FOOTER_HTML = '<p style="color:#999;font-size:0.8em;margin-top:24px;">Questions or concerns? Email <a href="mailto:admin@skullspace.ca">admin@skullspace.ca</a>.</p>';
 
 export default async ({ req, res, log, error }) => {
 	let body;
@@ -82,6 +89,35 @@ export default async ({ req, res, log, error }) => {
 		} catch (err) {
 			error('Failed to read giftcard: ' + err.message);
 			return res.json({ error: 'Giftcard not found' }, 404);
+		}
+
+		// A DJ voucher is just a giftcard row with an `events` link -- standing customer gift
+		// cards never have one, so this whole block is a no-op for them. Two rules, enforced
+		// here (not just client-side) since this is the only place a giftcard leg is ever
+		// actually applied: a voucher only works during its own event, and never alongside a
+		// discount.
+		const voucherEventId = giftcard.events?.$id || giftcard.events || null;
+		if (voucherEventId) {
+			if (giftcard.active === false) {
+				return res.json({ error: 'This voucher has been revoked' }, 400);
+			}
+			if ((parseInt(transaction.discount) || 0) > 0) {
+				return res.json({ error: "DJ vouchers can't be combined with a discount" }, 400);
+			}
+			let activeEvent;
+			try {
+				const result = await databases.listDocuments(DATABASE_ID, EVENTS_COLLECTION_ID, [
+					Query.equal('isActive', true),
+					Query.limit(1),
+				]);
+				activeEvent = result.documents?.[0] || null;
+			} catch (err) {
+				error("Failed to check active event for DJ voucher: " + err.message);
+				return res.json({ error: "Failed to verify this voucher's event" }, 500);
+			}
+			if (!activeEvent || activeEvent.$id !== voucherEventId) {
+				return res.json({ error: 'This voucher is only valid during its own event' }, 400);
+			}
 		}
 
 		const balance = parseInt(giftcard.balance) || 0;
@@ -193,6 +229,11 @@ async function notifyFinanceOfMembershipPayment({ to, name, email, amount, date 
 	const amountStr = new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(
 		(parseInt(amount) || 0) / 100,
 	);
+	// CC the member on their own dues receipt (in addition to the standing everett CC) -- best
+	// effort: an invalid/missing member email just means one less CC, never blocks the notice.
+	const cc = [ALWAYS_CC];
+	if (email && EMAIL_PATTERN.test(email)) cc.push(email);
+
 	const response = await fetch('https://api.resend.com/emails', {
 		method: 'POST',
 		headers: {
@@ -200,8 +241,9 @@ async function notifyFinanceOfMembershipPayment({ to, name, email, amount, date 
 			'Content-Type': 'application/json',
 		},
 		body: JSON.stringify({
-			from: 'SkullPOS <receipts@mail.shotty.tech>',
+			from: 'SkullPOS <SkullPOS@mail.shotty.tech>',
 			to: [to],
+			cc,
 			subject: `Membership dues paid: ${name || 'unknown member'}`,
 			html: `<p>A membership dues payment was just completed.</p>
 				<ul>
@@ -209,7 +251,8 @@ async function notifyFinanceOfMembershipPayment({ to, name, email, amount, date 
 					<li><strong>Email:</strong> ${escapeHtml(email || '(not provided)')}</li>
 					<li><strong>Amount:</strong> ${amountStr}</li>
 					<li><strong>Date:</strong> ${escapeHtml(date)}</li>
-				</ul>`,
+				</ul>
+				${FOOTER_HTML}`,
 		}),
 	});
 

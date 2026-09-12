@@ -124,6 +124,86 @@ describe("Transaction-RecordPayment", () => {
 		});
 	});
 
+	describe("DJ voucher legs", () => {
+		const voucherCtx = () =>
+			makeContext({ body: { transactionId: "t1", method: "giftcard", amount: 400, giftcardId: "gc1" } });
+
+		test("rejects a revoked voucher", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockResolvedValueOnce({ balance: 2000, events: "event1", active: false });
+
+			const result = await handler(voucherCtx());
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(/revoked/i);
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("rejects a voucher leg when a discount is applied to the sale", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction({ discount: 200 }))
+				.mockResolvedValueOnce({ balance: 2000, events: "event1", active: true });
+
+			const result = await handler(voucherCtx());
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(/combined with a discount/i);
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("rejects a voucher leg when no event is currently active", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockResolvedValueOnce({ balance: 2000, events: "event1", active: true });
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
+
+			const result = await handler(voucherCtx());
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(/only valid during its own event/i);
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("rejects a voucher leg when a different event is currently active", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockResolvedValueOnce({ balance: 2000, events: "event1", active: true });
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [{ $id: "event2" }] });
+
+			const result = await handler(voucherCtx());
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(/only valid during its own event/i);
+		});
+
+		test("accepts a voucher leg when active, matching event, and no discount", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockResolvedValueOnce({ balance: 2000, events: "event1", active: true });
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [{ $id: "event1" }] });
+			mockDatabases.updateDocument.mockResolvedValue({});
+
+			const result = await handler(voucherCtx());
+
+			expect(result.body).toEqual({ ok: true, remaining: 600, status: "pending" });
+			const giftcardCall = mockDatabases.updateDocument.mock.calls.find((c) => c[2] === "gc1");
+			expect(giftcardCall[3]).toEqual({ balance: 1600 });
+		});
+
+		test("a standing giftcard (no events link) is unaffected by the discount rule", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction({ discount: 500 }))
+				.mockResolvedValueOnce({ balance: 2000 }); // no `events`, no `active` -- a standard giftcard
+			mockDatabases.updateDocument.mockResolvedValue({});
+
+			const result = await handler(voucherCtx());
+
+			expect(result.body).toEqual({ ok: true, remaining: 600, status: "pending" });
+			expect(mockDatabases.listDocuments).not.toHaveBeenCalled();
+		});
+	});
+
 	describe("stripe legs", () => {
 		test("records a verified card charge, including its tip", async () => {
 			mockDatabases.getDocument.mockResolvedValue(baseTransaction());
@@ -318,8 +398,25 @@ describe("Transaction-RecordPayment", () => {
 			);
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 			expect(sentBody.to).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			expect(sentBody.cc).toEqual(expect.arrayContaining(["everett.bazzocchi@skullspace.ca", "jane@example.com"]));
 			expect(sentBody.html).toContain("Jane Member");
 			expect(sentBody.html).toContain("jane@example.com");
+			expect(sentBody.html).toContain("admin@skullspace.ca");
+		});
+
+		test("does not cc the member when no valid member_email is on the transaction", async () => {
+			mockDatabases.getDocument.mockResolvedValue(baseTransaction({ channel: "membership", total: 4000 }));
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "succeeded", amount: 1000 });
+			mockFetch.mockResolvedValue({ ok: true, text: () => Promise.resolve("{}") });
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+			});
+
+			await handler(ctx);
+
+			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+			expect(sentBody.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
 		});
 
 		test("a non-testing membership payment notifies finance's real address, not the test one", async () => {

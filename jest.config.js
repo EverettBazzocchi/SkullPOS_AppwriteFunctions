@@ -8,7 +8,9 @@ module.exports = {
 	// tests don't need a network call or a heavy local install to run.
 	moduleNameMapper: {
 		"^node-appwrite$": "<rootDir>/test/mocks/node-appwrite.js",
+		"^node-appwrite/file$": "<rootDir>/test/mocks/node-appwrite-file.js",
 		"^stripe$": "<rootDir>/test/mocks/stripe.js",
 		"^node-fetch$": "<rootDir>/test/mocks/node-fetch.js",
+		"^bwip-js$": "<rootDir>/test/mocks/bwip-js.js",
 	},
 };
