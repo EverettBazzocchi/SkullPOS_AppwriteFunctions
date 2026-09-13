@@ -162,6 +162,20 @@ export default async ({ req, res, log, error }) => {
             // accepting it as payment -- otherwise a PaymentIntent that succeeded
             // against one sale could be replayed to "pay" a second, unrelated one.
             metadata: { transactionId: body.transactionId },
+        }, {
+            // Makes this call safe to RETRY, which is the whole reason the register is allowed to
+            // retry it. Without a key, `paymentIntents.create` is create-every-time: a request that
+            // timed out on the way back -- the executor occasionally stalls a dispatch until the
+            // ceiling -- would leave one intent already made and mint a SECOND for the same sale.
+            // Two intents for one transaction is a reconciliation problem at best, and a double
+            // charge if both are ever confirmed.
+            //
+            // Keyed on transactionId because that is what identifies the SALE: the same sale
+            // retried returns the original intent instead of minting another, and a genuinely new
+            // sale carries a new id and is unaffected. Stripe also rejects a reused key sent with
+            // different parameters, so a collision fails loudly rather than quietly charging the
+            // wrong amount.
+            idempotencyKey: `pi_${body.transactionId}`,
         });
 
         log('Stripe payment intent created successfully');

@@ -17,13 +17,18 @@ describe("Stripe-CreatePaymentIntent", () => {
 			const result = await handler(ctx);
 
 			expect(result.body).toEqual({ intent: { id: "pi_1", client_secret: "secret_1" } });
-			expect(mockStripe.paymentIntents.create).toHaveBeenCalledWith({
-				amount: 500,
-				currency: 'cad',
-				payment_method_types: ['card_present', 'interac_present'],
-				capture_method: 'automatic',
-				metadata: { transactionId: "txn_abc" },
-			});
+			expect(mockStripe.paymentIntents.create).toHaveBeenCalledWith(
+				{
+					amount: 500,
+					currency: 'cad',
+					payment_method_types: ['card_present', 'interac_present'],
+					capture_method: 'automatic',
+					metadata: { transactionId: "txn_abc" },
+				},
+				// Second argument is new: the retry-safety key. See main.js for why a create without
+				// one cannot be retried.
+				{ idempotencyKey: "pi_txn_abc" },
+			);
 			expect(mockStripe.lastConstructedWithKey).toBe("sk_test_fake");
 		});
 
@@ -35,6 +40,9 @@ describe("Stripe-CreatePaymentIntent", () => {
 
 			expect(mockStripe.paymentIntents.create).toHaveBeenCalledWith(
 				expect.objectContaining({ metadata: { transactionId: "txn_abc" } }),
+				// The create now takes a second options argument (the retry-safety key); this
+				// assertion only cares about the metadata stamp, but it has to match arity.
+				expect.any(Object),
 			);
 		});
 
@@ -201,5 +209,35 @@ describe("Stripe-CreatePaymentIntent", () => {
 		const result = await handler(ctx);
 
 		expect(result.statusCode).toBe(400);
+	});
+});
+
+// The register is now allowed to retry a timed-out execution, and that is only safe because the
+// create carries an idempotency key. Without it a retry mints a SECOND PaymentIntent for one sale --
+// two intents to reconcile, and a double charge if both are ever confirmed.
+describe("retry safety", () => {
+	beforeEach(() => {
+		resetStripeMocks();
+		process.env.testKey = "sk_test_fake";
+		process.env.prodKey = "sk_live_fake";
+	});
+
+	test("creates the intent under a key derived from the transaction", async () => {
+		mockStripe.paymentIntents.create.mockResolvedValue({ id: "pi_1", client_secret: "cs_1" });
+		await handler(makeContext({ body: { test: "test", amount: 1500, transactionId: "txn_abc" } }));
+
+		expect(mockStripe.paymentIntents.create).toHaveBeenCalledTimes(1);
+		expect(mockStripe.paymentIntents.create.mock.calls[0][1]).toEqual(
+			expect.objectContaining({ idempotencyKey: "pi_txn_abc" }),
+		);
+	});
+
+	test("a different sale gets a different key, so real sales are never collapsed into one", async () => {
+		mockStripe.paymentIntents.create.mockResolvedValue({ id: "pi_2", client_secret: "cs_2" });
+		await handler(makeContext({ body: { test: "test", amount: 1500, transactionId: "txn_one" } }));
+		await handler(makeContext({ body: { test: "test", amount: 1500, transactionId: "txn_two" } }));
+
+		const keys = mockStripe.paymentIntents.create.mock.calls.map((c) => c[1].idempotencyKey);
+		expect(keys).toEqual(["pi_txn_one", "pi_txn_two"]);
 	});
 });
