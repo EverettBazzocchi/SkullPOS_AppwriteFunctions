@@ -1,47 +1,74 @@
 # Item-SetEnabled
 
-Toggles a menu item's `enabled_menu` flag, server-side. This is the
-**only** field this function will ever touch.
+**Function ID:** `6a9c6aad6d4a29ab66ee`
 
-The client has no write access to `pos_items` at all (removed alongside
-the rest of the POS PIN-system security plan) -- a blanket update grant
-would let any session, anonymous quick-access PIN sessions included,
-change *any* field on *any* item directly (price, alcohol flag, POS
-visibility, etc.), e.g. reprice a bottle to a cent and ring up unlimited
-cheap sales. Unlike Transactions/giftcards there's no natural "creator" to
-scope a document permission to (items are a shared, pre-existing catalog,
-not something a cashier creates), so this is a narrow single-purpose
-function instead: it only accepts `{itemId, enabled}` and only ever writes
-`enabled_menu`.
+Toggles one boolean visibility flag on one menu item. `field` is restricted to an
+allowlist of exactly two values — `enabled_menu` and `enabled_pos` — and those
+are the only fields this function will ever write.
+
+The client has no write access to `pos_items` at all. A blanket update grant
+would let any session, anonymous PIN sessions included, change *any* field on
+*any* item: reprice a bottle to a cent and ring up unlimited cheap sales, or flip
+the alcohol flag. Unlike `Transactions` or `giftcards` there is no natural
+"creator" to scope a document permission to — items are shared catalogue rows a
+cashier did not create — so a narrow single-purpose function is the whole
+mechanism.
+
+## Who may call it
+
+Live `execute`: **`team:68e35aed00144b8cde9d` (admin) only**. Verified 2026-09-13
+with `appwrite functions get --function-id 6a9c6aad6d4a29ab66ee`.
+
+There is no in-code caller check here, so a project API key with
+`execution.write` could invoke it directly. The blast radius is bounded by the
+field allowlist: the worst such a caller can do is hide or show a menu item.
 
 ## Request body
 
 ```json
-{ "itemId": "...", "enabled": false }
+{ "itemId": "...", "enabled": false, "field": "enabled_menu" }
 ```
 
-## Response
+- `itemId` — required.
+- `enabled` — required, must be a real boolean (a string `"false"` is a `400`).
+- `field` — optional, `enabled_menu` (default) or `enabled_pos`. `enabled_menu`
+  controls the public menu boards; `enabled_pos` controls whether the item
+  appears on the register.
 
-`{ "ok": true, "enabled": false }` or `{ "error": "<message>" }` with a
-4xx status.
+## Responses
+
+| Status | Body | What it means operationally |
+| --- | --- | --- |
+| `200` | `{ ok: true, enabled }` | Written. |
+| `400` | `{ error: "Invalid request body" }` | Unparseable JSON. |
+| `400` | `{ error: "Missing itemId or enabled (boolean)" }` | Malformed call. |
+| `400` | `{ error: "field must be one of: enabled_menu, enabled_pos" }` | Anything outside the allowlist. |
+| `404` | `{ error: "Item not found or failed to update" }` | Covers both a bad `itemId` and a write rejected by Appwrite — the execution log has the real message. |
+
+## Scopes
+
+| Scope | Why |
+| --- | --- |
+| `documents.write` | `updateDocument` on `pos_items`. |
+
+No `documents.read`: the function never reads the item first.
+
+## Environment variables
+
+None.
 
 ## Configuration
 
-| Setting     | Value                                        |
-| ----------- | ----------------------------------------------- |
-| Runtime     | Node (16.0)                                     |
-| Entrypoint  | `src/main.js`                                   |
-| Build       | `npm i`                                         |
-| Execute     | `users` (any session -- matches today's behavior, no new restriction added) |
-| Scopes      | `documents.write`                               |
+| Setting | Value |
+| --- | --- |
+| Runtime | `node-16.0` |
+| Entrypoint | `src/main.js` |
+| Build command | `npm i` |
+| Timeout | 15s |
+| Schedule | none |
 
-## Note on calling Appwrite's own API from within a function
+Deploy: `appwrite push function --function-id 6a9c6aad6d4a29ab66ee`
 
-This self-hosted instance's function-execution sandbox can't resolve its
-own public hostname via the normal `getaddrinfo` path (used internally by
-`fetch`/`http`) -- `dns.resolve4` (talks to nameservers directly,
-bypassing `getaddrinfo`) works fine though. `src/appwriteClient.js` patches
-the global `dns.lookup` so any HTTP client resolving this hostname gets the
-known-good IP instead of hanging/`EAI_AGAIN`; the URL/Host header is
-untouched, only the DNS step is bypassed. Every function that needs to
-call Databases/Teams/Users uses this same helper.
+## Calling Appwrite's own API from inside a function
+
+See the DNS-patch note in `functions/Giftcard-Lookup/README.md`.

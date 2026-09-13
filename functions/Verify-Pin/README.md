@@ -1,20 +1,121 @@
 # Verify-Pin
 
-Verifies a quick-access PIN for the POS's restricted "cashier mode" (no
-refunds, sales reports capped at 24 hours).
+**Function ID:** `6a9c4acd49bc458907e7`
 
-PINs live in the `PINS_JSON` **secret** environment variable, not a
-database collection -- reading one here would mean a network round trip to
-this instance's own API just to check a handful of PINs, when an env var
-needs no network call at all and gets the same write-only protection as
-the Stripe keys. PINs are stored as `sha256(pin)`, never in plaintext, and
-the variable is secret (write-only) so no one -- including this codebase's
-own tooling -- can read the value back out once set.
+Verifies a quick-access PIN and, on success, grants the calling session the team
+membership it needs to charge a card. Three kinds of PIN resolve through here:
 
-On a successful match, this function DOES make one network call to this
-instance's own API (via `appwriteClient.js`'s DNS-patch workaround for a
-self-hosted quirk where the public hostname doesn't resolve from inside a
-function) -- see "Payment-team membership" below.
+- **POS cashier** — `pins` rows with `system: 'pos'`. Restricted mode: no
+  refunds, sales reports capped at 24 hours.
+- **Self-checkout kiosk** — `pins` rows with `system: 'self_checkout'`. Returns
+  `selfCheckout: true` so the client routes to `/self-checkout` instead of the
+  staff `/pos` screen. Getting that flag right is what keeps a kiosk PIN from
+  opening the full staff UI.
+- **Bartender** — rows in the separate `bartenders` collection. These carry an
+  extra rule none of the others do (valid only near one of the bartender's
+  assigned events) and resolve to a real `bartenderId`, so POS can attribute
+  every sale back to that person.
+
+## PINs live in the database, not an environment variable
+
+PINs are `sha256(pin)` rows in the shared `pins` collection, managed from the
+admin app through `Admin-GeneratePin` (create / regenerate / revoke). Bartender
+PINs are hashed the same way in `bartenders`.
+
+The `PINS_JSON` secret variable this function was originally built around is
+**gone from the code** — `src/main.js` never reads `process.env.PINS_JSON`. It is
+still set on the live function; it does nothing, and editing it changes nothing.
+
+## Who may call it
+
+Live `execute`: **`any`**. Verified 2026-09-13 with
+`appwrite functions get --function-id 6a9c4acd49bc458907e7`. It has to be — the
+caller has no credentials yet; that is the point.
+
+That makes the rate limiter, not an allowlist, the real control.
+
+## Rate limiting
+
+Two buckets are checked and written on **every** failed attempt, both in the
+shared `rate_limits` collection:
+
+| Bucket | Document id | Ceiling | Why |
+| --- | --- | --- | --- |
+| caller | `pin_c_<sha1>` of `x-appwrite-user-id` (else the IP) | 5 | Per device, so one till's typos do not lock out every other device on the venue's egress. |
+| IP | `pin_ip_<sha1>` of the trusted IP | 30 | A caller can mint a fresh anonymous session for a fresh caller bucket, so this is the ceiling that cannot be walked away from. |
+
+Window and lockout are both 15 minutes.
+
+The IP is the **rightmost** element of `x-forwarded-for` — the one the trusted
+proxy appended. Everything to its left is caller-authored, because Appwrite's own
+`createExecution` lets a caller supply an arbitrary header map. This assumes
+exactly one trusted proxy in front of the runtime (which is what the deployment
+behind `api.cloud.shotty.tech` is); add another and the trusted element moves to
+Nth-from-last.
+
+**Reads fail open, writes fail closed.** A rate-limit storage hiccup must never
+lock staff out of the till, so an unreadable counter just proceeds. But a failed
+attempt that could not be *recorded* leaves no trace and the next attempt starts
+from zero — i.e. the endpoint is running with no brute-force defence at all — so
+that is answered `503`, turning a silent permanent hole into a visible outage.
+
+`rate_limits` has exactly three attributes: `attempts`, `windowStart`,
+`lockedUntil`. Nothing else may appear in a write payload (Appwrite's structure
+validator rejects the whole document), so every write goes through
+`toPersistedState()`. `justLocked` is a return value, never a field — passing it
+through as one is what made every single write 400 for the limiter's entire life.
+
+**Known gap:** the counter is a read-modify-write, not an atomic increment, so a
+concurrent burst all reads the same `attempts` and all writes back the same
+successor. Appwrite 1.9.0 serves `PATCH .../documents/{id}/{attribute}/increment`,
+but reaching it needs `Databases.incrementDocumentAttribute` from node-appwrite
+17+, which needs Node 18+ — and this runtime is `node-16.0`. Closing it is a
+runtime bump plus an SDK major, not an edit to this file. `quick-access-login`
+talks raw HTTP and so already calls that endpoint directly; see
+`recordFailureForBucket` there for the shape this should take.
+
+## Bartender event window
+
+A bartender PIN works only within **1 hour either side** of any of that
+bartender's assigned events' windows. The window is the event's `date` (an
+absolute instant) extended by the bar's open-to-close **duration**, derived from
+`barOpenTime`/`barCloseTime` (`src/eventWindow.js`); it wraps past midnight
+correctly, and with no bar hours configured it collapses to the start instant, so
+the effective window is the flat ±1h.
+
+A correct bartender PIN presented **outside** its window gets a response that is
+byte-for-byte identical to a no-match, and is **not** counted as a failed
+attempt. The identical body matters: a distinguishable message made this endpoint
+a PIN-existence oracle — walk the 10,000-code space at any hour, get that message
+on exactly one code, and you have identified a live bartender PIN to replay at
+the venue's next advertised event. The human-readable reason exists only in the
+execution log.
+
+## Payment-team membership
+
+On success, the calling session is added to **PIN Payment Access**
+(`6a9cbb1c95ea7d59dd8c`), which is on the `execute` list of
+`stripe-getConnectionToken`, `Stripe-CreatePaymentIntent`,
+`Stripe-CancelPaymentIntent`, `Giftcard-Lookup`, `Transactions-List` and
+`Transaction-EmailReceipt`.
+
+That team is deliberately **not** the admin team: a PIN session must be able to
+charge a card without counting as admin for `Sales-Report`'s and
+`Transactions-List`'s checks, which is what keeps the 24h clamp and the
+no-refunds restriction real.
+
+The session must already exist when this runs — `loginWithPin` in
+`POS/src/utils/api.js` creates the anonymous session first, then calls this. If
+the grant fails, the PIN is still valid; the device just cannot charge a card
+until it is resolved (logged as an error, not surfaced to the caller).
+
+**Known gap:** the grant has no expiry and nothing deletes it, so setting a PIN
+row to `active: false` does **not** revoke access already handed to a device that
+used it. It cannot simply be TTL'd here — a self-checkout kiosk is designed never
+to re-enter its PIN, so expiring it server-side would strand the kiosk mid-shift.
+Until a short-lived claim replaces the durable team, every grant is logged as
+`PIN-GRANT user=<id> label=<label> bartenderId=<id>`, and a revoke is carried out
+by hand against the team's member list in the console.
 
 ## Request body
 
@@ -22,110 +123,41 @@ function) -- see "Payment-team membership" below.
 { "pin": "1234" }
 ```
 
-## Response
+## Responses
 
-`{ "ok": true, "label": "Bartender", "selfCheckout": false }` or
-`{ "ok": false }`. Never reveals whether a PIN exists, how many are
-configured, or any hash -- just whether this one matched. `selfCheckout`
-is `true` only for a PIN flagged as kiosk-only (see below) -- the client
-uses it to route a self-checkout PIN to `/self-checkout` instead of the
-staff `/pos` screen, so getting this flag right is what keeps a kiosk PIN
-from ever opening the full staff UI.
+| Status | Body | What it means operationally |
+| --- | --- | --- |
+| `200` | `{ ok: true, label, selfCheckout, bartenderId }` | Verified. `bartenderId` is non-null only for a bartender PIN. |
+| `200` | `{ ok: false }` | No match — or a correct bartender PIN outside its event window. Deliberately indistinguishable. |
+| `400` | `{ ok: false, error: "Invalid request body" \| "Missing pin" }` | Malformed call. |
+| `429` | `{ ok: false, error: "Too many incorrect PIN attempts. Try again in N minute(s)." }` | A bucket is locked. Either wait, or clear the `pin_c_*` / `pin_ip_*` row in `rate_limits`. |
+| `500` | `{ ok: false, error: "Server not configured" }` | The `pins` or `bartenders` query failed. |
+| `503` | `{ ok: false, error: "PIN verification is temporarily unavailable. Please try again shortly." }` | A failed attempt could not be recorded. Deliberate fail-closed; the log carries `RATE-LIMIT-WRITE-FAILED` with Appwrite's own code and type. |
 
-## Payment-team membership
+## Scopes
 
-Every PIN-based session (staff cashier or self-checkout kiosk) is anonymous
-and deliberately NOT a member of `STAFF_TEAM_IDS` (that's what keeps the
-24h report clamp and no-refunds restriction real -- see Sales-Report/
-Transactions-List). But the Stripe functions (Terminal connection token,
-create/cancel PaymentIntent) need *some* team membership to satisfy their
-`execute` permission. On a successful match, this function adds the
-caller (`req.headers['x-appwrite-user-id']`) to a separate, narrower team
--- `PIN Payment Access` (`6a9cbb1c95ea7d59dd8c`) -- that's listed in those
-functions' `execute` permissions alongside `STAFF_TEAM_IDS`, but nowhere
-that checks `isStaff()`.
+| Scope | Why |
+| --- | --- |
+| `documents.read` | Query `pins`, `bartenders` (with `events.*` selected), and the `rate_limits` rows. |
+| `documents.write` | Persist the two rate-limit counters. |
+| `teams.write` | `teams.createMembership` into PIN Payment Access. |
 
-This requires the caller's session to already exist by the time this
-function runs -- the client (`POS/src/utils/api.js`'s `loginWithPin`)
-creates the anonymous session first, then calls Verify-Pin, in that order.
-If somehow there's no caller id on the request, or granting the membership
-fails, the PIN check itself still succeeds -- the session just won't be
-able to charge a card until that's resolved (logged as an error, not
-surfaced to the caller).
+## Environment variables
 
-**Known gap:** this grant has no expiry and nothing deletes it, so setting a
-PIN row to `active: false` does not revoke access already handed out to a
-device that used it. It can't simply be given a TTL here -- a self-checkout
-kiosk is designed never to re-enter its PIN, so expiring the membership
-server-side would strand it mid-shift. The durable fix is to replace the
-team grant with a short-lived claim the Stripe functions validate. Until
-then, every grant is logged as `PIN-GRANT user=<id> label=<pin label>` so a
-revoke can be carried out by hand against the team's member list.
-
-## Rate limiting
-
-Failed attempts are counted in the shared `rate_limits` collection, which
-has exactly three attributes -- `attempts`, `windowStart`, `lockedUntil`.
-Nothing else may appear in a document payload (Appwrite's structure
-validator 400s the whole write), so every write goes through
-`toPersistedState()`; `justLocked` is a return value only, never a field.
-
-Two buckets are counted per failed attempt:
-
-| bucket | key | ceiling | why |
-| --- | --- | --- | --- |
-| caller | `pin_c_<sha1>` of `x-appwrite-user-id`, else the IP | 5 | per device, so one till's typos don't lock out the venue |
-| IP | `pin_ip_<sha1>` of the trusted IP | 30 | a caller can mint a fresh session for a fresh caller bucket, so this is the ceiling that can't be walked away from |
-
-The IP is the **rightmost** element of `x-forwarded-for` -- the one the
-trusted proxy appended. Everything to its left is caller-supplied, and
-Appwrite's `createExecution` lets a caller set headers outright. This
-assumes exactly one trusted proxy in front of the runtime; add another and
-the trusted element moves.
-
-Reads fail **open** (a database hiccup must not lock staff out of the till)
-but writes fail **closed**: if a failed attempt cannot be recorded, the
-request is answered `503` rather than with a normal wrong-PIN response,
-because an attempt that isn't counted is an attempt that doesn't exist.
-
-A correct bartender PIN presented outside its event window is **not** a
-failed attempt -- the credential was right, only the timing was wrong.
+`PINS_JSON` is set on the live function and **is not read**. See above.
 
 ## Configuration
 
-| Setting     | Value                                               |
-| ----------- | ---------------------------------------------------- |
-| Runtime     | Node (16.0), matching the other functions             |
-| Entrypoint  | `src/main.js`                                         |
-| Build       | `npm i`                                               |
-| Execute     | `any` (must be callable before any session exists)   |
-| API key scopes | `teams.write`, `teams.read` (to grant payment-team membership) |
+| Setting | Value |
+| --- | --- |
+| Runtime | `node-16.0` |
+| Entrypoint | `src/main.js` |
+| Build command | `npm i` |
+| Timeout | 15s |
+| Schedule | none |
 
-## Managing PINs
+Deploy: `appwrite push function --function-id 6a9c4acd49bc458907e7`
 
-`PINS_JSON` is a JSON array of
-`{ "hash": "<sha256>", "label": "...", "active": true, "selfCheckout": false }`.
-There's no admin UI yet -- to add/rotate PINs, build the full array
-(there's no partial-update for a single env var) and set it:
+## Calling Appwrite's own API from inside a function
 
-```bash
-node -e "console.log(require('crypto').createHash('sha256').update('1234').digest('hex'))"
-
-appwrite functions update-variable --function-id <id> --variable-id <id> \
-  --key PINS_JSON --secret \
-  --value '[{"hash":"<hash1>","label":"Bartender","active":true},{"hash":"<hash2>","label":"Manager","active":true}]'
-```
-
-Set `"active": false` to disable a PIN without removing it from the list.
-
-Set `"selfCheckout": true` on a PIN record to make it a **kiosk-only** PIN
-instead of a staff-cashier PIN -- entering it signs the device into the
-self-checkout screen (`/self-checkout`: click/scan to add, card-only
-payment, no refunds/history/reporting) rather than the regular staff POS.
-Omit the field (or leave it `false`) for every ordinary staff PIN:
-
-```bash
-appwrite functions update-variable --function-id <id> --variable-id <id> \
-  --key PINS_JSON --secret \
-  --value '[{"hash":"<hash1>","label":"Bartender","active":true},{"hash":"<hash2>","label":"Self-Checkout Kiosk 1","active":true,"selfCheckout":true}]'
-```
+See the DNS-patch note in `functions/Giftcard-Lookup/README.md`.

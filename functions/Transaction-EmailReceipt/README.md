@@ -1,58 +1,79 @@
 # Transaction-EmailReceipt
 
-Emails an itemized receipt for a completed (or refunded) sale to a
-customer-supplied email address. Used by the POS Transactions view and the
+**Function ID:** `6a9cd1ed552967ba3560`
+
+Emails an itemized receipt for a completed or refunded sale to a
+customer-supplied address. Used by the POS transactions view and the
 self-checkout kiosk's post-payment screen.
 
-Separate from Appwrite's own auth-email SMTP (configured for
-verification/recovery/magic-URL emails only) -- a receipt is arbitrary
-custom content, so this calls Resend's plain HTTP API directly
-(`POST https://api.resend.com/emails`) rather than going through Appwrite's
-SMTP/Messaging subsystem. No SDK/nodemailer dependency needed, just `fetch`,
-matching how every other function here calls an external API (e.g. Stripe).
+Sends through Resend's plain HTTP API (`POST https://api.resend.com/emails`),
+not Appwrite's SMTP — Appwrite's mailer only handles its own built-in auth email
+types (verification/recovery/magic-URL), and a receipt is arbitrary content.
+Every send CCs `everett.bazzocchi@skullspace.ca`.
 
-## Why it is gated
+A receipt carries the whole sale: items, quantities, unit prices, discount, tip,
+total and the per-leg payment breakdown. Three rules stand in front of it.
 
-A receipt carries the whole sale -- items, quantities, unit prices, discount,
-tip, total and the per-leg payment breakdown -- and CCs the venue owner on
-every send. Both inputs used to come straight off the request with nothing
-else checked, which made this a read primitive for the entire ledger: anyone
-who knew (or harvested) a transaction id could have its receipt mailed
-wherever they liked. Three rules now stand in front of it:
+## 1. Who may call it
 
-1. **Caller identity.** The caller must hold a confirmed membership in the
-   admin team, the POS team, or the `PIN Payment Access` team `Verify-Pin`
-   joins a device to once a PIN is accepted. A bare anonymous session --
-   which is what `execute: ["users"]` actually admits -- belongs to none of
-   them and gets a 403.
-2. **Recipient binding.** If the sale carries a `member_email`, that is the
-   only address it can be receipted to (403 otherwise). A walk-up sale names
-   nobody, so the address typed at the till is still used. Admins are exempt:
-   they can read the transaction directly anyway, and the admin app resends to
-   corrected addresses.
-3. **Send quota.** A non-admin caller may trigger 20 sends per 15 minutes,
-   counted per Appwrite user id in the shared `rate_limits` collection
-   (`rcp_...` docs). Checked before the transaction is read, so the quota
-   cannot be used to probe which ids exist, and the send is **reserved before
-   the mail goes out** -- counting afterwards cannot cap anything, since the
-   mail is already gone by the time the counter fails. The cost of that is one
-   slot per Resend failure.
+Live `execute` list, read from the project on 2026-09-13
+(`appwrite functions get --function-id 6a9cd1ed552967ba3560`):
 
-While `execute` is still `users`, rules 1 and 3 **are** the access control, not
-a second copy of one -- so both fail closed:
+- `team:68e35aed00144b8cde9d` — admin
+- `team:68ffcecc0026f78f0af8` — POS
+- `team:6a9cbb1c95ea7d59dd8c` — PIN Payment Access
 
-- a caller whose team membership cannot be checked (no injected
-  `x-appwrite-key`, or a Users API outage) gets `503`, not a pass at non-admin
-  level;
-- a send that cannot be counted -- either counter unreadable or unwritable --
-  gets `503` and no mail.
+Appwrite checks that list at execution-creation time. `classifyCaller` adds one
+check: no `x-appwrite-user-id` → `403`. That is the API-key-invocation case.
 
-**This requires the `users.read` and `documents.write` scopes to be granted.**
-Without them the function now refuses rather than -- as it did before -- mailing
-any sale's receipt anywhere with a log line. Both checks were previously dead:
-with no declared scopes Appwrite injects no key, so the membership check could
-never run, and with no `documents.write` every quota write threw and was
-swallowed.
+**No team lookup gates this function any more.** The `503`-on-unverifiable
+membership check was removed in commit `02bee62`, alongside the same code in
+`stripe-getConnectionToken` and `Giftcard-Lookup`.
+
+## 2. Recipient binding
+
+If the transaction carries a `member_email`, that is the **only** address it can
+be receipted to — anything else is `403`. A membership purchase already names its
+buyer, so there is no legitimate reason for a till to redirect that receipt. A
+walk-up sale names nobody, so the address typed at the till is used, and rules 1
+and 3 are what bound that path.
+
+Admins are exempt (they can read the transaction directly anyway, and the admin
+app resends receipts to corrected addresses).
+
+## 3. Send quota
+
+A non-admin caller may trigger **20 sends per 15 minutes** (`src/sendLimit.js`),
+counted per `x-appwrite-user-id` as `rcp_<sha1>` documents in the shared
+`rate_limits` collection.
+
+- Checked **before** the transaction is read, so the quota cannot be used to
+  probe which transaction ids exist.
+- The slot is **reserved before the mail goes out**. Counting afterwards cannot
+  cap anything — the mail is already gone by the time the write fails. The price
+  is one wasted slot per Resend failure.
+- Fails **closed** (`503`) when the counter cannot be read or written.
+
+## Admin status is a privilege upgrade, not the authorization decision
+
+`isAdminCaller` still calls `users.listMemberships()` — this is the one Users
+lookup that remains, and it is why this function keeps `users.read` while the
+other two lost it. It can only ever *grant* something extra (exemption from the
+recipient binding and the send cap), so any answer other than a definitive "yes,
+confirmed member of admin" degrades the caller to an ordinary till, which is the
+path every POS device takes and which works end to end. It can never produce a
+`503` and can never stop a receipt reaching the address the sale already names.
+
+The one visible residual: while the Users API is failing, an admin cannot
+*redirect* a member sale's receipt. That falls back to the address on the sale.
+
+## Scopes
+
+| Scope | Why |
+| --- | --- |
+| `documents.read` | Read the transaction; read the caller's `rate_limits` row. |
+| `documents.write` | Write the send-quota counter. Without it the cap is decorative. |
+| `users.read` | `isAdminCaller`'s `listMemberships` call. **Do not remove** — Appwrite injects the function's dynamic API key only for a function that declares scopes, and without the key this lookup cannot run at all. |
 
 ## Request body
 
@@ -60,39 +81,42 @@ swallowed.
 { "transactionId": "...", "email": "customer@example.com" }
 ```
 
-## Response
+## Responses
 
-Success: `{ "ok": true }`
-Failure: `{ "error": "<message>" }` with a 4xx/5xx status.
+| Status | Body | What it means operationally |
+| --- | --- | --- |
+| `200` | `{ ok: true }` | Resend accepted the message. |
+| `400` | `{ error: "Invalid request body" \| "Missing transactionId" \| "A valid email address is required" }` | Malformed call. |
+| `400` | `{ error: "Only a completed or refunded sale can be receipted (current status: …)" }` | The sale is `pending` or `cancelled`. There is nothing to receipt. |
+| `403` | `{ error: "Unauthorized" }` | No session user — an API-key invocation. |
+| `403` | `{ error: "This sale is attached to a member account…" }` | Recipient binding. Send it to the address on the sale, or do it from an admin account. |
+| `404` | `{ error: "Transaction not found" }` | No such transaction id. |
+| `429` | `{ error: "Too many receipts sent from this device…" }` | 20 sends in 15 minutes from this account. |
+| `500` | `{ error: "Failed to send receipt email" }` | Resend returned non-2xx, or was unreachable. The execution log carries Resend's own status and body. |
+| `503` | `{ error: "Receipts are temporarily unavailable — try again" }` | The send counter could not be read or written. Deliberate: an uncounted send is an uncapped mailer. |
 
-Only a transaction with `status: "complete"` or `status: "refunded"` can be
-receipted -- `"pending"`/`"cancelled"` are rejected (400), since there's
-nothing to receipt for those.
+## Environment variables
+
+| Name | Purpose |
+| --- | --- |
+| `RESEND_API_KEY` | Resend API key (`sending_access`, scoped to `mail.shotty.tech`). Each function holds its own copy — Appwrite has no shared secret store. |
 
 ## Configuration
 
-| Setting     | Value                                            |
-| ----------- | ------------------------------------------------- |
-| Runtime     | Node (16.0), matching the other functions          |
-| Entrypoint  | `src/main.js`                                      |
-| Build       | `npm i`                                            |
-| Execute     | `team:68e35aed00144b8cde9d` (admin), `team:68ffcecc0026f78f0af8` (POS), `team:6a9cbb1c95ea7d59dd8c` (PIN Payment Access) -- narrowed off `users` in `appwrite.config.json`, **live until pushed**. Exactly the same three teams the in-function check enforces, so no caller the function would serve loses access. |
-| Scopes      | `documents.read`, `users.read` (team check), `documents.write` (send-quota counters) -- set in `appwrite.config.json`, **must be pushed (`appwrite push functions`) or this function refuses every receipt** |
+| Setting | Value |
+| --- | --- |
+| Runtime | `node-16.0` |
+| Entrypoint | `src/main.js` |
+| Build command | `npm i` |
+| Timeout | 15s |
+| Schedule | none |
 
-## Environment Variables
+Deploy: `appwrite push function --function-id 6a9cd1ed552967ba3560`
 
-- `RESEND_API_KEY` - Resend API key (`sending_access`, scoped to the
-  `mail.shotty.tech` domain). Each Appwrite function has its own secret
-  vars -- this is a separate copy of the same key used for Appwrite's SMTP
-  configuration, not a shared reference.
+`node-16.0` predates global `fetch`, so `node-fetch` is a real dependency here
+rather than a leftover.
 
-## Note on calling Appwrite's own API from within a function
+## Calling Appwrite's own API from inside a function
 
-This self-hosted instance's function-execution sandbox can't resolve its
-own public hostname via the normal `getaddrinfo` path (used internally by
-`fetch`/`http`) -- `dns.resolve4` (talks to nameservers directly, bypassing
-`getaddrinfo`) works fine though. `src/appwriteClient.js` patches the
-global `dns.lookup` so any HTTP client resolving this hostname gets the
-known-good IP instead of hanging/`EAI_AGAIN`; the URL/Host header is
-untouched, only the DNS step is bypassed. Every function that needs to call
-Databases/Teams uses this same helper.
+See the DNS-patch note in `functions/Giftcard-Lookup/README.md`;
+`src/appwriteClient.js` here is the same helper.
