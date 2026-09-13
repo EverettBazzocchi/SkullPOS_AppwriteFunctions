@@ -54,8 +54,10 @@ function formatDateTime(iso) {
 }
 
 function buildEventAssignedHtml({ bartenderName, eventName, eventDate, window, pin }) {
-	// `window` is null when the event has no bar hours set -- falls back to the flat ±1h-around-
-	// start wording so the email still makes sense (matches Verify-Pin's own fallback).
+	// `window` is null only when the event carries no start instant at all; a row with a start but
+	// no `barClosesAt`/`endsAt` comes back zero-length instead, which is Verify-Pin's own deliberate
+	// answer to that shape. Both land on the flat ±1h-around-start wording below, so the email
+	// promises exactly the hours the pin will honour in either case.
 	const startMs = window ? window.startMs : new Date(eventDate).getTime();
 	const endMs = window ? window.endMs : startMs;
 	const validFrom = formatDateTime(new Date(startMs - PIN_VALID_WINDOW_MS).toISOString());

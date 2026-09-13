@@ -53,14 +53,25 @@ attributes exist on `Transactions`.
 
 ## The sales window
 
-`eventSalesWindow()` derives the window from the event's `date` plus the bar's
-open-to-close duration. An event is **due** when its window end is in the past.
+`eventSalesWindow()` takes the window as the **union** of `startsAt`/`endsAt` and
+`barOpensAt`/`barClosesAt` — a sale can land any time either the event or the bar
+is running. An event is **due** when its window end is in the past.
 
-- **No date at all** — a draft that was never scheduled. Skipped silently.
-- **A date but no usable window** (bar open and close identical, or unparseable)
-  — reported in `skipped` and **not** rolled up. Rolling it up would match no
-  transactions and overwrite the event's already-correct figures with zeroes
-  while reporting success.
+`date` is the one legacy field still read, and only as a start anchor for a row
+carrying none of the four instants. The two duration fallbacks this function used
+to reach for are gone with their attributes: `barOpenTime`/`barCloseTime`, and
+`event_start`/`event_end` — an hour pair no screen in the admin app could edit,
+which invented a 7pm–4am window (and read a small start hour as PM) for rows
+nobody had ever given hours to.
+
+- **No start at all** — a draft that was never scheduled. Skipped silently.
+- **A start but no usable window** — no end instant of any kind, or an end that
+  is not after the start — reported in `skipped` and **not** rolled up. This is
+  the deliberate fail-closed direction, and the opposite of what `Verify-Pin`
+  does with the same row: rolling up a guessed window would attribute a whole
+  window of the wrong transactions to the night, or drop real sales out of it,
+  and write the result over figures that in at least one case are already
+  published. A skipped event keeps the numbers it has.
 
 ## Two exclusions worth knowing
 

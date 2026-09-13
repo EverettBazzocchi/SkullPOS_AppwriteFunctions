@@ -12,22 +12,32 @@ const INGREDIENTS_ID = "ingredients";
 const TRANSACTIONS_ID = "68e4cd3500179ce661c6";
 const TICKETS_ID = "tickets";
 
+// The 19:00-04:00 shift these fixtures used to spell as `barOpenTime`/`barCloseTime` is now written
+// the only way that survives: a pair of instants nine hours apart. `date` is kept alongside them
+// because it is still a real column on live rows -- and because a fixture that carries both is the
+// one that proves a leftover `date` no longer moves anything.
+const PAST_START = "2020-01-01T01:00:00.000Z"; // always in the past relative to any test run
+const PAST_END = "2020-01-01T10:00:00.000Z"; // nine hours, the old 19:00-04:00 span
+
 const pastEvent = (id, overrides = {}) => ({
 	$id: id,
 	name: "Past Event",
-	date: "2020-01-01T01:00:00.000Z", // always in the past relative to any test run
-	barOpenTime: "19:00",
-	barCloseTime: "04:00",
+	date: PAST_START,
+	barOpensAt: PAST_START,
+	barClosesAt: PAST_END,
 	...overrides,
 });
 
-const futureEvent = (id) => ({
-	$id: id,
-	name: "Future Event",
-	date: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
-	barOpenTime: "19:00",
-	barCloseTime: "04:00",
-});
+const futureEvent = (id) => {
+	const startsIn = Date.now() + 365 * 24 * 60 * 60 * 1000;
+	return {
+		$id: id,
+		name: "Future Event",
+		date: new Date(startsIn).toISOString(),
+		barOpensAt: new Date(startsIn).toISOString(),
+		barClosesAt: new Date(startsIn + 9 * 60 * 60 * 1000).toISOString(),
+	};
+};
 
 function wireCollections({ events = [], categories = [], ingredients = [], transactions = [], tickets = [] } = {}) {
 	mockDatabases.listDocuments.mockImplementation((dbId, collectionId) => {
@@ -57,7 +67,7 @@ describe("Admin-RollupEventSales", () => {
 	});
 
 	test("skips an event with no date, silently", async () => {
-		wireCollections({ events: [{ $id: "no-date", name: "No Date", barOpenTime: "19:00", barCloseTime: "04:00" }] });
+		wireCollections({ events: [{ $id: "no-date", name: "No Date" }] });
 		const ctx = makeContext({ body: {} });
 
 		const result = await handler(ctx);
@@ -66,9 +76,9 @@ describe("Admin-RollupEventSales", () => {
 	});
 
 	test("reports (and does not zero out) an event whose window is degenerate", async () => {
-		// open === close is a 0-length window: it matches no transactions, and writing that result
-		// would overwrite the event's real figures with zeroes and count as a success.
-		wireCollections({ events: [pastEvent("degenerate", { barOpenTime: "20:00", barCloseTime: "20:00" })] });
+		// barClosesAt === barOpensAt is a 0-length window: it matches no transactions, and writing
+		// that result would overwrite the event's real figures with zeroes and count as a success.
+		wireCollections({ events: [pastEvent("degenerate", { barClosesAt: PAST_START })] });
 		const ctx = makeContext({ body: {} });
 
 		const result = await handler(ctx);
@@ -312,38 +322,49 @@ describe("Admin-RollupEventSales", () => {
 			return new Date(iso(to)).getTime() - new Date(iso(from)).getTime();
 		}
 
-		test("comes from the admin-editable bar hours, not from event_start/event_end", async () => {
-			// The admin app writes only barOpenTime/barCloseTime -- event_start/event_end are not
-			// editable anywhere, so honouring them meant shortening an event's bar hours moved
-			// Verify-Pin's window and left this one frozen, folding the tail into the event.
-			wireCollections({ events: [pastEvent("e1", { barOpenTime: "22:00", barCloseTime: "02:00", event_start: 22, event_end: 4 })] });
+		// This pair used to read "comes from the admin-editable bar hours, not from
+		// event_start/event_end" and "falls back to event_start/event_end for a row with no bar
+		// hours set". Both derivations are gone with their attributes: the first is now simply what
+		// the instants say, and the second has no replacement on purpose -- see below.
+		test("comes from the event's own instants", async () => {
+			wireCollections({
+				events: [pastEvent("e1", { barOpensAt: "2020-01-01T03:00:00.000Z", barClosesAt: "2020-01-01T07:00:00.000Z" })],
+			});
 			mockDatabases.updateDocument.mockResolvedValue({});
 			const ctx = makeContext({ body: {} });
 
 			const result = await handler(ctx);
 
 			expect(result.body.updated).toEqual(["e1"]);
-			expect(windowOf(result)).toBe(4 * 60 * 60 * 1000); // bar hours, not the 6h event_start/end span
+			expect(windowOf(result)).toBe(4 * 60 * 60 * 1000);
 		});
 
-		test("falls back to event_start/event_end for a row with no bar hours set", async () => {
-			wireCollections({ events: [pastEvent("e1", { barOpenTime: null, barCloseTime: null, event_start: 8, event_end: 3 })] });
+		// The end of the legacy duration fallbacks, stated as behaviour rather than as an absence.
+		// A nine-hour window used to be invented for a row like this from the event_start/event_end
+		// defaults; now it is skipped and named, because guessing an end writes a whole window of
+		// the wrong transactions over figures that may already have been published.
+		test("an event with a start but no end is skipped and reported, never given an invented window", async () => {
+			wireCollections({ events: [{ $id: "e1", name: "Past Event", date: PAST_START, startsAt: PAST_START }] });
 			mockDatabases.updateDocument.mockResolvedValue({});
 			const ctx = makeContext({ body: {} });
 
-			await handler(ctx);
+			const result = await handler(ctx);
 
-			expect(windowOf()).toBe(7 * 60 * 60 * 1000);
+			expect(result.body.processed).toBe(0);
+			expect(result.body.updated).toEqual([]);
+			expect(result.body.skipped).toEqual([{ id: "e1", name: "Past Event", reason: expect.stringMatching(/no usable sales window/i) }]);
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
 		});
 	});
 
 	describe("attributing tickets when the same event name runs more than once", () => {
+		// A 22:00-02:00 night, four hours long, as instants.
 		const occurrence = (id, dateIso) => ({
 			$id: id,
 			name: "Goth Night",
 			date: dateIso,
-			barOpenTime: "22:00",
-			barCloseTime: "02:00",
+			barOpensAt: dateIso,
+			barClosesAt: new Date(Date.parse(dateIso) + 4 * 60 * 60 * 1000).toISOString(),
 		});
 
 		function ticketQueriesFor(callIndex) {

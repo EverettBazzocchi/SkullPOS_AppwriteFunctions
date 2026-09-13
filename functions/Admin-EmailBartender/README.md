@@ -34,14 +34,18 @@ already has hers, and a retry must not re-send her PIN over a failed notice.
 Computed by `src/eventWindow.js`, the same module `Verify-Pin` uses, so the email
 cannot promise hours the PIN will not honour:
 
-- the event's `date` (an absolute instant) extended by the bar's open-to-close
-  **duration** from `barOpenTime`/`barCloseTime`, wrapping past midnight
-  correctly;
+- the **union** of `barOpensAt`/`barClosesAt` and `startsAt`/`endsAt`, all four
+  absolute instants;
 - padded by **1 hour on each side** (`PIN_VALID_WINDOW_MS`, matching Verify-Pin
   exactly);
-- with no bar hours configured, the window collapses to the start instant, and
-  the email falls back to the flat "1 hour on either side of the event's start
-  time" wording.
+- with no end instant on the row, the window collapses to the start and the email
+  falls back to the flat "1 hour on either side of the event's start time"
+  wording -- which is exactly what Verify-Pin will honour for that row, so the
+  email cannot over-promise.
+
+`date` is the one legacy field still read, and only as a start anchor for a row
+carrying none of the four instants. The `barOpenTime`/`barCloseTime` duration
+this section used to describe is gone with those attributes.
 
 Times render in `America/Winnipeg`. That is hardcoded, not inferred:
 `event.date` is an absolute UTC instant, and without an explicit `timeZone`,

@@ -127,8 +127,10 @@ be counted.
 
 `Ticketing-ActiveEvent` is now the single read path for the active event. The
 door app, the register and the menu boards all go through it rather than reading
-`Events` directly — it projects `sellsAlcohol` / `barOpenTime` / `barCloseTime`
-alongside the ticket fields, and keeps every financial column on the server.
+`Events` directly — it projects `sellsAlcohol` plus the bar window, as the
+`barOpensAt`/`barClosesAt` instants and (still, until every client has shipped and
+is confirmed on the device) the legacy `barOpenTime`/`barCloseTime` strings,
+alongside the ticket fields — and keeps every financial column on the server.
 
 ### Ticketing intake
 

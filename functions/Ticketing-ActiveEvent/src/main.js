@@ -90,6 +90,15 @@ function toPublicEvent(doc) {
 		// isWithinBarHours) and all fail closed on null, so an unset window hides alcohol rather
 		// than opening the bar. None of these three carry any financial meaning.
 		sellsAlcohol: doc.sellsAlcohol === true,
+		// STILL PROJECTED ON PURPOSE, even though `barOpenTime`/`barCloseTime` are being retired
+		// from the Events schema and every server-side reader has already stopped using them. The
+		// register and both menu boards still read them as their fallback, and each of those ships
+		// on its own cycle: a build sitting on the bar, or on a board facing the room, does not
+		// update because this function was redeployed. Dropping a key here is instant and reaches
+		// every client at once, so it must come LAST -- after each one has shipped its own removal
+		// AND is confirmed running on the device. An extra projected field costs nothing; a missing
+		// one closes the alcohol gate on an open floor. `?? null` needs no change when the
+		// attributes are deleted either -- a missing attribute simply reads as undefined.
 		barOpenTime: doc.barOpenTime ?? null,
 		barCloseTime: doc.barCloseTime ?? null,
 		// The same four instants every server-side reader now prefers, projected through to the

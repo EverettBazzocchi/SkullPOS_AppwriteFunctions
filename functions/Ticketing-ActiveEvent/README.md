@@ -50,7 +50,11 @@ None. Any body is ignored.
     "isActive": true,
     "sellsAlcohol": true,
     "barOpenTime": "22:00",
-    "barCloseTime": "02:00"
+    "barCloseTime": "02:00",
+    "startsAt": "2026-09-13T22:00:00.000Z",
+    "endsAt": "2026-09-14T07:00:00.000Z",
+    "barOpensAt": "2026-09-14T03:00:00.000Z",
+    "barClosesAt": "2026-09-14T07:00:00.000Z"
   },
   "multipleActive": false,
   "activeCount": 1
@@ -65,12 +69,27 @@ to exclude it.
   is not a usable number. A plain `|| DEFAULT` would have rewritten a
   legitimately free (0-cent) event into a CA$30 charge. Matches the door client's
   own fallback so the two cannot disagree about what a ticket costs.
-- **`sellsAlcohol` / `barOpenTime` / `barCloseTime`** are the alcohol gate.
-  `sellsAlcohol` mirrors the column's own `false` default; the two window strings
-  stay raw `"HH:mm"` because the clients already own the parsing (POS's
-  `isWithinBarHours`) and all of them fail closed on `null` — an unset window
-  hides alcohol rather than opening the bar. None of the three carries financial
-  meaning.
+- **`sellsAlcohol` / `barOpensAt` / `barClosesAt`** are the alcohol gate.
+  `sellsAlcohol` mirrors the column's own `false` default; the two instants are
+  normalized to ISO or `null`, and every client fails the gate closed on `null` —
+  an unset window hides alcohol rather than opening the bar. None of these
+  carries financial meaning.
+- **`barOpenTime` / `barCloseTime`** are the legacy `"HH:mm"` form of that same
+  window and are **still projected on purpose**, even though the attributes are
+  being retired from `Events`. The register and both menu boards still read them
+  as their fallback, and each runs on its own deploy cycle: a build sitting on the
+  bar or facing the room does not update because this function did. They stay
+  until every client has shipped *and* is confirmed on the device. An extra
+  projected field costs nothing; a missing one closes the alcohol gate on a floor
+  that is open. `doc.<field> ?? null` already survives the attribute's deletion —
+  a missing attribute simply reads as `undefined` — so this projection needs no
+  further edit when the schema drops them, only the eventual removal of these two
+  keys once the clients are done.
+- **`startsAt` / `endsAt`** are the event's own window, projected alongside, so a
+  client can gate on a real timestamp instead of recombining `date`'s calendar day
+  with a wall-clock string — the recombination that let the menu board (which
+  accepts a bare `"1800"`) and the register (which does not) disagree about the
+  very same event.
 
 ## Responses
 

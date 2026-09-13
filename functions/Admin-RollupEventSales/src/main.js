@@ -69,11 +69,12 @@ export default async ({ req, res, log, error }) => {
 
 	const withWindows = events.map((event) => ({ event, window: eventSalesWindow(event) }));
 
-	// An event with a date but no usable window (its bar open and close are the same, so the window
-	// is zero-length) must NOT be rolled up: it matches no transactions, and writing that result
-	// would overwrite the event's already-correct figures with zeroes and report it as a success.
-	// Reported instead, the way a per-event failure already is. An event with no date at all is a
-	// draft that was never scheduled -- skipped silently, as always.
+	// A scheduled event with no usable window -- no end instant at all now that the legacy duration
+	// fallbacks are gone, or an end that is not after its start -- must NOT be rolled up: it matches
+	// no transactions, and writing that result would overwrite the event's already-correct figures
+	// with zeroes and report it as a success. Reported instead, the way a per-event failure already
+	// is. An event with no start at all is a draft that was never scheduled -- skipped silently, as
+	// always.
 	// "Scheduled" means the row carries a start instant of any shape -- the new `startsAt`/
 	// `barOpensAt` timestamps or the legacy `date`. Testing `event.date` alone would silently
 	// downgrade a fully-migrated row (one whose window came out unusable) from "reported" to
@@ -85,7 +86,7 @@ export default async ({ req, res, log, error }) => {
 			id: event.$id,
 			name: event.name,
 			reason:
-				'no usable sales window (check startsAt/endsAt and barOpensAt/barClosesAt, or the legacy barOpenTime/barCloseTime -- start and end are the same, inverted, or unparseable)',
+				'no usable sales window (check startsAt/endsAt and barOpensAt/barClosesAt -- the event has no end instant at all, or start and end are the same, inverted, or unparseable)',
 		}));
 	skipped.forEach((s) => error(`Skipping rollup for event ${s.id} ("${s.name}"): ${s.reason}.`));
 

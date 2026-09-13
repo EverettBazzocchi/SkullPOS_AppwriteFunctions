@@ -188,13 +188,26 @@ describe("Verify-Pin", () => {
 		});
 
 		test("accepts a pin well into a multi-hour shift, past the old fixed 1-hour-from-start cutoff", async () => {
-			// Event started 3.5 hours ago with a 4-hour (10pm-2am) bar window -- well outside a
-			// flat ±1h-from-start window, but still inside the actual shift + 1h buffer.
-			const eventDate = new Date(Date.now() - 3.5 * 60 * 60 * 1000).toISOString();
+			// Bar opened 3.5 hours ago and closes in half an hour -- well outside a flat ±1h-from-
+			// start window, but still inside the actual shift + 1h buffer. The shift length used to
+			// be spelled as barOpenTime/barCloseTime; it is the barOpensAt/barClosesAt pair now, and
+			// a row carrying only the start would get the flat ±1h instead.
+			const opensAt = Date.now() - 3.5 * 60 * 60 * 1000;
 			mockDatabases.listDocuments
 				.mockResolvedValueOnce({ documents: [] })
 				.mockResolvedValueOnce({
-					documents: [mockBartenderRow({ pin: "5678", events: [{ date: eventDate, barOpenTime: "2200", barCloseTime: "02:00" }] })],
+					documents: [
+						mockBartenderRow({
+							pin: "5678",
+							events: [
+								{
+									date: new Date(opensAt).toISOString(),
+									barOpensAt: new Date(opensAt).toISOString(),
+									barClosesAt: new Date(opensAt + 4 * 60 * 60 * 1000).toISOString(),
+								},
+							],
+						}),
+					],
 				});
 			const ctx = makeContext({ body: { pin: "5678" } });
 
@@ -205,9 +218,11 @@ describe("Verify-Pin", () => {
 
 		// --- the migrated time model ---------------------------------------------------------
 		//
-		// An event row may carry the legacy shape (`date` + HH:mm bar hours), the new instants
-		// (`startsAt`/`endsAt`/`barOpensAt`/`barClosesAt`), or both while the backfill runs. All
-		// three have to authenticate the same bartender at the same moments, in any deploy order.
+		// An event row may carry the instants (`startsAt`/`endsAt`/`barOpensAt`/`barClosesAt`) or,
+		// for a row nothing has re-saved yet, only `date`. The HH:mm bar hours that used to be the
+		// other half of the legacy shape are gone: a date-only row no longer describes a shift
+		// LENGTH at all, so it authenticates inside the flat ±1h buffer around its start and the
+		// instants are what extend that to the whole shift.
 
 		function shiftRows({ openedMinutesAgo = 30, lengthHours = 4, dateOffsetHours = 0 } = {}) {
 			const opensAt = Date.now() - openedMinutesAgo * 60 * 1000;
@@ -215,10 +230,8 @@ describe("Verify-Pin", () => {
 			return {
 				legacy: {
 					// `date`'s time half is junk: dateOffsetHours is how far it drifts from the real
-					// bar open. barOpenTime/barCloseTime still describe the true shift length.
+					// bar open, and with no HH:mm pair left there is nothing to correct it with.
 					date: new Date(opensAt + dateOffsetHours * 60 * 60 * 1000).toISOString(),
-					barOpenTime: "22:00",
-					barCloseTime: "02:00",
 				},
 				instants: {
 					startsAt: new Date(opensAt).toISOString(),
@@ -242,7 +255,12 @@ describe("Verify-Pin", () => {
 			expect(result.body.ok).toBe(true);
 		});
 
-		test("a row with only the old fields, only the new, and both all authenticate the same shift", async () => {
+		// This used to assert all three shapes authenticate "the same shift", which held only while
+		// the HH:mm pair supplied a duration. A date-only row now has no shift length, so what is
+		// pinned is the narrower truth that still matters on the floor: half an hour into her own
+		// shift a bartender is let in whichever shape her event is in, and a leftover `date` never
+		// takes anything away from a row that carries the instants.
+		test("a date-only row, an instants-only row and both all let a bartender in at the top of her shift", async () => {
 			const { legacy, instants } = shiftRows();
 
 			const legacyOnly = await verifyWithEvent(legacy);
@@ -252,6 +270,15 @@ describe("Verify-Pin", () => {
 			expect(legacyOnly.body.ok).toBe(true);
 			expect(newOnly.body.ok).toBe(true);
 			expect(both.body.ok).toBe(true);
+		});
+
+		// The half the date-only row can no longer do, and the reason the instants are not optional:
+		// three hours into a four-hour shift there is nothing left for `date` alone to say.
+		test("only the instants keep a bartender in past the flat buffer around a date-only row", async () => {
+			const { legacy, instants } = shiftRows({ openedMinutesAgo: 180 });
+
+			expect((await verifyWithEvent(legacy)).body.ok).toBe(false);
+			expect((await verifyWithEvent({ ...legacy, ...instants })).body.ok).toBe(true);
 		});
 
 		// The owner's "the time it says is irrelevant" bug, end to end: `date` sits two hours after

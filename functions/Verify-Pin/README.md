@@ -77,11 +77,25 @@ talks raw HTTP and so already calls that endpoint directly; see
 ## Bartender event window
 
 A bartender PIN works only within **1 hour either side** of any of that
-bartender's assigned events' windows. The window is the event's `date` (an
-absolute instant) extended by the bar's open-to-close **duration**, derived from
-`barOpenTime`/`barCloseTime` (`src/eventWindow.js`); it wraps past midnight
-correctly, and with no bar hours configured it collapses to the start instant, so
-the effective window is the flat ±1h.
+bartender's assigned events' windows. The window (`src/eventWindow.js`) is the
+**union** of the bar's own hours and the event's, read straight off the
+`barOpensAt`/`barClosesAt` and `startsAt`/`endsAt` instants — so a bartender
+rostered before doors, or kept on past last call, is never cut off by whichever
+pair is narrower. Nothing is recombined from a calendar day and a wall clock,
+and no timezone is inferred anywhere on the server.
+
+`date` is the last legacy field still read, and only ever as a **start** anchor
+for a row carrying none of the four instants. The `barOpenTime`/`barCloseTime`
+`"HH:mm"` pair this module used to derive a *duration* from is gone with the
+attributes themselves, so there is no legacy route to an **end** any more.
+
+A row with a start but no end (no `barClosesAt`, no `endsAt`) collapses to the
+start instant, making the effective window the flat ±1h — deliberately **not** a
+refusal. Returning nothing would mean the PIN never verifies for that event, and
+an out-of-window PIN gets a response byte-identical to a wrong one (below), so a
+bartender at the till would get a flat "no" with no reason and no fix she can
+make from the floor. `Admin-RollupEventSales` decides the same shape the other
+way, on purpose: there a guessed window rewrites real revenue.
 
 A correct bartender PIN presented **outside** its window gets a response that is
 byte-for-byte identical to a no-match, and is **not** counted as a failed

@@ -5,31 +5,36 @@
 // app, which is the only place a real timezone (America/Winnipeg) exists, so nothing on the server
 // ever recombines a calendar day with a wall clock or infers a zone. It only ever compares instants.
 //
-// FALLBACK -- a row that has not been backfilled yet: the legacy shape, `date` as the start instant
-// extended by the open-to-close DURATION derived from the `barOpenTime`/`barCloseTime` "HH:mm"
-// strings. Kept behaviour-for-behaviour identical to what shipped before the migration, so an
-// un-backfilled row still authenticates exactly the bartender it always did and any deploy order
-// (or a rollback of any single component) is safe.
+// FALLBACK -- `date`, itself an absolute instant, as the START anchor for a row that carries none
+// of the four. That is now the whole of the legacy shape. The open-to-close DURATION this module
+// used to derive from the `barOpenTime`/`barCloseTime` "HH:mm" pair is gone with the attributes
+// themselves: they are being deleted from the Events schema, so there is no legacy route to an END
+// any more, only to a start.
 //
-// Why the legacy path is the one that needed fixing: `date`'s TIME half is junk -- the owner's own
-// words are "the date is the date of the event, the time it says is irrelevant". Taking its raw
-// instant as the window START means a row stored as 20:00 against an 18:00 bar open locks the
-// bartender out of the first two hours of her own shift. `barOpensAt` deletes that guess entirely.
+// `date` survives here only because it is still a real column, and it is still only ever read as a
+// start. Its TIME half is junk -- the owner's own words are "the date is the date of the event, the
+// time it says is irrelevant" -- so a row stored as 20:00 against an 18:00 bar open starts the
+// window two hours late and locks the bartender out of the first two hours of her own shift. That
+// is why `barOpensAt` sits ahead of it in the chain below, and why `date` is expected to follow the
+// HH:mm strings out of the schema in a later pass rather than being leaned on for anything new.
+//
+// A START WITH NO END IS A START-ONLY WINDOW, NOT A REFUSAL. With no duration left to extend by, a
+// row carrying `barOpensAt` (or `startsAt`, or only `date`) but neither `barClosesAt` nor `endsAt`
+// collapses to endMs === startMs, and the pin is live only inside the caller's own buffer. That is
+// a deliberate choice over returning null. Null means the pin NEVER verifies for that event, and
+// Verify-Pin answers an out-of-window pin with a body byte-identical to a wrong one -- so the
+// bartender standing at the till gets a flat "no" with no reason attached and no fix she can make
+// from the floor. A short window is a bad night; no window is a dead till. Admin-RollupEventSales
+// decides the very same shape the other way, and should: there the cost of inventing a window is
+// silently overwriting an event's real revenue with zeroes, and nobody is waiting at a till on it.
+//
+// No live row is in that shape -- all three carry all four instants -- but a save that composes
+// `barOpensAt` from a bar open time while the close time is unparseable ("late") still produces
+// one, which is why it needs a stated answer rather than an accident.
 //
 // The window spans the UNION of the bar's hours and the event's own, so a bartender rostered before
 // doors (or kept on past last call) is never cut off by whichever of the two is narrower. The
 // caller still pads this by its own ±1h buffer (PIN_VALID_WINDOW_MS).
-
-function parseTimeToMinutes(value) {
-	if (!value) return null;
-	const cleaned = String(value).replace(':', '');
-	if (!/^\d{3,4}$/.test(cleaned)) return null;
-	const padded = cleaned.padStart(4, '0');
-	const hour = parseInt(padded.slice(0, 2), 10);
-	const minute = parseInt(padded.slice(2), 10);
-	if (Number.isNaN(hour) || Number.isNaN(minute) || hour > 23 || minute > 59) return null;
-	return hour * 60 + minute;
-}
 
 // An Appwrite datetime attribute arrives as an ISO string; a Date is accepted too so a caller that
 // has already parsed one doesn't have to stringify it back. Anything absent, empty or unparseable
@@ -38,15 +43,6 @@ function toMs(value) {
 	if (value === null || value === undefined || value === '') return null;
 	const ms = value instanceof Date ? value.getTime() : Date.parse(String(value));
 	return Number.isNaN(ms) ? null : ms;
-}
-
-// Open-to-close duration in minutes from the legacy HH:mm strings, or null when they aren't usable.
-function legacyBarDurationMinutes(event) {
-	const openMinutes = parseTimeToMinutes(event.barOpenTime);
-	const closeMinutes = parseTimeToMinutes(event.barCloseTime);
-	if (openMinutes === null || closeMinutes === null) return null;
-	// Wraps past midnight correctly (open 22:00 / close 02:00 -> 240 minutes, not negative).
-	return (((closeMinutes - openMinutes) % 1440) + 1440) % 1440;
 }
 
 export function computeEventWindow(event) {
@@ -61,18 +57,13 @@ export function computeEventWindow(event) {
 	const startMs = starts.length > 0 ? Math.min(...starts) : toMs(event.date);
 	if (startMs === null) return null;
 
-	if (ends.length > 0) {
-		// Clamped at startMs: bad data with an end before the start would otherwise produce a
-		// negative-length window, leaving the pin valid only inside the caller's buffer -- i.e.
-		// quietly locking a bartender out mid-shift rather than failing visibly.
-		return { startMs, endMs: Math.max(startMs, ...ends) };
-	}
+	// Nothing left to extend the start by, so the caller's own before/after buffer IS the window.
+	// See the header for why that beats refusing to produce one.
+	if (ends.length === 0) return { startMs, endMs: startMs };
 
-	const durationMinutes = legacyBarDurationMinutes(event);
-	if (durationMinutes === null) {
-		// No bar hours configured -- nothing to extend by, so the window is just the start instant
-		// (the caller still pads this by its own before/after buffer).
-		return { startMs, endMs: startMs };
-	}
-	return { startMs, endMs: startMs + durationMinutes * 60 * 1000 };
+	// Clamped at startMs: bad data with an end before the start would otherwise produce a
+	// negative-length window, which is strictly worse than the flat buffer above -- once the caller
+	// pads it, an inverted pair can exclude the start instant itself, i.e. quietly locking a
+	// bartender out mid-shift rather than failing visibly.
+	return { startMs, endMs: Math.max(startMs, ...ends) };
 }

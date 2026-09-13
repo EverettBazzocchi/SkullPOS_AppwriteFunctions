@@ -2,86 +2,51 @@ const { eventSalesWindow } = require("./eventWindow.js");
 
 const hours = (window) => (window.end.getTime() - window.start.getTime()) / (60 * 60 * 1000);
 
+// Two whole describe blocks used to live here -- "duration from the admin-editable bar hours" and
+// "event_start/event_end fallback for rows with no bar hours" -- pinning the two legacy ways this
+// function could invent an END from a start. Both attribute pairs are being deleted, so both
+// derivations are deliberately gone and their tests with them. The behaviour that replaced them is
+// pinned in "a start with no end" below: no end instant means no window, reported by main.js rather
+// than guessed at, because the output of this function is money.
+
 describe("eventSalesWindow", () => {
-	test("returns null when the event has no date", () => {
-		expect(eventSalesWindow({ barOpenTime: "19:00", barCloseTime: "04:00" })).toBeNull();
+	test("returns null when the event has no start of any kind", () => {
+		expect(eventSalesWindow({})).toBeNull();
 	});
 
 	test("returns null when date is unparseable", () => {
-		expect(eventSalesWindow({ date: "not-a-date", barOpenTime: "19:00", barCloseTime: "04:00" })).toBeNull();
+		expect(eventSalesWindow({ date: "not-a-date", endsAt: "2026-06-05T10:00:00.000Z" })).toBeNull();
 	});
 
 	test("start is always exactly the event's date field, untouched", () => {
-		const { start } = eventSalesWindow({ date: "2026-03-15T13:37:00.000Z", barOpenTime: "19:00", barCloseTime: "04:00" });
+		const { start } = eventSalesWindow({ date: "2026-03-15T13:37:00.000Z", endsAt: "2026-03-15T22:37:00.000Z" });
 		expect(start.toISOString()).toBe("2026-03-15T13:37:00.000Z");
 	});
 
-	describe("duration from the admin-editable bar hours", () => {
-		test("derives the window from barOpenTime/barCloseTime", () => {
-			const window = eventSalesWindow({ date: "2026-06-05T01:00:00.000Z", barOpenTime: "22:00", barCloseTime: "02:00" });
-			expect(hours(window)).toBe(4);
+	// The deliberate fail-closed half of this migration, and the reason this module and Verify-Pin's
+	// now disagree on purpose. A missing end used to be papered over with a bar-hours duration, or
+	// failing that a 7pm-4am default; either could attribute a whole window of transactions to the
+	// wrong night and then overwrite figures that may already have been published. Skipping keeps
+	// the event's existing numbers and puts a line in the Errors view.
+	describe("a start with no end", () => {
+		test("returns null for a row carrying startsAt but no end instant", () => {
+			expect(eventSalesWindow({ startsAt: "2026-09-28T03:00:00.000Z" })).toBeNull();
 		});
 
-		test("bar hours win over event_start/event_end, which no screen can edit", () => {
-			// Live shape: "The NB Afterparty" -- event_start 22 / event_end 4 (6h) but 22:00-02:00 (4h).
-			const window = eventSalesWindow({
-				date: "2026-06-05T01:00:00.000Z",
-				barOpenTime: "22:00",
-				barCloseTime: "02:00",
-				event_start: 22,
-				event_end: 4,
-			});
-			expect(hours(window)).toBe(4);
+		test("returns null for a row carrying barOpensAt but no end instant", () => {
+			expect(eventSalesWindow({ startsAt: null, barOpensAt: "2026-09-28T03:00:00.000Z" })).toBeNull();
 		});
 
-		test("honours minutes, not just whole hours", () => {
-			const window = eventSalesWindow({ date: "2026-06-05T01:00:00.000Z", barOpenTime: "21:30", barCloseTime: "02:00" });
-			expect(hours(window)).toBe(4.5);
-		});
-
-		test("accepts the colon-less form Verify-Pin accepts, so the two agree on the same stored value", () => {
-			const window = eventSalesWindow({ date: "2026-06-05T01:00:00.000Z", barOpenTime: "1800", barCloseTime: "0200" });
-			expect(hours(window)).toBe(8);
-		});
-
-		test("returns null for a zero-length window rather than a window that matches nothing", () => {
-			expect(eventSalesWindow({ date: "2026-06-05T01:00:00.000Z", barOpenTime: "20:00", barCloseTime: "20:00" })).toBeNull();
-		});
-	});
-
-	describe("event_start/event_end fallback for rows with no bar hours", () => {
-		test("defaults to a 7pm-4am (9 hour) window when nothing is set", () => {
-			const window = eventSalesWindow({ date: "2026-06-05T01:00:00.000Z" });
-			expect(window.start.toISOString()).toBe("2026-06-05T01:00:00.000Z");
-			expect(hours(window)).toBe(9);
-		});
-
-		test("treats a small event_start hour as PM and event_end as-is (AM)", () => {
-			const window = eventSalesWindow({ date: "2026-01-01T00:00:00.000Z", event_start: 8, event_end: 3 });
-			expect(hours(window)).toBe(7);
-		});
-
-		test("does not adjust an event_start hour that's already 12 or greater", () => {
-			const window = eventSalesWindow({ date: "2026-01-01T00:00:00.000Z", event_start: 14, event_end: 22 });
-			expect(hours(window)).toBe(8);
-		});
-
-		test("falls back when the bar hours are set but unparseable", () => {
-			const window = eventSalesWindow({ date: "2026-01-01T00:00:00.000Z", barOpenTime: "8pm", barCloseTime: "late", event_start: 14, event_end: 22 });
-			expect(hours(window)).toBe(8);
-		});
-
-		test("returns null when event_start === event_end", () => {
-			expect(eventSalesWindow({ date: "2026-01-01T00:00:00.000Z", event_start: 22, event_end: 22 })).toBeNull();
+		test("returns null for a legacy row that only ever had a date", () => {
+			expect(eventSalesWindow({ date: "2026-09-28T03:00:00.000Z" })).toBeNull();
 		});
 	});
 
 	// --- the migrated shape: real timestamps -------------------------------------------------
 	//
-	// The same 22:00-02:00 night in Winnipeg (CDT, UTC-5) written three ways: legacy only, new
-	// only, and a row carrying both mid-migration.
+	// The same 22:00-02:00 night in Winnipeg (CDT, UTC-5), now expressible only as instants.
 	describe("startsAt/endsAt/barOpensAt/barClosesAt", () => {
-		const LEGACY_ONLY = { date: "2026-09-28T03:00:00.000Z", barOpenTime: "22:00", barCloseTime: "02:00" };
+		const DATE_ONLY = { date: "2026-09-28T03:00:00.000Z" };
 		const NEW_ONLY = {
 			startsAt: "2026-09-28T03:00:00.000Z",
 			endsAt: "2026-09-28T07:00:00.000Z",
@@ -89,24 +54,21 @@ describe("eventSalesWindow", () => {
 			barClosesAt: "2026-09-28T07:00:00.000Z",
 		};
 
-		// Whichever shape a row is in while the rollout is half-done, the transactions folded into
-		// that event's revenue, tips and COGS are exactly the same set.
-		test("a row with only the old fields, only the new, and both produce the identical window", () => {
-			const legacy = eventSalesWindow(LEGACY_ONLY);
+		// Replaces the old three-way equivalence proof, which could only hold while the HH:mm pair
+		// supplied a duration. What matters now is that a leftover `date` on a migrated row cannot
+		// move which transactions are folded into that event's revenue, tips and COGS.
+		test("a leftover legacy date changes nothing about a row that carries the instants", () => {
 			const migrated = eventSalesWindow(NEW_ONLY);
-			const both = eventSalesWindow({ ...LEGACY_ONLY, ...NEW_ONLY });
+			const both = eventSalesWindow({ ...DATE_ONLY, ...NEW_ONLY });
 
-			expect(migrated).toEqual(legacy);
-			expect(both).toEqual(legacy);
-			expect(legacy.start.toISOString()).toBe("2026-09-28T03:00:00.000Z");
-			expect(legacy.end.toISOString()).toBe("2026-09-28T07:00:00.000Z");
+			expect(both).toEqual(migrated);
+			expect(migrated.start.toISOString()).toBe("2026-09-28T03:00:00.000Z");
+			expect(migrated.end.toISOString()).toBe("2026-09-28T07:00:00.000Z");
 		});
 
-		test("the timestamps win over date + bar hours, which can disagree with them", () => {
+		test("the timestamps win over a date whose time half is junk", () => {
 			const window = eventSalesWindow({
 				date: "2026-09-28T05:00:00.000Z", // junk time -- two hours after the real start
-				barOpenTime: "22:00",
-				barCloseTime: "02:00",
 				startsAt: "2026-09-28T03:00:00.000Z",
 				endsAt: "2026-09-28T07:00:00.000Z",
 			});
@@ -129,47 +91,17 @@ describe("eventSalesWindow", () => {
 			expect(window.end.toISOString()).toBe("2026-09-28T07:00:00.000Z");
 		});
 
-		// The whole point of the timestamps: no more "is a small hour PM?".
-		test("never applies the small-hour PM guess to a row that carries the new fields", () => {
-			// event_start 8 would be read as 8 PM by the legacy path, giving a 7-hour window.
-			const window = eventSalesWindow({
-				date: "2026-01-01T00:00:00.000Z",
-				event_start: 8,
-				event_end: 3,
-				startsAt: "2026-01-01T02:00:00.000Z",
-				endsAt: "2026-01-01T05:00:00.000Z",
-			});
-
-			expect(hours(window)).toBe(3);
-			expect(window.start.toISOString()).toBe("2026-01-01T02:00:00.000Z");
-		});
-
-		// ...but it must stay exactly as it was for a row that carries nothing else.
-		test("still applies the small-hour PM guess to a row with no new fields and no bar hours", () => {
-			expect(hours(eventSalesWindow({ date: "2026-01-01T00:00:00.000Z", event_start: 8, event_end: 3 }))).toBe(7);
-		});
-
-		test("anchors on startsAt and derives the end the legacy way when only the start was backfilled", () => {
-			const window = eventSalesWindow({
-				date: "2026-09-28T05:00:00.000Z",
-				startsAt: "2026-09-28T03:00:00.000Z",
-				barOpenTime: "22:00",
-				barCloseTime: "02:00",
-			});
-
-			expect(window.start.toISOString()).toBe("2026-09-28T03:00:00.000Z");
-			expect(hours(window)).toBe(4);
-		});
-
 		test("anchors on the legacy date and honours endsAt when only the end was backfilled", () => {
-			const window = eventSalesWindow({ ...LEGACY_ONLY, endsAt: "2026-09-28T08:00:00.000Z" });
+			const window = eventSalesWindow({ ...DATE_ONLY, endsAt: "2026-09-28T08:00:00.000Z" });
 			expect(window.start.toISOString()).toBe("2026-09-28T03:00:00.000Z");
 			expect(hours(window)).toBe(5);
 		});
 
-		test("ignores a blank or unparseable timestamp and falls back instead of producing an invalid window", () => {
-			const window = eventSalesWindow({ ...LEGACY_ONLY, startsAt: "", endsAt: "sometime" });
-			expect(window).toEqual(eventSalesWindow(LEGACY_ONLY));
+		test("ignores a blank or unparseable timestamp rather than producing an invalid window", () => {
+			const usable = { ...DATE_ONLY, barClosesAt: "2026-09-28T07:00:00.000Z" };
+			const window = eventSalesWindow({ ...usable, startsAt: "", endsAt: "sometime" });
+			expect(window).toEqual(eventSalesWindow(usable));
+			expect(hours(window)).toBe(4);
 		});
 
 		test("works with no legacy date at all, once a row has been fully migrated", () => {

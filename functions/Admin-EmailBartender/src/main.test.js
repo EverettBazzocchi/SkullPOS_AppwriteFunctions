@@ -36,7 +36,7 @@ describe("Admin-EmailBartender", () => {
 
 		test("shows the event time in the venue's local timezone, not UTC", async () => {
 			// 2026-09-27T03:00:00Z is 10:00 PM the evening before in America/Winnipeg (CDT,
-			// UTC-5) -- matches this event's real barOpenTime of 22:00. Rendering without an
+			// UTC-5) -- this event's real 22:00 bar open. Rendering without an
 			// explicit timeZone would show 3:00 a.m. (or whatever the server's own zone is)
 			// instead, which is the exact bug this guards against.
 			mockDatabases.getDocument
@@ -55,8 +55,8 @@ describe("Admin-EmailBartender", () => {
 		// --- the migrated time model -----------------------------------------------------------
 		//
 		// 2026-09-27T03:00:00Z is 10:00 p.m. the evening before in America/Winnipeg, and
-		// 2026-09-27T07:00:00Z is 2:00 a.m. -- the same 22:00-02:00 shift the legacy row above
-		// describes with `date` + barOpenTime/barCloseTime.
+		// 2026-09-27T07:00:00Z is 2:00 a.m. -- the same 22:00-02:00 shift the date-only row above
+		// can now only point at the start of.
 
 		test("renders the start from startsAt for a row that no longer carries a legacy date", async () => {
 			mockDatabases.getDocument
@@ -89,8 +89,6 @@ describe("Admin-EmailBartender", () => {
 					date: "2026-09-27T05:00:00.000Z", // midnight local -- meaningless time
 					startsAt: "2026-09-27T03:00:00.000Z", // the real 10 p.m. start
 					endsAt: "2026-09-27T07:00:00.000Z",
-					barOpenTime: "22:00",
-					barCloseTime: "02:00",
 					barOpensAt: "2026-09-27T03:00:00.000Z",
 					barClosesAt: "2026-09-27T07:00:00.000Z",
 				});

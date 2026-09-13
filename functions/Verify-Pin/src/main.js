@@ -145,10 +145,18 @@ const BARTENDERS_COLLECTION_ID = 'bartenders';
 const PIN_VALID_WINDOW_MS = 60 * 60 * 1000; // buffer on each side of the event's actual window
 
 // True if `now` falls within 1 hour of any of this bartender's assigned events' actual
-// start-to-close window (see eventWindow.js -- the event's own `startsAt`/`endsAt` and
-// `barOpensAt`/`barClosesAt` instants where they exist, the legacy `date` + bar-hours derivation
-// where they don't) -- a bartender pin only works for the event(s) they're actually scheduled for,
-// covering their whole shift, not permanently like a POS/self-checkout pin.
+// start-to-close window (see eventWindow.js -- the UNION of the event's own `startsAt`/`endsAt`
+// and the bar's `barOpensAt`/`barClosesAt` instants, with the legacy `date` surviving only as a
+// START anchor for a row carrying none of the four) -- a bartender pin only works for the event(s)
+// they're actually scheduled for, covering their whole shift, not permanently like a
+// POS/self-checkout pin.
+//
+// There is no longer any legacy route from a start to an END: the `barOpenTime`/`barCloseTime`
+// duration this used to fall back on is gone with the attributes themselves. So a row with a start
+// and no end instant yields a zero-length window, and the ±1h buffer below is then that pin's
+// ENTIRE validity rather than padding on top of a real shift. eventWindow.js argues why that beats
+// refusing to authenticate at all; what matters at this call site is that the buffer is the only
+// thing holding such a shift open, so narrowing it is not the local tweak it looks like.
 //
 // The bartender rows are fetched with Query.select(['*', 'events.*']), so the new attributes come
 // through on the nested events with no query change needed.
