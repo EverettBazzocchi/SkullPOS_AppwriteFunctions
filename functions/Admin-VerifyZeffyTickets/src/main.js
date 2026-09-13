@@ -1,6 +1,7 @@
 import { Databases, Query } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
 import { persistZeffyPayment, DATABASE_ID, FAILED_WEBHOOKS_COLLECTION_ID } from './zeffyPersist.js';
+import { createEventIdResolver } from './eventLookup.js';
 import { fetchAllZeffySucceededPayments, parsedFromZeffyPayment } from './zeffyApi.js';
 
 // Runs every 12 hours in two phases, both against the exact same idempotent write path
@@ -58,7 +59,7 @@ async function markUnreplayable(databases, row, reason, error) {
 	}
 }
 
-async function retryFailedWebhooks(databases, log, error) {
+async function retryFailedWebhooks(databases, log, error, resolveEventId) {
 	let deadLettered;
 	try {
 		deadLettered = await listZeffyFailedWebhooks(databases);
@@ -102,7 +103,7 @@ async function retryFailedWebhooks(databases, log, error) {
 		}
 
 		try {
-			await persistZeffyPayment(databases, parsed, log);
+			await persistZeffyPayment(databases, parsed, log, resolveEventId);
 			await databases.deleteDocument(DATABASE_ID, FAILED_WEBHOOKS_COLLECTION_ID, row.$id);
 			succeeded++;
 		} catch (err) {
@@ -118,7 +119,7 @@ async function retryFailedWebhooks(databases, log, error) {
 	return { retried: deadLettered.length, succeeded, stillFailing, unreplayable };
 }
 
-async function reconcileAgainstZeffyApi(databases, log, error) {
+async function reconcileAgainstZeffyApi(databases, log, error, resolveEventId) {
 	const apiKey = process.env.ZEFFY_API_KEY;
 	if (!apiKey) {
 		log('ZEFFY_API_KEY is not configured -- skipping the full Zeffy API reconciliation pass.');
@@ -141,7 +142,7 @@ async function reconcileAgainstZeffyApi(databases, log, error) {
 	for (const payment of payments) {
 		try {
 			const parsed = parsedFromZeffyPayment(payment);
-			const result = await persistZeffyPayment(databases, parsed, log);
+			const result = await persistZeffyPayment(databases, parsed, log, resolveEventId);
 			if (result.orderCreated) ordersCreated++;
 			ticketsSaved += result.ticketsSaved || 0;
 
@@ -179,8 +180,15 @@ export default async ({ req, res, log, error }) => {
 	const client = await createAppwriteClient(req);
 	const databases = new Databases(client);
 
-	const failedWebhookRetry = await retryFailedWebhooks(databases, log, error);
-	const zeffyApiReconciliation = await reconcileAgainstZeffyApi(databases, log, error);
+	// One resolver for the whole invocation, shared by both phases: it memoises eventName -> $id, so
+	// reconciling a few hundred payments for the same event issues ONE Events query, not one per
+	// payment. (Per-invocation rather than module-level on purpose -- a warm container must not keep
+	// serving a pre-rename answer.) This function already declares `documents.read`, so unlike
+	// Zeffy-Webhook its lookups work as soon as it is deployed.
+	const resolveEventId = createEventIdResolver(databases, DATABASE_ID, log, error);
+
+	const failedWebhookRetry = await retryFailedWebhooks(databases, log, error, resolveEventId);
+	const zeffyApiReconciliation = await reconcileAgainstZeffyApi(databases, log, error, resolveEventId);
 
 	return res.json({ failedWebhookRetry, zeffyApiReconciliation });
 };

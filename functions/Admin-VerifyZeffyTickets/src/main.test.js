@@ -428,4 +428,102 @@ describe("Admin-VerifyZeffyTickets", () => {
 			expect(result.body.zeffyApiReconciliation.failures).toEqual([{ id: "pay_bad", error: "boom" }]);
 		});
 	});
+
+	// --- tickets.eventId (limitation 5) -------------------------------------------------------
+	//
+	// This job is the second writer of tickets, through the byte-identical copy of zeffyPersist.js
+	// the live webhook uses. It has to place tickets on events exactly the way the webhook does, or
+	// a dead-lettered ticket replayed hours later ends up attached differently from one that landed
+	// first time. Unlike zeffy-webhook, this function already declares `documents.read`, so the
+	// lookup works here from the moment it deploys.
+	describe("event id resolution", () => {
+		/**
+		 * listDocuments stub that answers the failed_webhooks page and the Events lookup separately,
+		 * and records every Events query so the per-invocation memoisation can be asserted.
+		 */
+		function stubCollections({ failedWebhooks = [], events = [] } = {}) {
+			const eventLookups = [];
+			mockDatabases.listDocuments.mockImplementation((_db, collectionId, queries) => {
+				if (collectionId === "68e400210008d19bb5c9") {
+					eventLookups.push(queries);
+					const name = String(queries.find((q) => q.startsWith('equal("name"')) || "");
+					return Promise.resolve({ documents: events.filter((e) => name.includes(JSON.stringify(e.name))) });
+				}
+				return Promise.resolve({ documents: failedWebhooks });
+			});
+			return eventLookups;
+		}
+
+		const ticketPayloads = () => mockDatabases.createDocument.mock.calls.filter((c) => c[1] === "tickets").map((c) => c[3]);
+
+		test("writes the resolved event id alongside the name on a reconciled ticket", async () => {
+			process.env.ZEFFY_API_KEY = "test_key";
+			stubCollections({ events: [{ $id: "6a9a44984ca3104e2efc", name: "Fall Fundraiser" }] });
+			mockDatabases.createDocument.mockResolvedValue({});
+			fetchMock.mockResolvedValueOnce(apiPaymentsPage([zeffyPayment("pay_1")]));
+
+			await handler(makeContext({ body: {} }));
+
+			expect(ticketPayloads()[0]).toMatchObject({ eventName: "Fall Fundraiser", eventId: "6a9a44984ca3104e2efc" });
+		});
+
+		test("writes the same event id on a replayed dead-lettered ticket as the live webhook would", async () => {
+			stubCollections({
+				failedWebhooks: [failedWebhookDoc("fw1")],
+				events: [{ $id: "6a9a44984ca3104e2efc", name: "Fall Fundraiser" }],
+			});
+			mockDatabases.createDocument.mockResolvedValue({});
+			mockDatabases.deleteDocument.mockResolvedValue({});
+
+			const result = await handler(makeContext({ body: {} }));
+
+			expect(result.body.failedWebhookRetry.succeeded).toBe(1);
+			expect(ticketPayloads()[0]).toMatchObject({ eventName: "Fall Fundraiser", eventId: "6a9a44984ca3104e2efc" });
+		});
+
+		// Without a shared resolver this job would issue one Events query per payment -- a backlog
+		// of a few hundred Zeffy payments for one event is exactly the shape this job is for.
+		test("looks each event name up once for the whole run, not once per payment", async () => {
+			process.env.ZEFFY_API_KEY = "test_key";
+			const eventLookups = stubCollections({ events: [{ $id: "evt1", name: "Fall Fundraiser" }] });
+			mockDatabases.createDocument.mockResolvedValue({});
+			fetchMock.mockResolvedValueOnce(
+				apiPaymentsPage([zeffyPayment("pay_1"), zeffyPayment("pay_2"), zeffyPayment("pay_3"), zeffyPayment("pay_4")])
+			);
+
+			await handler(makeContext({ body: {} }));
+
+			expect(ticketPayloads()).toHaveLength(4);
+			expect(ticketPayloads().every((t) => t.eventId === "evt1")).toBe(true);
+			expect(eventLookups).toHaveLength(1);
+		});
+
+		test("caches a miss too, so an unknown event name isn't re-queried for every payment", async () => {
+			process.env.ZEFFY_API_KEY = "test_key";
+			const eventLookups = stubCollections({ events: [] });
+			mockDatabases.createDocument.mockResolvedValue({});
+			fetchMock.mockResolvedValueOnce(apiPaymentsPage([zeffyPayment("pay_1"), zeffyPayment("pay_2")]));
+
+			await handler(makeContext({ body: {} }));
+
+			expect(ticketPayloads()).toHaveLength(2);
+			expect(ticketPayloads()[0]).not.toHaveProperty("eventId");
+			expect(eventLookups).toHaveLength(1);
+		});
+
+		test("still reconciles the payment when the event lookup fails", async () => {
+			process.env.ZEFFY_API_KEY = "test_key";
+			mockDatabases.listDocuments.mockImplementation((_db, collectionId) =>
+				collectionId === "68e400210008d19bb5c9" ? Promise.reject(new Error("events unreadable")) : Promise.resolve({ documents: [] })
+			);
+			mockDatabases.createDocument.mockResolvedValue({});
+			fetchMock.mockResolvedValueOnce(apiPaymentsPage([zeffyPayment("pay_1")]));
+
+			const result = await handler(makeContext({ body: {} }));
+
+			expect(result.body.zeffyApiReconciliation).toMatchObject({ checked: 1, ordersCreated: 1, ticketsSaved: 1, failures: [] });
+			expect(ticketPayloads()[0].eventName).toBe("Fall Fundraiser");
+			expect(ticketPayloads()[0]).not.toHaveProperty("eventId");
+		});
+	});
 });

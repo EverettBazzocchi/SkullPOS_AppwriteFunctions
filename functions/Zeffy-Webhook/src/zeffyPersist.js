@@ -28,14 +28,30 @@ function isConflict(err) {
  * transaction. Each document's id is deterministically derived from the Zeffy transaction/ticket
  * id (see deterministicId.js), so a duplicate `createDocument` call fails atomically on
  * Appwrite's own uniqueness constraint instead of racing a separate `listDocuments` check.
+ *
+ * `resolveEventId` is optional: the memoised resolver from eventLookup.js, used once per payload to
+ * turn the free-text event name into an `Events.$id` that is stored on each ticket alongside the
+ * name. Omit it and tickets are written exactly as they were before -- name only.
  */
-export async function persistZeffyPayment(databases, parsed, log) {
+export async function persistZeffyPayment(databases, parsed, log, resolveEventId) {
 	if (parsed.eventType !== 'payment.completed') {
 		return { skipped: true, reason: `event type "${parsed.eventType}" is not persisted` };
 	}
 
 	const { eventName, amount, currency, buyerName, email, paymentMethodType, items } = parsed;
 	const transactionId = String(parsed.transactionId);
+
+	// ONCE per payload, before the ticket loop, and belt-and-braces guarded: the resolver already
+	// swallows its own failures, but this is the live ticket-purchase path and a lookup that only
+	// ever adds a nice-to-have id must not be able to lose a real ticket sale under any circumstance.
+	let eventId = null;
+	if (typeof resolveEventId === 'function') {
+		try {
+			eventId = await resolveEventId(eventName);
+		} catch (err) {
+			if (log) log(`Event lookup for "${eventName}" threw (${err.message}) -- continuing with the event name only.`);
+		}
+	}
 
 	let orderCreated = false;
 	try {
@@ -67,7 +83,13 @@ export async function persistZeffyPayment(databases, parsed, log) {
 				ticketId: ticketCode,
 				orderId: transactionId,
 				source: 'ZEFFY',
+				// Both, always. The name is what every reader keys off today and stays the source of
+				// truth for display; the id is the rename-proof join for the readers that are being
+				// migrated onto it. The key is omitted rather than written as null when the name
+				// resolved to nothing, so a ticket this function could not place is indistinguishable
+				// from the 204 legacy rows the backfill script looks for.
 				eventName,
+				...(eventId ? { eventId } : {}),
 				ticketType: item.type || 'Standard Ticket',
 				attendeeName: buyerName,
 				attendeeEmail: email,
@@ -94,5 +116,7 @@ export async function persistZeffyPayment(databases, parsed, log) {
 	// than only counting what was created) so the reconciliation job can tell "this order was
 	// already complete" apart from "this order exists but its tickets are missing" -- an existing
 	// order row on its own was never proof that its tickets landed.
-	return { orderCreated, ticketsSaved, ticketsAlreadyPresent, ticketsExpected: items.length };
+	// eventId is reported (not just written) so a caller -- the webhook's own JSON response, the
+	// verify job's summary -- can see at a glance whether the name resolved, without reading logs.
+	return { orderCreated, ticketsSaved, ticketsAlreadyPresent, ticketsExpected: items.length, eventId };
 }

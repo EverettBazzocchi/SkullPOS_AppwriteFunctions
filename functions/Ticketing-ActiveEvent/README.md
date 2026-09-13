@@ -51,7 +51,9 @@ None. Any body is ignored.
     "sellsAlcohol": true,
     "barOpenTime": "22:00",
     "barCloseTime": "02:00"
-  }
+  },
+  "multipleActive": false,
+  "activeCount": 1
 }
 ```
 
@@ -74,12 +76,43 @@ to exclude it.
 
 | Status | Body | What it means operationally |
 | --- | --- | --- |
-| `200` | `{ event: {...} }` | The active event. |
-| `200` | `{ event: null }` | **Not an error** — nothing is running right now. The client shows its own generic entry-pass label, which is correct, and which is distinguishable from the `401` this function exists to fix. |
+| `200` | `{ event: {...}, multipleActive, activeCount }` | The active event. |
+| `200` | `{ event: null }` | **Not an error** — nothing is running right now. The client shows its own generic entry-pass label, which is correct, and which is distinguishable from the `401` this function exists to fix. Deliberately carries no `multipleActive`/`activeCount`: this exact shape is what every client already fails closed on, and there is nothing to warn about when nothing is active. |
 | `500` | `{ error: "Failed to load the active event" }` | The `Events` query failed. Every floor surface degrades: the door shows its generic label and the bar hides alcohol. |
 
-Only the first document with `isActive: true` is returned. Two events flagged
-active at once means whichever Appwrite returns first wins.
+## Which event wins when more than one is active
+
+Nothing in the schema or the admin app stops two events carrying `isActive`
+(`Events.isActive` is a plain optional boolean and the admin app writes the
+collection directly), so this function has to have an answer.
+
+**The rule: the most recently updated active event wins** —
+`orderDesc('$updatedAt')`, i.e. the one whoever is on shift just saved.
+
+That replaces `Query.limit(1)` with no order clause at all. Verified read-only
+against the live instance (Appwrite 1.9.0) rather than assumed: an unordered
+`limit(3)` over the 95 tickets named `Everetts Test event ignopre` returns
+sequences 1, 16, 17 — byte-identical to the same query with
+`orderAsc('$createdAt')`, and the exact reverse of `orderDesc('$updatedAt')`,
+which returns sequence 219 (created 2026-09-12T18:40, updated 18:46) first. So
+the default order follows creation and ignores updates entirely: the **oldest**
+active event won, and re-ticking a newer one did nothing. That is why the floor
+could silently follow an event nobody meant.
+
+Two more things follow from that:
+
+- **More than one active event is reported, not hidden.** `activeCount` is the
+  server-side `total` (accurate past the fetch limit), `multipleActive` is the
+  flag, and the same sentence is written to the function's **Errors** view naming
+  the event that won. Still a `200` with a usable event — this is a warning about
+  the data, not a failed request.
+- **An event left active with `testing: true` is stepped over** in favour of the
+  first non-test active event. If *every* active event is a test event it is
+  still served, loudly, because returning `null` would close the alcohol gate on
+  the register and both menu boards and drop the door to its CA$30 default —
+  strictly worse than today. `testing` is only honoured when explicitly `true`;
+  it was added 2026-09-12 and is absent on two of the three live event rows, and
+  a server-side `Query.notEqual('testing', true)` would drop those NULLs outright.
 
 ## Scopes
 

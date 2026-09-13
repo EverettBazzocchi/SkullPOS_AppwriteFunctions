@@ -115,6 +115,121 @@ describe("Zeffy-Webhook", () => {
 		expect(result.body).toMatchObject({ orderCreated: false, ticketsSaved: 0 });
 	});
 
+	// --- tickets.eventId (limitation 5) -------------------------------------------------------
+	//
+	// tickets carry the event name as free text and every reader re-matches it against Events.name
+	// on every read, so renaming an event orphans its tickets. These pin the write half: the name
+	// is resolved to an Events.$id ONCE here, at write time, and stored alongside the name -- and,
+	// just as importantly, the lookup can never cost a real ticket sale.
+
+	/** listDocuments stub for the Events-by-name lookup, with a call counter. */
+	function eventsNamed(documents) {
+		const calls = [];
+		mockDatabases.listDocuments.mockImplementation((_db, collectionId, queries) => {
+			calls.push({ collectionId, queries });
+			return Promise.resolve({ documents });
+		});
+		return calls;
+	}
+
+	const ticketPayloads = () => mockDatabases.createDocument.mock.calls.filter((c) => c[1] === "tickets").map((c) => c[3]);
+
+	test("writes the resolved event id onto the ticket alongside the event name", async () => {
+		const lookups = eventsNamed([{ $id: "6a9a44984ca3104e2efc", name: "Fall Fundraiser" }]);
+
+		const result = await handler(signedContext(completedPayload));
+
+		expect(ticketPayloads()[0]).toMatchObject({ eventName: "Fall Fundraiser", eventId: "6a9a44984ca3104e2efc" });
+		expect(result.body.eventId).toBe("6a9a44984ca3104e2efc");
+		// Events collection, matched on the exact name -- never a fuzzy or partial match.
+		expect(lookups[0].collectionId).toBe("68e400210008d19bb5c9");
+		expect(lookups[0].queries).toContain('equal("name", "Fall Fundraiser")');
+	});
+
+	// The whole point: nothing that reads by name may change shape mid-migration.
+	test("keeps writing the event name unchanged, so name-based readers keep working", async () => {
+		eventsNamed([{ $id: "evt1", name: "Fall Fundraiser" }]);
+
+		await handler(signedContext(completedPayload));
+
+		expect(ticketPayloads()[0].eventName).toBe("Fall Fundraiser");
+	});
+
+	test("resolves the event once per payload, not once per ticket", async () => {
+		const lookups = eventsNamed([{ $id: "evt1", name: "Fall Fundraiser" }]);
+		const threeTickets = {
+			...completedPayload,
+			data: {
+				...completedPayload.data,
+				items: [
+					{ id: "i1", amount: 1000 },
+					{ id: "i2", amount: 1000 },
+					{ id: "i3", amount: 1000 },
+				],
+			},
+		};
+
+		await handler(signedContext(threeTickets));
+
+		expect(ticketPayloads()).toHaveLength(3);
+		expect(ticketPayloads().every((t) => t.eventId === "evt1")).toBe(true);
+		expect(lookups).toHaveLength(1);
+	});
+
+	test("writes the ticket with its name only when no event matches, rather than guessing", async () => {
+		eventsNamed([]);
+
+		const result = await handler(signedContext(completedPayload));
+
+		expect(result.body).toMatchObject({ success: true, ticketsSaved: 1 });
+		expect(ticketPayloads()[0].eventName).toBe("Fall Fundraiser");
+		// Absent, not null: an unplaceable ticket has to look exactly like the legacy rows the
+		// backfill script goes looking for.
+		expect(ticketPayloads()[0]).not.toHaveProperty("eventId");
+		expect(result.body.eventId).toBeNull();
+	});
+
+	// Two events sharing a name is the one case where a guess would silently move real ticket
+	// revenue from one event to another in the rollup.
+	test("refuses to pick an event when two share the name", async () => {
+		eventsNamed([
+			{ $id: "evtA", name: "Fall Fundraiser" },
+			{ $id: "evtB", name: "Fall Fundraiser" },
+		]);
+
+		const ctx = signedContext(completedPayload);
+		const result = await handler(ctx);
+
+		expect(ticketPayloads()[0]).not.toHaveProperty("eventId");
+		expect(result.body.ticketsSaved).toBe(1);
+		expect(ctx.error).toHaveBeenCalledWith(expect.stringContaining("More than one event is named"));
+	});
+
+	// This is the one that matters most. zeffy-webhook declares `documents.write` only, so until
+	// `documents.read` is added to its scopes every one of these lookups is a 403 -- and a paid
+	// ticket must still land. Same guarantee for any other DB hiccup.
+	test("still records the paid ticket when the event lookup fails outright (e.g. missing documents.read scope)", async () => {
+		const forbidden = new Error("app.xxx@project is missing scope (documents.read)");
+		forbidden.code = 401;
+		mockDatabases.listDocuments.mockRejectedValue(forbidden);
+
+		const result = await handler(signedContext(completedPayload));
+
+		expect(result.statusCode).toBe(200);
+		expect(result.body).toMatchObject({ success: true, orderCreated: true, ticketsSaved: 1 });
+		expect(ticketPayloads()[0].eventName).toBe("Fall Fundraiser");
+		expect(ticketPayloads()[0]).not.toHaveProperty("eventId");
+	});
+
+	test("does not put an event id on the order row, only on tickets", async () => {
+		eventsNamed([{ $id: "evt1", name: "Fall Fundraiser" }]);
+
+		await handler(signedContext(completedPayload));
+
+		const orderPayload = mockDatabases.createDocument.mock.calls.find((c) => c[1] === "orders")[3];
+		expect(orderPayload).not.toHaveProperty("eventId");
+	});
+
 	test("does not persist a non-payment.completed event", async () => {
 		const ctx = signedContext({ type: "payment.refunded", data: { id: "txn_999" } });
 		const result = await handler(ctx);

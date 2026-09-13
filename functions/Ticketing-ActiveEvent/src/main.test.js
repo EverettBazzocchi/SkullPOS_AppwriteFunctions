@@ -166,6 +166,121 @@ describe("Ticketing-ActiveEvent", () => {
 		expect(queries.some((q) => q.includes("isActive"))).toBe(true);
 	});
 
+	// --- which of several active events wins (limitation 4) ---------------------------------
+	//
+	// The old query was `equal(isActive,true) + limit(1)` with no order clause. Verified against
+	// the live instance (see the comment in main.js): an unordered list comes back in creation
+	// order and is unaffected by updates, so the OLDEST active row won and re-ticking a newer
+	// event did nothing. These pin the replacement rule: most recently updated wins, deterministically.
+
+	test("asks the database to order active events by most-recently-updated, and fetches more than one", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [activeEventDoc] });
+		const ctx = makeContext({ body: {} });
+
+		await handler(ctx);
+
+		const [, , queries] = mockDatabases.listDocuments.mock.calls[0];
+		// Without this the row served is whichever the database returns first, which live is the
+		// oldest one -- the opposite of the event the operator just ticked.
+		expect(queries).toContain('orderDesc("$updatedAt")');
+		// limit(1) cannot see a second active event, so it can neither warn about one nor step
+		// past a test event.
+		expect(queries.some((q) => /^limit\((\d+)\)$/.test(q) && Number(q.match(/^limit\((\d+)\)$/)[1]) > 1)).toBe(true);
+	});
+
+	test("serves the most recently updated active event when several are active", async () => {
+		const stale = { ...activeEventDoc, $id: "evtOld", name: "Last Month's Party" };
+		const justTicked = { ...activeEventDoc, $id: "evtNew", name: "Tonight" };
+		// The order the query now asks for: orderDesc($updatedAt) puts the just-ticked row first.
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [justTicked, stale], total: 2 });
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(result.body.event.$id).toBe("evtNew");
+	});
+
+	test("makes a multiple-active situation visible in the log and in the response instead of silently picking one", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({
+			documents: [activeEventDoc, { ...activeEventDoc, $id: "evtOld", name: "Last Month's Party" }],
+			total: 2,
+		});
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(result.body.multipleActive).toBe(true);
+		expect(result.body.activeCount).toBe(2);
+		// Errors view, not the chatty log -- this is the channel somebody actually reads after the
+		// floor behaves oddly, and it has to name the event that won.
+		expect(ctx.error).toHaveBeenCalledWith(expect.stringContaining("2 events are marked active"));
+		expect(ctx.error).toHaveBeenCalledWith(expect.stringContaining("HAX 7.0"));
+	});
+
+	test("reports the true active count from the server total, not just the fetched page", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({
+			documents: [activeEventDoc, { ...activeEventDoc, $id: "e2" }],
+			total: 9,
+		});
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(result.body.activeCount).toBe(9);
+	});
+
+	test("stays quiet when exactly one event is active", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [activeEventDoc], total: 1 });
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(result.body.multipleActive).toBe(false);
+		expect(result.body.activeCount).toBe(1);
+		expect(ctx.error).not.toHaveBeenCalled();
+	});
+
+	test("steps past an event left active with testing:true and serves the real one", async () => {
+		const testEvent = { ...activeEventDoc, $id: "evtTest", name: "Everetts Test event", testing: true };
+		const realEvent = { ...activeEventDoc, $id: "evtReal", name: "HAX 7.0", testing: false };
+		// Test event is the most recently updated, so ordering alone would hand it to the floor.
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [testEvent, realEvent], total: 2 });
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(result.body.event.$id).toBe("evtReal");
+		// The warning has to explain the rule that actually picked this row -- saying "the most
+		// recently updated" here would send whoever reads it looking at the wrong event.
+		expect(ctx.error).toHaveBeenCalledWith(expect.stringContaining("most recently updated non-test event"));
+	});
+
+	// `testing` was added 2026-09-12 and is absent on two of the three live event rows. Treating
+	// "no testing field" as a test event would black out the floor for every event created before
+	// that date.
+	test("treats an event with no testing field as a real event", async () => {
+		const noFlag = { $id: "evtNoFlag", name: "Legacy Night", isActive: true };
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [noFlag], total: 1 });
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(result.body.event.$id).toBe("evtNoFlag");
+	});
+
+	// Returning null here would close the alcohol gate on the register and both menu boards and
+	// drop the door to its CA$30 default -- strictly worse than today. Serve it, and shout.
+	test("still serves a test event (loudly) rather than going dark when every active event is a test", async () => {
+		const testEvent = { ...activeEventDoc, $id: "evtTest", name: "Everetts Test event", testing: true };
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [testEvent], total: 1 });
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(result.body.event.$id).toBe("evtTest");
+		expect(ctx.error).toHaveBeenCalledWith(expect.stringContaining("TEST event"));
+	});
+
 	test("returns event:null (not an error) when no event is active", async () => {
 		mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
 		const ctx = makeContext({ body: {} });

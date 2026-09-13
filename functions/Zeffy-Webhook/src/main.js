@@ -3,6 +3,7 @@ import { createAppwriteClient } from './appwriteClient.js';
 import { parseZeffyPayload } from './zeffyPayload.js';
 import { isZeffySignatureValid } from './zeffySignature.js';
 import { persistZeffyPayment, DATABASE_ID, FAILED_WEBHOOKS_COLLECTION_ID } from './zeffyPersist.js';
+import { createEventIdResolver } from './eventLookup.js';
 
 // Receives Zeffy's payment.completed webhook (relayed unmodified, raw body + Zeffy-Signature
 // header, by the Cloudflare Worker in ShottyTicketing/cloudflare-worker -- see that repo's
@@ -119,7 +120,11 @@ export default async ({ req, res, log, error }) => {
 	const databases = new Databases(client);
 
 	try {
-		const result = await persistZeffyPayment(databases, parsed, log);
+		// Resolves the event name to an Events.$id once and stores it on each ticket alongside the
+		// name, so a later event rename can't orphan these tickets. Fails soft in every direction --
+		// including the 403 this will return until `documents.read` is added to this function's
+		// scopes in appwrite.config.json, since it currently declares `documents.write` only.
+		const result = await persistZeffyPayment(databases, parsed, log, createEventIdResolver(databases, DATABASE_ID, log, error));
 		return res.json({ success: true, transactionId, ...result });
 	} catch (err) {
 		error('Failed to persist Zeffy order/tickets: ' + err.message);

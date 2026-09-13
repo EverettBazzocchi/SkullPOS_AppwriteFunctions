@@ -83,7 +83,7 @@ refused at the door), `unreplayable` (payments only phase 2 can recover), and
 
 | Scope | Why |
 | --- | --- |
-| `documents.read` | Page `failed_webhooks`. |
+| `documents.read` | Page `failed_webhooks`, and look an event name up in `Events` (see below). Already live here, unlike on `zeffy-webhook`. |
 | `documents.write` | Create `orders`/`tickets`; stamp and delete `failed_webhooks` rows. |
 
 ## Environment variables
@@ -107,9 +107,27 @@ Phase 2 walks **every** succeeded payment Zeffy has ever recorded, not a recent
 window, so its cost grows with the campaign's lifetime. If it starts timing out,
 that is the thing to bound first.
 
-`src/zeffyPersist.js` is kept in sync **by hand** with the identical file in
-`functions/Zeffy-Webhook/src/`. Change one, change both — divergence means a
-retried payload writes something different from what the live webhook wrote.
+`src/zeffyPersist.js` and `src/eventLookup.js` are kept in sync **by hand** with
+the identical files in `functions/Zeffy-Webhook/src/`. Change one, change both —
+divergence means a retried payload writes something different from what the live
+webhook wrote. `diff` the pairs before pushing; they are byte-identical on purpose.
+
+## `eventId` on the tickets this job writes
+
+Every ticket written here carries `eventId` (the matching `Events.$id`) alongside
+`eventName`, exactly as the live webhook now does, so a payload replayed hours
+later lands on the same event as one that arrived first time. The rules are in
+`src/eventLookup.js`: exact single name match only, never a guess when a name
+matches zero or two events, and any failure at all resolves to "write the name
+only" rather than failing the payment.
+
+The resolver is created **once per invocation** and memoises `name -> $id`, so
+reconciling a few hundred payments for one event issues one `Events` query rather
+than one per payment. It is deliberately not module-level: a warm container must
+not keep serving a pre-rename answer.
+
+Rows written before this shipped are filled in by
+`functions/_scripts/backfill-ticket-event-ids.js`.
 
 ## Calling Appwrite's own API from inside a function
 
