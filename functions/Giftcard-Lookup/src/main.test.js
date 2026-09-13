@@ -8,31 +8,29 @@ const { makeContext } = require("../../../test/helpers/handlerContext");
 const { MAX_ATTEMPTS } = require("./rateLimit.js");
 
 const PIN_PAYMENT_TEAM_ID = "6a9cbb1c95ea7d59dd8c";
-const ADMIN_TEAM_ID = "68e35aed00144b8cde9d";
 
 // Every real caller is a PIN-verified till: an anonymous account that Verify-Pin has joined to the
-// PIN Payment Access team, executing with the platform-injected key. The tests in this file used
-// to pass no headers at all, which is precisely the unauthenticated caller this function now
-// refuses -- so the context helper below is what "a legitimate POS device" looks like.
-function tillContext(body, { ip = "203.0.113.9" } = {}) {
+// PIN Payment Access team, executing with the platform-injected key. Appwrite has already checked
+// that membership against the function's `execute` list before the body runs, so a caller that gets
+// this far is an authorized one. The tests in this file used to pass no headers at all, which is
+// precisely the caller-less API-key invocation this function refuses.
+// `caller` is the throttle key now, not the IP. Appwrite sets x-appwrite-user-id from the session
+// and a caller cannot supply it, so each till gets its own bucket and nobody can choose someone
+// else's. x-forwarded-for is still passed on some cases purely to prove it is ignored.
+function tillContext(body, { caller = "pos-device-1", ip } = {}) {
 	return makeContext({
 		body,
 		headers: {
-			"x-appwrite-user-id": "pos-device-1",
+			"x-appwrite-user-id": caller,
 			"x-appwrite-key": "injected-key",
-			"x-forwarded-for": ip,
+			...(ip ? { "x-forwarded-for": ip } : {}),
 		},
 	});
-}
-
-function grantMembership(teamId = PIN_PAYMENT_TEAM_ID) {
-	mockUsers.listMemberships.mockResolvedValue({ memberships: [{ teamId, confirm: true }] });
 }
 
 describe("Giftcard-Lookup", () => {
 	beforeEach(() => {
 		resetAppwriteMocks();
-		grantMembership();
 	});
 
 	test("finds a card by exact UPC match", async () => {
@@ -132,83 +130,110 @@ describe("Giftcard-Lookup", () => {
 		expect(result.statusCode).toBe(500);
 	});
 
-	describe("caller authorization", () => {
-		test("a session in none of the till/admin teams is refused, and never reaches the giftcards collection", async () => {
-			mockUsers.listMemberships.mockResolvedValue({ memberships: [] });
+	// The one authorization decision this function still makes for itself. Appwrite enforces the
+	// `execute` team allowlist before the function body runs, so a session caller has already been
+	// proven to be a confirmed member of an allowed team; the only caller that gets past that list
+	// is a project API key with execution.write, which carries no session user.
+	describe("caller authorization -- refusing an API-key-only invocation", () => {
+		test("no caller id at all (a raw API-key invocation) is refused", async () => {
 			mockDatabases.listDocuments.mockResolvedValue({
 				documents: [{ $id: "gc1", UPC: "75855123", balance: 5000 }],
 			});
-			const ctx = tillContext({ code: "75855123" });
-
-			const result = await handler(ctx);
-
-			expect(result.statusCode).toBe(403);
-			expect(result.body).not.toHaveProperty("balance");
-			expect(mockDatabases.listDocuments).not.toHaveBeenCalled();
-		});
-
-		test("an unconfirmed membership in an allowed team does not count", async () => {
-			mockUsers.listMemberships.mockResolvedValue({ memberships: [{ teamId: PIN_PAYMENT_TEAM_ID, confirm: false }] });
-			const ctx = tillContext({ code: "75855123" });
-
-			const result = await handler(ctx);
-
-			expect(result.statusCode).toBe(403);
-		});
-
-		test("no caller id at all (a raw API-key invocation) is refused", async () => {
 			const ctx = makeContext({ body: { code: "75855123" } });
 
 			const result = await handler(ctx);
 
 			expect(result.statusCode).toBe(403);
+			expect(result.body).not.toHaveProperty("balance");
 			expect(mockUsers.listMemberships).not.toHaveBeenCalled();
 			expect(mockDatabases.listDocuments).not.toHaveBeenCalled();
 		});
 
-		test("an admin-team caller is allowed", async () => {
-			grantMembership(ADMIN_TEAM_ID);
+		// Appwrite sends x-appwrite-user-id with an empty value rather than omitting it when the
+		// execution has no session user, so "" is the shape this actually arrives in.
+		test("an empty caller id is refused as firmly as a missing one", async () => {
 			mockDatabases.listDocuments.mockResolvedValue({
-				documents: [{ $id: "gc1", UPC: "75855123", balance: 500 }],
+				documents: [{ $id: "gc1", UPC: "75855123", balance: 5000 }],
 			});
-			const ctx = tillContext({ code: "75855123" });
+			const ctx = makeContext({
+				body: { code: "75855123" },
+				headers: { "x-appwrite-user-id": "", "x-appwrite-key": "injected-key" },
+			});
 
 			const result = await handler(ctx);
 
-			expect(result.body.found).toBe(true);
-		});
-
-		// `execute` is still `users`, so this check is the access control, not a second copy of
-		// one. Both of its "cannot run" states therefore refuse -- and the second one was every
-		// request in production, since a function with no declared scopes is never handed a key.
-		test("a Users API failure refuses rather than answering the lookup unverified", async () => {
-			mockUsers.listMemberships.mockRejectedValue(new Error("users api down"));
-			mockDatabases.listDocuments.mockResolvedValue({
-				documents: [{ $id: "gc1", UPC: "75855123", balance: 500 }],
-			});
-			const ctx = tillContext({ code: "75855123" });
-
-			const result = await handler(ctx);
-
-			expect(result.statusCode).toBe(503);
+			expect(result.statusCode).toBe(403);
 			expect(result.body).not.toHaveProperty("balance");
 			expect(mockDatabases.listDocuments).not.toHaveBeenCalled();
 		});
+	});
 
-		test("no injected x-appwrite-key refuses, and names the missing scope in the log", async () => {
+	// The incident of 2026-09-13 07:51 UTC: the guard re-derived team membership through the Users
+	// API and refused with a 503 whenever that call could not answer, which stopped giftcard
+	// scanning at the bar. Each row below is a way that lookup used to fail or refuse. A session
+	// caller has already cleared Appwrite's `execute` allowlist, so every row must still be served
+	// -- and in particular none of them may produce a 503.
+	describe("a session caller is never turned away by an external lookup", () => {
+		const hostileConditions = [
+			[
+				"the caller id does not resolve as a project user",
+				() => {
+					// The literal error the live function logged.
+					const notFound = new Error("User with the requested ID could not be found.");
+					notFound.code = 404;
+					mockUsers.listMemberships.mockRejectedValue(notFound);
+				},
+			],
+			["the Users API is down", () => mockUsers.listMemberships.mockRejectedValue(new Error("users api down"))],
+			["the caller belongs to no team", () => mockUsers.listMemberships.mockResolvedValue({ memberships: [] })],
+			[
+				"the caller's membership is unconfirmed",
+				() => mockUsers.listMemberships.mockResolvedValue({ memberships: [{ teamId: PIN_PAYMENT_TEAM_ID, confirm: false }] }),
+			],
+		];
+
+		test.each(hostileConditions)("still answers the lookup when %s", async (_label, arrange) => {
+			arrange();
+			mockDatabases.listDocuments.mockResolvedValue({
+				documents: [{ $id: "gc1", UPC: "75855123", balance: 500 }],
+			});
+			const ctx = tillContext({ code: "75855123" });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(200);
+			expect(result.body).toEqual({ found: true, id: "gc1", balance: 500, eventId: null, active: true });
+		});
+
+		// Appwrite injects x-appwrite-key only for a function that declares scopes. Whether that
+		// injection happened must not decide whether the bar can scan a card.
+		test("still answers the lookup when no x-appwrite-key is injected", async () => {
 			mockDatabases.listDocuments.mockResolvedValue({
 				documents: [{ $id: "gc1", UPC: "75855123", balance: 500 }],
 			});
 			const ctx = makeContext({
 				body: { code: "75855123" },
-				headers: { "x-appwrite-user-id": "anonymous-session", "x-forwarded-for": "203.0.113.9" },
+				headers: { "x-appwrite-user-id": "pos-device-1", "x-forwarded-for": "203.0.113.9" },
 			});
 
 			const result = await handler(ctx);
 
-			expect(result.statusCode).toBe(503);
-			expect(mockDatabases.listDocuments).not.toHaveBeenCalled();
-			expect(ctx.error).toHaveBeenCalledWith(expect.stringMatching(/users\.read/));
+			expect(result.statusCode).toBe(200);
+			expect(result.body.found).toBe(true);
+		});
+
+		// The structural reason all of the above hold: the authorization path makes no outbound
+		// call, so it has no failure mode to mishandle. Reintroducing a membership lookup here --
+		// fail-closed or fail-open -- fails this test.
+		test("decides authorization without consulting any external service", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({
+				documents: [{ $id: "gc1", UPC: "75855123", balance: 500 }],
+			});
+			const ctx = tillContext({ code: "75855123" });
+
+			await handler(ctx);
+
+			expect(mockUsers.listMemberships).not.toHaveBeenCalled();
 		});
 	});
 
@@ -294,17 +319,31 @@ describe("Giftcard-Lookup", () => {
 			expect(result.body.found).toBe(true);
 		});
 
-		test("two different IPs are throttled independently", async () => {
+		test("two different tills are throttled independently", async () => {
 			mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
 
-			await handler(tillContext({ code: "75855000" }, { ip: "203.0.113.1" }));
-			await handler(tillContext({ code: "75855001" }, { ip: "198.51.100.7" }));
+			await handler(tillContext({ code: "75855000" }, { caller: "pos-device-1" }));
+			await handler(tillContext({ code: "75855001" }, { caller: "pos-device-2" }));
 
 			const [firstId, secondId] = mockDatabases.createDocument.mock.calls.map((call) => call[2]);
 			expect(firstId).not.toBe(secondId);
 		});
 
-		test("a found card clears the accumulated misses for that IP", async () => {
+		// The bug this replaces: the key came from x-forwarded-for, which createExecution lets the
+		// caller set. Rotating it made the enumeration oracle unthrottled; pinning it to another
+		// till's value exhausted that till's bucket from outside. It also meant every till at the
+		// venue shared one bucket, because they all leave through one public IP.
+		test("the throttle bucket cannot be chosen by the caller -- x-forwarded-for is ignored", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
+
+			await handler(tillContext({ code: "75855000" }, { caller: "pos-device-1", ip: "203.0.113.1" }));
+			await handler(tillContext({ code: "75855001" }, { caller: "pos-device-1", ip: "198.51.100.7" }));
+
+			const [firstId, secondId] = mockDatabases.createDocument.mock.calls.map((call) => call[2]);
+			expect(firstId).toBe(secondId);
+		});
+
+		test("a found card clears the accumulated misses for that till", async () => {
 			mockDatabases.getDocument.mockResolvedValue({ attempts: 3, windowStart: new Date().toISOString(), lockedUntil: null });
 			mockDatabases.listDocuments.mockResolvedValue({
 				documents: [{ $id: "gc1", UPC: "75855123", balance: 500 }],

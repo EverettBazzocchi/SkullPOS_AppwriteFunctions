@@ -230,12 +230,33 @@ describe("Transaction-EmailReceipt", () => {
 		expect(result.body).toEqual({ ok: true });
 	});
 
-	describe("caller authorization", () => {
-		test("a session in none of the till/admin teams is refused, and no transaction is read or mailed", async () => {
-			mockUsers.listMemberships.mockResolvedValue({ memberships: [] });
+	// The one authorization decision this function still makes for itself. Appwrite enforces the
+	// `execute` team allowlist before the function body runs, so a session caller has already been
+	// proven to be a confirmed member of an allowed team; the only caller that gets past that list
+	// is a project API key with execution.write, which carries no session user.
+	describe("caller authorization -- refusing an API-key-only invocation", () => {
+		test("no caller id at all (a raw API-key invocation) is refused", async () => {
 			mockDocuments();
 			mockResendSuccess();
-			const ctx = tillContext({ transactionId: "t1", email: "attacker@example.com" });
+			const ctx = makeContext({ body: { transactionId: "t1", email: "attacker@example.com" } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(403);
+			expect(mockUsers.listMemberships).not.toHaveBeenCalled();
+			expect(transactionWasRead()).toBe(false);
+			expect(mockFetch).not.toHaveBeenCalled();
+		});
+
+		// Appwrite sends x-appwrite-user-id with an empty value rather than omitting it when the
+		// execution has no session user, so "" is the shape this actually arrives in.
+		test("an empty caller id is refused as firmly as a missing one", async () => {
+			mockDocuments();
+			mockResendSuccess();
+			const ctx = makeContext({
+				body: { transactionId: "t1", email: "attacker@example.com" },
+				headers: { "x-appwrite-user-id": "", "x-appwrite-key": "injected-key" },
+			});
 
 			const result = await handler(ctx);
 
@@ -243,58 +264,75 @@ describe("Transaction-EmailReceipt", () => {
 			expect(transactionWasRead()).toBe(false);
 			expect(mockFetch).not.toHaveBeenCalled();
 		});
+	});
 
-		test("no caller id at all (a raw API-key invocation) is refused", async () => {
-			mockDocuments();
-			const ctx = makeContext({ body: { transactionId: "t1", email: "attacker@example.com" } });
+	// The incident of 2026-09-13: the guard re-derived team membership through the Users API and
+	// refused with a 503 whenever that call could not answer. This function still calls the Users
+	// API, but only to decide the admin EXEMPTIONS -- never whether the caller may be served -- so
+	// every row below must still send the receipt, and none of them may produce a 503.
+	describe("a session caller is never turned away by an external lookup", () => {
+		const hostileConditions = [
+			[
+				"the caller id does not resolve as a project user",
+				() => {
+					// The literal error the live function logged.
+					const notFound = new Error("User with the requested ID could not be found.");
+					notFound.code = 404;
+					mockUsers.listMemberships.mockRejectedValue(notFound);
+				},
+			],
+			["the Users API is down", () => mockUsers.listMemberships.mockRejectedValue(new Error("users api down"))],
+			["the caller belongs to no team", () => mockUsers.listMemberships.mockResolvedValue({ memberships: [] })],
+			[
+				"the caller's membership is unconfirmed",
+				() => mockUsers.listMemberships.mockResolvedValue({ memberships: [{ teamId: PIN_PAYMENT_TEAM_ID, confirm: false }] }),
+			],
+		];
 
-			const result = await handler(ctx);
-
-			expect(result.statusCode).toBe(403);
-			expect(mockUsers.listMemberships).not.toHaveBeenCalled();
-			expect(mockFetch).not.toHaveBeenCalled();
-		});
-
-		test("an unconfirmed membership in an allowed team does not count", async () => {
-			mockUsers.listMemberships.mockResolvedValue({ memberships: [{ teamId: PIN_PAYMENT_TEAM_ID, confirm: false }] });
-			mockDocuments();
-			const ctx = tillContext({ transactionId: "t1", email: "attacker@example.com" });
-
-			const result = await handler(ctx);
-
-			expect(result.statusCode).toBe(403);
-			expect(mockFetch).not.toHaveBeenCalled();
-		});
-
-		// `execute` is still `users`, so this check is the access control on an endpoint that will
-		// mail any sale's full itemized receipt anywhere. Both of its "cannot run" states refuse --
-		// and the second was every request in production, since a function declaring no scopes is
-		// never handed the key the Users API needs.
-		test("a Users API failure refuses rather than mailing a receipt unverified", async () => {
-			mockUsers.listMemberships.mockRejectedValue(new Error("users api down"));
+		test.each(hostileConditions)("still sends the receipt when %s", async (_label, arrange) => {
+			arrange();
 			mockDocuments();
 			mockResendSuccess();
 			const ctx = tillContext({ transactionId: "t1", email: "customer@example.com" });
 
 			const result = await handler(ctx);
 
-			expect(result.statusCode).toBe(503);
-			expect(mockFetch).not.toHaveBeenCalled();
+			expect(result).toEqual({ statusCode: 200, body: { ok: true } });
+			expect(JSON.parse(mockFetch.mock.calls[0][1].body).to).toEqual(["customer@example.com"]);
 		});
 
-		test("no injected x-appwrite-key refuses, and names the missing scope in the log", async () => {
+		// Appwrite injects x-appwrite-key only for a function that declares scopes. Whether that
+		// injection happened must not decide whether a till can hand a customer their receipt.
+		test("still sends the receipt when no x-appwrite-key is injected", async () => {
 			mockDocuments();
 			mockResendSuccess();
 			const ctx = makeContext({
-				body: { transactionId: "t1", email: "attacker@example.com" },
-				headers: { "x-appwrite-user-id": "anonymous-session" },
+				body: { transactionId: "t1", email: "customer@example.com" },
+				headers: { "x-appwrite-user-id": "pos-device-1" },
 			});
 
 			const result = await handler(ctx);
 
-			expect(result.statusCode).toBe(503);
-			expect(mockFetch).not.toHaveBeenCalled();
-			expect(ctx.error).toHaveBeenCalledWith(expect.stringMatching(/users\.read/));
+			expect(result).toEqual({ statusCode: 200, body: { ok: true } });
+			expect(mockUsers.listMemberships).not.toHaveBeenCalled();
+		});
+
+		// A caller the admin lookup could not classify is treated as an ordinary till -- which means
+		// the send cap still applies to them. Degraded privilege, not a refusal.
+		test("a caller the admin lookup could not classify is still counted against the send cap", async () => {
+			mockUsers.listMemberships.mockRejectedValue(new Error("users api down"));
+			mockDocuments();
+			mockResendSuccess();
+			const ctx = tillContext({ transactionId: "t1", email: "customer@example.com" });
+
+			await handler(ctx);
+
+			expect(mockDatabases.createDocument).toHaveBeenCalledWith(
+				DATABASE_ID,
+				RATE_LIMIT_COLLECTION_ID,
+				expect.stringMatching(/^rcp_/),
+				expect.objectContaining({ attempts: 1 }),
+			);
 		});
 	});
 
@@ -340,6 +378,47 @@ describe("Transaction-EmailReceipt", () => {
 			const result = await handler(ctx);
 
 			expect(result.body).toEqual({ ok: true });
+		});
+
+		// The admin exemption is the one thing still derived from a membership, so `confirm` still
+		// has to mean something here: an invitation that was never accepted is not an admin.
+		test("an unconfirmed admin membership does not grant the redirect exemption", async () => {
+			mockUsers.listMemberships.mockResolvedValue({ memberships: [{ teamId: ADMIN_TEAM_ID, confirm: false }] });
+			mockDocuments({ transaction: baseTransaction({ member_email: "alice@example.com" }) });
+			mockResendSuccess();
+			const ctx = tillContext({ transactionId: "t1", email: "alice-new@example.com" }, "admin-1");
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(403);
+			expect(mockFetch).not.toHaveBeenCalled();
+		});
+
+		// The deliberate residual of deciding admin status from a lookup that may fail. An admin
+		// mid-outage falls back to the safe default -- the address the sale already names -- instead
+		// of the endpoint going down. The send itself still works (below), only the redirect does
+		// not; if this ever needs to change, change it here and not by making the guard fail closed.
+		test("an admin cannot redirect a member receipt while the admin lookup is failing", async () => {
+			mockUsers.listMemberships.mockRejectedValue(new Error("users api down"));
+			mockDocuments({ transaction: baseTransaction({ member_email: "alice@example.com" }) });
+			mockResendSuccess();
+			const ctx = tillContext({ transactionId: "t1", email: "alice-new@example.com" }, "admin-1");
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(403);
+			expect(mockFetch).not.toHaveBeenCalled();
+		});
+
+		test("but the same failing lookup still lets that receipt go to the address on the sale", async () => {
+			mockUsers.listMemberships.mockRejectedValue(new Error("users api down"));
+			mockDocuments({ transaction: baseTransaction({ member_email: "alice@example.com" }) });
+			mockResendSuccess();
+			const ctx = tillContext({ transactionId: "t1", email: "alice@example.com" }, "admin-1");
+
+			const result = await handler(ctx);
+
+			expect(result).toEqual({ statusCode: 200, body: { ok: true } });
 		});
 	});
 

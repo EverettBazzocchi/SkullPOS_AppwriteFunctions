@@ -1,6 +1,4 @@
 import Stripe from 'stripe';
-import { Users } from 'node-appwrite';
-import { createAppwriteClient } from './appwriteClient.js';
 
 // Shared by SkullPOS and ShottyTicketing (same Stripe account) -- both
 // apps' Stripe Terminal connection-token needs are identical, so this is
@@ -17,67 +15,48 @@ function resolveIsLive(body) {
 	return !(body.test && body.test === 'test');
 }
 
-// Teams allowed to mint a Terminal connection token. This function's `execute`
-// list carries `users` on it -- which, with anonymous sessions enabled, is the
-// public internet -- so until that list is narrowed THIS check is the only
-// thing standing between an anonymous caller and a *live* Terminal connection
-// token for the venue's own reader (P0-10). It is therefore written to fail
-// closed: anything other than a positive "yes, this caller is in an allowed
-// team" refuses. One extra API call on a path that runs once per POS boot
-// rather than per sale.
+// WHO MAY CALL THIS FUNCTION IS APPWRITE'S DECISION, NOT THIS FILE'S.
 //
-// It needs the users.read scope to run at all (Appwrite injects
-// x-appwrite-key only for a function that declares scopes) -- see
-// appwrite.config.json and the README.
-const ALLOWED_TEAM_IDS = [
-	'68e35aed00144b8cde9d', // admin
-	'68ffcecc0026f78f0af8', // POS
-	'6a9cbb1c95ea7d59dd8c', // PIN Payment Access
-];
-
-// ShottyTicketing authenticates as this shared door account (quick-access-login
-// mints its token), and that account is not a member of any team -- it reached
-// this function only via the `users` entry above. Allow it by id so removing
-// `users` from `execute` can't take the door app down; drop this constant once
-// the account is a member of the POS team.
-const DOOR_STAFF_USER_ID = '6aa201ecd741fa3bb794';
-
-// 'allowed' | 'denied' | 'unverified'. `unverified` is a FAILURE, not a pass:
-// this check used to return true whenever it could not run, which -- with this
-// function's scopes empty, so Appwrite never injects x-appwrite-key at all --
-// meant it never ran and never refused anybody. A gate that cannot run is not
-// defence in depth, it is decoration, so both "cannot run" states now fail
-// closed and are reported separately from a genuine refusal (they are an
-// operator problem: see this function's README and `scopes` in
-// appwrite.config.json, which must carry users.read).
-async function classifyCaller(req, log, error) {
+// The function's `execute` list names three teams -- admin (68e35aed00144b8cde9d), POS
+// (68ffcecc0026f78f0af8) and PIN Payment Access (6a9cbb1c95ea7d59dd8c) -- and the platform checks
+// that list when the execution is created, before this module is ever loaded. Appwrite grants a
+// caller the `team:<id>` role only for a membership whose `confirm` is true, so "a confirmed
+// member of one of those three teams" is exactly the predicate that has already been proven by the
+// time this code runs. Verified against the live function on 2026-09-13 with
+// `appwrite functions get --function-id 68f2904a00171e8b0266`: `execute` is those three teams and
+// nothing else.
+//
+// So this function checks the ONE thing that allowlist does not cover: whether there is a caller at
+// all. A project API key carrying `execution.write` can invoke a function directly -- Appwrite
+// cancels permission checks for API-key requests, so the `execute` list is not consulted -- and
+// such an execution has no session user, so `x-appwrite-user-id` arrives absent or empty. That is
+// the only reachable caller the allowlist does not stop, and the identity check below is what stops
+// it.
+//
+// There is deliberately NO third "I could not tell" state, and nothing on this path calls out to
+// another service. An earlier version re-derived team membership here through
+// users.listMemberships() and refused with a 503 whenever that call could not answer. On 2026-09-13
+// 07:50 UTC it could not answer -- `User with the requested ID could not be found`, which is what
+// the project's Users API says about any caller id it cannot resolve, a console-authenticated
+// operator included -- and a live Terminal reader was refused its connection token by a check whose
+// only job was to re-prove something Appwrite had already proven. A control that duplicates the
+// platform's own decision can only ever agree with it or be wrong, and the cost of being wrong here
+// is a door reader or a till going dark mid-service. That trade is not worth making, so the
+// duplicate is gone rather than merely made fail-open: a second copy of the team list is also a
+// second thing to keep in sync, and a stale copy refuses legitimate callers just as readily.
+//
+// Whatever replaces this must keep both properties: an API-key-only invocation is refused, and no
+// external lookup can turn a session caller away. Both are covered by tests in main.test.js.
+function classifyCaller(req) {
+	// 'allowed' | 'denied' -- two states, because every input this needs is already on the request.
 	const callerId = req.headers['x-appwrite-user-id'];
 	if (!callerId) {
-		// No user session at all -- a direct invocation with a project API key
-		// carrying `execution.write`, which bypasses the execute allowlist.
+		// No session user: a direct invocation with a project API key carrying `execution.write`,
+		// which is the one way past the execute allowlist. Appwrite sends this header with an empty
+		// value rather than omitting it, so "" must be refused as firmly as a missing header.
 		return 'denied';
 	}
-	// ShottyTicketing's shared door account, which belongs to no team. Allowed by
-	// id -- see DOOR_STAFF_USER_ID above.
-	if (callerId === DOOR_STAFF_USER_ID) return 'allowed';
-
-	if (!req.headers['x-appwrite-key']) {
-		error(
-			'No x-appwrite-key injected: team membership cannot be verified, so this request is refused. Grant this function the users.read scope.',
-		);
-		return 'unverified';
-	}
-
-	try {
-		const users = new Users(await createAppwriteClient(req));
-		const result = await users.listMemberships(callerId);
-		const allowed = (result.memberships || []).some((m) => ALLOWED_TEAM_IDS.includes(m.teamId) && m.confirm);
-		if (!allowed) log(`Caller ${callerId} is in none of the allowed teams`);
-		return allowed ? 'allowed' : 'denied';
-	} catch (err) {
-		error('Could not check team membership, refusing this request: ' + err.message);
-		return 'unverified';
-	}
+	return 'allowed';
 }
 
 // Which mode a Stripe secret/restricted key declares about itself, or null
@@ -92,14 +71,8 @@ function keyDeclaresMode(key) {
 }
 
 export default async ({ req, res, log, error }) => {
-	const caller = await classifyCaller(req, log, error);
-	if (caller === 'unverified') {
-		// Distinct status and message from a refusal: this one is on us, and a
-		// till that hits it needs the operator to fix a scope, not a new PIN.
-		return res.json({ error: 'Could not verify this device right now -- try again' }, 503);
-	}
-	if (caller !== 'allowed') {
-		error('Refused connection-token request from a caller outside the allowed teams.');
+	if (classifyCaller(req) !== 'allowed') {
+		error('Refused connection-token request: no session user, so this was a direct API-key invocation.');
 		return res.json({ error: 'Unauthorized' }, 403);
 	}
 

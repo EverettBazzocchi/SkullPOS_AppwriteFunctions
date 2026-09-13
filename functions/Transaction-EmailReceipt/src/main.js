@@ -16,15 +16,15 @@ import { checkSendQuota, recordSend } from './sendLimit.js';
 // have its full itemized receipt -- items, quantities, unit prices, discount, tip, total and the
 // per-leg payment breakdown -- mailed to an address of their choosing. Three rules now stand in
 // front of that:
-//   1. the caller must belong to a till/admin team,
+//   1. who may call this function at all, which Appwrite decides from the `execute` list (see
+//      classifyCaller below),
 //   2. a sale attached to a member account can only be receipted to the address on that sale, and
 //   3. one caller's sends are capped per 15 minutes (sendLimit.js), reserved before the mail goes
 //      out so the cap holds even when the counter write fails.
-// `execute` has been narrowed off `users` in appwrite.config.json, but only a push makes that
-// live, and a list is only ever as tight as its last deploy -- so rules 1 and 3 both fail CLOSED
-// (503) when they cannot run, rather than waving the request through with a log line. Running
-// them at all requires the users.read and documents.write scopes; without those this function now
-// refuses every receipt instead of mailing every receipt.
+// Rule 3 fails CLOSED (503) when it cannot run, which needs the documents.write scope: nothing else
+// caps this mailer, and its counter can only fail while the Appwrite Databases API is failing, at
+// which point the transaction below cannot be read either. Rule 1 deliberately does NOT work that
+// way -- see classifyCaller.
 //
 // This runtime is node-16.0 (the only Node runtime this self-hosted
 // instance offers), which predates global fetch -- node-fetch polyfills it
@@ -36,14 +36,6 @@ const RECEIPT_SENDER = 'SkullPOS <SkullPOS@mail.shotty.tech>';
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const ADMIN_TEAM_ID = '68e35aed00144b8cde9d';
-// Mirrors what this function's `execute` list should be: the admin team, the POS team, and the
-// team Verify-Pin joins a device to once a PIN is accepted. A bare anonymous session belongs to
-// none of them.
-const ALLOWED_TEAM_IDS = [
-	ADMIN_TEAM_ID,
-	'68ffcecc0026f78f0af8', // POS
-	'6a9cbb1c95ea7d59dd8c', // PIN Payment Access
-];
 // Every email this system sends CCs this address and closes with the same contact line --
 // see the identical constants in Transaction-RecordPayment/Admin-EmailDj/Admin-EmailBartender/
 // Admin-EmailCoordinator (each function stays self-contained, no shared email module).
@@ -124,38 +116,73 @@ function buildReceiptHtml(transaction, items, legs) {
 		</div>`;
 }
 
-// Resolves both questions this function asks about the caller from one Users API call: may they
-// call it at all, and are they admin (exempt from the recipient binding and the send cap, since
-// an admin can already read every transaction directly).
+// WHO MAY CALL THIS FUNCTION IS APPWRITE'S DECISION, NOT THIS FILE'S. Identical in shape and
+// reasoning to stripe-getConnectionToken's and Giftcard-Lookup's guard -- the three must stay the
+// same shape, because an inconsistency between them is how the next incident starts.
 //
-// Fail-closed, because `execute` is still `users` (with anonymous sessions enabled, the public
-// internet): this check IS the access control on a function that will mail any sale's full
-// itemized receipt anywhere. It used to return allowed:true whenever it could not run, and with
-// no users.read scope declared it could never run at all -- Appwrite injects x-appwrite-key only
-// for a function that declares scopes, so listMemberships had no key and always threw. So both
-// "cannot run" states are now `unverified`, which refuses.
-async function resolveCaller(req, users, log, error) {
+// The function's `execute` list names three teams -- admin (68e35aed00144b8cde9d), POS
+// (68ffcecc0026f78f0af8) and PIN Payment Access (6a9cbb1c95ea7d59dd8c), the team Verify-Pin joins a
+// device to once a PIN is accepted -- and the platform checks that list when the execution is
+// created, before this module is ever loaded. Appwrite grants a caller the `team:<id>` role only
+// for a membership whose `confirm` is true, so "a confirmed member of one of those three teams" has
+// already been proven by the time this code runs; a bare anonymous session belongs to none of them
+// and never reaches here. Verified against the live function on 2026-09-13 with
+// `appwrite functions get --function-id 6a9cd1ed552967ba3560`: `execute` is those three teams and
+// nothing else.
+//
+// So this function checks the ONE thing that allowlist does not cover: whether there is a caller at
+// all. A project API key carrying `execution.write` can invoke a function directly -- Appwrite
+// cancels permission checks for API-key requests, so the `execute` list is not consulted -- and
+// such an execution has no session user, so `x-appwrite-user-id` arrives absent or empty.
+//
+// There is deliberately NO third "I could not tell" state, and nothing on this path calls out to
+// another service. An earlier version re-derived team membership here through
+// users.listMemberships() and refused with a 503 whenever that call could not answer -- the same
+// code that, on 2026-09-13, 503'd a live Terminal reader and the bar's giftcard scanning when the
+// Users API answered `User with the requested ID could not be found` for a caller id it could not
+// resolve. Re-proving what Appwrite has already proven can only ever agree or be wrong, and being
+// wrong takes a till offline.
+//
+// Whatever replaces this must keep both properties: an API-key-only invocation is refused, and no
+// external lookup can turn a session caller away. Both are covered by tests in main.test.js.
+function classifyCaller(req) {
+	// 'allowed' | 'denied' -- two states, because every input this needs is already on the request.
 	const callerId = req.headers['x-appwrite-user-id'];
 	if (!callerId) {
-		// No user session at all -- a direct invocation with a project API key carrying
-		// `execution.write`, which bypasses the execute allowlist entirely.
-		return { callerId: null, allowed: false, unverified: false, admin: false };
+		// No session user: a direct invocation with a project API key carrying `execution.write`,
+		// which is the one way past the execute allowlist. Appwrite sends this header with an empty
+		// value rather than omitting it, so "" must be refused as firmly as a missing header.
+		return 'denied';
 	}
+	return 'allowed';
+}
+
+// Admin is a PRIVILEGE UPGRADE, not the authorization decision above, and the difference is what
+// keeps this lookup safe to make. An admin is exempt from the recipient binding and the send cap
+// (they can read every transaction directly anyway, and the admin app resends receipts to corrected
+// addresses), and nothing but the Users API can tell us whether a caller is one -- Appwrite injects
+// no team roles into a function's headers.
+//
+// Because it only ever grants something extra, a failure here is a DEGRADATION, never a refusal:
+// any answer other than a definitive "yes, confirmed member of the admin team" means the caller is
+// treated as an ordinary till, which is the same path every POS device takes and which still works
+// end to end. It cannot produce a 503, and it cannot stop a receipt being sent to the address the
+// sale already names. The one visible residual is that an admin cannot REDIRECT a member sale's
+// receipt while this lookup is failing -- see the recipient binding in the handler; that refusal
+// falls back to the safe default (the address on the sale) rather than taking the endpoint down.
+async function isAdminCaller(req, users, callerId, error) {
 	if (!req.headers['x-appwrite-key']) {
-		error(
-			'No x-appwrite-key injected: team membership cannot be verified, so this receipt is refused. Grant this function the users.read scope.',
-		);
-		return { callerId, allowed: false, unverified: true, admin: false };
+		// Appwrite injects the key only for a function that declares scopes. Without it the Users
+		// API cannot be called at all -- so treat the caller as an ordinary till and carry on.
+		error('No x-appwrite-key injected, so admin status cannot be checked -- treating this caller as a normal till. Grant this function the users.read scope to restore the admin exemptions.');
+		return false;
 	}
 	try {
 		const result = await users.listMemberships(callerId);
-		const memberships = (result.memberships || []).filter((m) => m.confirm);
-		const allowed = memberships.some((m) => ALLOWED_TEAM_IDS.includes(m.teamId));
-		if (!allowed) log(`Caller ${callerId} is in none of the allowed teams`);
-		return { callerId, allowed, unverified: false, admin: memberships.some((m) => m.teamId === ADMIN_TEAM_ID) };
+		return (result.memberships || []).some((m) => m.teamId === ADMIN_TEAM_ID && m.confirm);
 	} catch (err) {
-		error('Could not check team membership, refusing this receipt: ' + err.message);
-		return { callerId, allowed: false, unverified: true, admin: false };
+		error('Could not check admin status, treating this caller as a normal till (the receipt is still sent): ' + err.message);
+		return false;
 	}
 }
 
@@ -220,20 +247,17 @@ export default async ({ req, res, log, error }) => {
 		return res.json({ error: 'A valid email address is required' }, 400);
 	}
 
+	if (classifyCaller(req) !== 'allowed') {
+		error('Refused receipt request: no session user, so this was a direct API-key invocation.');
+		return res.json({ error: 'Unauthorized' }, 403);
+	}
+	const callerId = req.headers['x-appwrite-user-id'];
+
 	const client = await createAppwriteClient(req);
 	const databases = new Databases(client);
 	const users = new Users(client);
 
-	const { callerId, allowed, unverified, admin } = await resolveCaller(req, users, log, error);
-	if (unverified) {
-		// Distinct from a refusal: this one is an operator problem (a missing scope or an Appwrite
-		// blip) and it must not be answerable by simply asking again with a different id.
-		return res.json({ error: 'Could not verify this device right now -- try again' }, 503);
-	}
-	if (!allowed) {
-		error('Refused receipt request from a caller outside the allowed teams.');
-		return res.json({ error: 'Unauthorized' }, 403);
-	}
+	const admin = await isAdminCaller(req, users, callerId, error);
 
 	// Checked before the transaction is read, so a caller who has blown the quota cannot use this
 	// endpoint to probe which transaction ids exist either.
@@ -273,7 +297,10 @@ export default async ({ req, res, log, error }) => {
 	// requester's own. A walk-up cash sale names nobody, so the address typed at the till is the
 	// only one available; the team check and the send cap above are what bound that path.
 	// Admins are exempt: they can read the transaction directly anyway, and the admin app resends
-	// receipts to corrected addresses.
+	// receipts to corrected addresses. If the admin lookup could not run (see isAdminCaller), the
+	// caller is not treated as admin and lands here -- so a redirect is refused while the Users API
+	// is unavailable. That is the deliberate residual: it falls back to the address the sale already
+	// names, which is a narrowed privilege for one operator action, not an endpoint going dark.
 	const boundEmail = String(transaction.member_email || '').trim();
 	if (!admin && boundEmail && boundEmail.toLowerCase() !== email.toLowerCase()) {
 		log(`Refused receipt for ${transactionId}: requested recipient does not match the address on the sale`);

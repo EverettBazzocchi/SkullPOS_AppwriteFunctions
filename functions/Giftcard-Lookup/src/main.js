@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { Databases, Users, Query } from 'node-appwrite';
+import { Databases, Query } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
 import { checkLockout, recordMiss, resetState, toPersistable } from './rateLimit.js';
 
@@ -12,40 +12,42 @@ import { checkLockout, recordMiss, resetState, toPersistable } from './rateLimit
 // pair Transaction-RecordPayment accepts as `giftcardId` to debit a card, and every live UPC
 // shares a fixed `75855` prefix -- a 100,000-wide keyspace one caller could otherwise walk end to
 // end in an afternoon:
-//   1. the caller must belong to a till/admin team (below), and
+//   1. who may call this function at all, which Appwrite decides from the `execute` list (see
+//      classifyCaller below), and
 //   2. repeated misses from one IP lock that IP out (rateLimit.js).
-// `execute` has been narrowed off `users` (the public internet, with anonymous sessions enabled)
-// in appwrite.config.json, but only a push makes that live, and a list is only ever as tight as
-// its last deploy -- so these two are treated as the access control, not a second copy of it.
-// Both therefore fail closed: a caller whose team membership cannot be
-// checked, and a miss that cannot be counted, are both refused (503) rather than served. Running
-// them at all requires the users.read and documents.write scopes (see appwrite.config.json and
-// the README); without those this function refuses every lookup instead of quietly allowing
-// every lookup, which is what it did before.
+// The second fails closed -- a miss that cannot be counted is refused (503) rather than served,
+// which needs the documents.write scope to work at all -- and that is a different trade from the
+// one in classifyCaller: the throttle is the only thing guarding the keyspace, nothing else
+// enforces it, and it can only fail when the Appwrite Databases API is failing, at which point the
+// giftcards query below cannot run either. Refusing there costs nothing that was still working.
 const DATABASE_ID = '67c9ffd9003d68236514';
 const GIFTCARDS_COLLECTION_ID = 'giftcards';
 const RATE_LIMIT_COLLECTION_ID = 'rate_limits';
 
-// Mirrors what this function's `execute` list should be: the admin team, the POS team, and the
-// team Verify-Pin joins a device to once a PIN is accepted. A bare anonymous session belongs to
-// none of them.
-const ALLOWED_TEAM_IDS = [
-	'68e35aed00144b8cde9d', // admin
-	'68ffcecc0026f78f0af8', // POS
-	'6a9cbb1c95ea7d59dd8c', // PIN Payment Access
-];
-
-function extractClientIp(req) {
-	const forwarded = (req.headers && (req.headers['x-forwarded-for'] || req.headers['x-real-ip'])) || '';
-	return String(forwarded).split(',')[0].trim() || 'unknown';
+// Throttle per CALLING ACCOUNT, not per IP.
+//
+// This used to key on the leftmost element of x-forwarded-for (falling back to x-real-ip), which
+// is caller-authored: createExecution lets a caller set arbitrary headers, so the bucket was
+// choosable. That breaks it in both directions -- rotate the value and the 100,000-wide
+// enumeration oracle is unthrottled, or pin it to another till's value and you exhaust that till's
+// bucket from outside. It was also wrong operationally even with honest callers: every till at the
+// venue leaves through one public IP, so all of them shared a single 10-attempt bucket and the
+// eleventh legitimate scan of the night would have been refused venue-wide.
+//
+// `x-appwrite-user-id` is set by Appwrite from the session, cannot be supplied by the caller, and
+// is per-device (each till signs in as its own account). classifyCaller has already refused the
+// request if it is absent, so it is always present here. Same keying Transaction-EmailReceipt
+// already uses for its send quota.
+function extractThrottleKey(req) {
+	return String((req.headers && req.headers['x-appwrite-user-id']) || '').trim() || 'unknown';
 }
 
 // Appwrite document IDs must be a restricted charset -- a short hash keeps this valid regardless
 // of the raw IP format (IPv4, IPv6, or a comma-separated x-forwarded-for chain). Prefixed
 // distinctly from Verify-Pin's `pin_...` and quick-access-login's `qa_...` docs in the same
 // collection, since the three functions throttle independently.
-function rateLimitDocId(ip) {
-	return 'gcl_' + crypto.createHash('sha1').update(ip).digest('hex').slice(0, 16);
+function rateLimitDocId(throttleKey) {
+	return 'gcl_' + crypto.createHash('sha1').update(throttleKey).digest('hex').slice(0, 16);
 }
 
 function minutesFromMs(ms) {
@@ -86,33 +88,47 @@ async function saveRateLimitState(databases, docId, existed, state, error) {
 	}
 }
 
-// Same shape as stripe-getConnectionToken's check, for the same reason, and fail-closed for the
-// same reason: returning true whenever the check could not run meant it never ran at all (this
-// function declares no users.read scope, so Appwrite injects no x-appwrite-key, so
-// listMemberships could only ever throw). 'allowed' | 'denied' | 'unverified' -- only the first
-// reaches the giftcards collection.
-async function classifyCaller(req, users, log, error) {
+// WHO MAY CALL THIS FUNCTION IS APPWRITE'S DECISION, NOT THIS FILE'S. Identical in shape and
+// reasoning to stripe-getConnectionToken's and Transaction-EmailReceipt's guard -- the three must
+// stay the same shape, because an inconsistency between them is how the next incident starts.
+//
+// The function's `execute` list names three teams -- admin (68e35aed00144b8cde9d), POS
+// (68ffcecc0026f78f0af8) and PIN Payment Access (6a9cbb1c95ea7d59dd8c), the team Verify-Pin joins a
+// device to once a PIN is accepted -- and the platform checks that list when the execution is
+// created, before this module is ever loaded. Appwrite grants a caller the `team:<id>` role only
+// for a membership whose `confirm` is true, so "a confirmed member of one of those three teams" has
+// already been proven by the time this code runs; a bare anonymous session belongs to none of them
+// and never reaches here. Verified against the live function on 2026-09-13 with
+// `appwrite functions get --function-id 6a9c5c1acb643536564a`: `execute` is those three teams and
+// nothing else.
+//
+// So this function checks the ONE thing that allowlist does not cover: whether there is a caller at
+// all. A project API key carrying `execution.write` can invoke a function directly -- Appwrite
+// cancels permission checks for API-key requests, so the `execute` list is not consulted -- and
+// such an execution has no session user, so `x-appwrite-user-id` arrives absent or empty.
+//
+// There is deliberately NO third "I could not tell" state, and nothing on this path calls out to
+// another service. An earlier version re-derived team membership here through
+// users.listMemberships() and refused with a 503 whenever that call could not answer. On 2026-09-13
+// 07:51 UTC it could not answer -- `User with the requested ID could not be found`, which is what
+// the project's Users API says about any caller id it cannot resolve -- and giftcard scanning at
+// the bar stopped. The check's only job was to re-prove something Appwrite had already proven, so
+// it could only ever agree or be wrong, and being wrong took a live till offline. Note the contrast
+// with the enumeration throttle below, which does still fail closed: that one guards something
+// nothing else guards, and it cannot fail while the rest of this function still works.
+//
+// Whatever replaces this must keep both properties: an API-key-only invocation is refused, and no
+// external lookup can turn a session caller away. Both are covered by tests in main.test.js.
+function classifyCaller(req) {
+	// 'allowed' | 'denied' -- two states, because every input this needs is already on the request.
 	const callerId = req.headers['x-appwrite-user-id'];
 	if (!callerId) {
-		// No user session at all -- a direct invocation with a project API key carrying
-		// `execution.write`, which bypasses the execute allowlist entirely.
+		// No session user: a direct invocation with a project API key carrying `execution.write`,
+		// which is the one way past the execute allowlist. Appwrite sends this header with an empty
+		// value rather than omitting it, so "" must be refused as firmly as a missing header.
 		return 'denied';
 	}
-	if (!req.headers['x-appwrite-key']) {
-		error(
-			'No x-appwrite-key injected: team membership cannot be verified, so this lookup is refused. Grant this function the users.read scope.',
-		);
-		return 'unverified';
-	}
-	try {
-		const result = await users.listMemberships(callerId);
-		const allowed = (result.memberships || []).some((m) => ALLOWED_TEAM_IDS.includes(m.teamId) && m.confirm);
-		if (!allowed) log(`Caller ${callerId} is in none of the allowed teams`);
-		return allowed ? 'allowed' : 'denied';
-	} catch (err) {
-		error('Could not check team membership, refusing this lookup: ' + err.message);
-		return 'unverified';
-	}
+	return 'allowed';
 }
 
 export default async ({ req, res, log, error }) => {
@@ -128,23 +144,16 @@ export default async ({ req, res, log, error }) => {
 		return res.json({ error: 'Missing code' }, 400);
 	}
 
-	const client = await createAppwriteClient(req);
-	const databases = new Databases(client);
-	const users = new Users(client);
-
-	const caller = await classifyCaller(req, users, log, error);
-	if (caller === 'unverified') {
-		// Distinct from a refusal: this one is an operator problem (a missing scope or an Appwrite
-		// blip), and it must not be answerable by guessing codes in the meantime.
-		return res.json({ error: 'Could not verify this device right now -- try again' }, 503);
-	}
-	if (caller !== 'allowed') {
-		error('Refused giftcard lookup from a caller outside the allowed teams.');
+	if (classifyCaller(req) !== 'allowed') {
+		error('Refused giftcard lookup: no session user, so this was a direct API-key invocation.');
 		return res.json({ error: 'Unauthorized' }, 403);
 	}
 
-	const ip = extractClientIp(req);
-	const rateLimitKey = rateLimitDocId(ip);
+	const client = await createAppwriteClient(req);
+	const databases = new Databases(client);
+
+	const throttleKey = extractThrottleKey(req);
+	const rateLimitKey = rateLimitDocId(throttleKey);
 	const now = Date.now();
 	const { state: rateLimitState, ok: rateLimitReadable } = await loadRateLimitState(databases, rateLimitKey, error);
 	if (!rateLimitReadable) {
@@ -155,7 +164,7 @@ export default async ({ req, res, log, error }) => {
 	// that exists and one that does not -- the lockout itself can't be used to finish the walk.
 	const lockout = checkLockout(rateLimitState, now);
 	if (lockout.locked) {
-		log(`Giftcard lookup locked out for ${ip} -- ${Math.ceil(lockout.retryAfterMs / 1000)}s remaining`);
+		log(`Giftcard lookup locked out for caller ${throttleKey} -- ${Math.ceil(lockout.retryAfterMs / 1000)}s remaining`);
 		return res.json(
 			{ found: false, error: `Too many unrecognized giftcard codes. Try again in ${minutesFromMs(lockout.retryAfterMs)} minute(s).` },
 			429,
@@ -195,7 +204,7 @@ export default async ({ req, res, log, error }) => {
 			return res.json({ error: 'Giftcard lookup is temporarily unavailable -- try again' }, 503);
 		}
 		if (nextState.justLocked) {
-			log(`Giftcard lookup now locked out for ${ip} after repeated unrecognized codes`);
+			log(`Giftcard lookup now locked out for caller ${throttleKey} after repeated unrecognized codes`);
 			const retryAfterMs = Date.parse(nextState.lockedUntil) - now;
 			return res.json(
 				{ found: false, error: `Too many unrecognized giftcard codes. Try again in ${minutesFromMs(retryAfterMs)} minute(s).` },
