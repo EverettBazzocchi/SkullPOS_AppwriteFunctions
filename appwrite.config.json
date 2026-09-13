@@ -44,8 +44,7 @@
 			"execute": [
 				"team:68e35aed00144b8cde9d",
 				"team:68ffcecc0026f78f0af8",
-				"team:6a9cbb1c95ea7d59dd8c",
-				"users"
+				"team:6a9cbb1c95ea7d59dd8c"
 			],
 			"name": "stripe-getConnectionToken",
 			"enabled": true,
@@ -184,7 +183,11 @@
 		},
 		{
 			"$id": "6a9c687ec05e99a6f1a8",
-			"execute": ["users"],
+			"execute": [
+				"team:68e35aed00144b8cde9d",
+				"team:68ffcecc0026f78f0af8",
+				"team:6a9cbb1c95ea7d59dd8c"
+			],
 			"name": "Transactions-List",
 			"enabled": true,
 			"logging": true,
