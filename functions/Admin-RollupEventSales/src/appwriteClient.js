@@ -1,32 +1,15 @@
 import { Client } from 'node-appwrite';
-import dns from 'dns';
+import { installDnsPatch } from './dnsPatch.js';
 
-// This self-hosted instance's function-execution sandbox can't resolve its
-// own public hostname via the normal getaddrinfo path (used internally by
-// fetch/http under the hood) -- dns.resolve4 (talks to nameservers
-// directly, bypassing getaddrinfo) works fine though. Patch the global
-// lookup so any HTTP client resolving this hostname gets the known-good IP
-// instead of hanging/EAI_AGAIN; the URL/Host header is untouched, only the
-// DNS step is bypassed.
-let patchedHost = null;
+// Install the resolver workaround at import time. This is deliberately SYNCHRONOUS and deliberately
+// not awaited: the previous version awaited a DNS round trip here, before the handler ran a single
+// line, and under concurrent cold starts that is what left executions dead at their timeout ceiling
+// with empty logs. See dnsPatch.js for the measurements and the reasoning.
+installDnsPatch();
 
-async function ensureDnsPatched(hostname) {
-	if (patchedHost === hostname) return;
-	const [ip] = await dns.promises.resolve4(hostname);
-	const origLookup = dns.lookup;
-	dns.lookup = (host, options, callback) => {
-		if (typeof options === 'function') callback = options;
-		if (host === hostname) return callback(null, ip, 4);
-		return origLookup(host, options, callback);
-	};
-	patchedHost = hostname;
-}
-
-export async function createAppwriteClient(req) {
-	const endpoint = process.env.APPWRITE_FUNCTION_API_ENDPOINT;
-	await ensureDnsPatched(new URL(endpoint).hostname);
+export function createAppwriteClient(req) {
 	return new Client()
-		.setEndpoint(endpoint)
+		.setEndpoint(process.env.APPWRITE_FUNCTION_API_ENDPOINT)
 		.setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
 		.setKey(req.headers['x-appwrite-key'] ?? '');
 }

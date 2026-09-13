@@ -1,4 +1,11 @@
 import Stripe from 'stripe';
+import { installDnsPatch } from './dnsPatch.js';
+
+// This deployment's sandbox cannot resolve its own domain through getaddrinfo (EAI_AGAIN after
+// ~5s), which is the path Stripe's SDK and node-appwrite both use underneath. This function had NO
+// resolver workaround at all -- it is why a card sale could log its key selection and then hang for
+// the whole timeout without another line. Installed synchronously at import; it never blocks.
+installDnsPatch();
 
 // Cancels the PaymentIntent behind an aborted card sale, so the amount stops
 // sitting on the reader's screen. Called by POS/src/utils/stripe.js's

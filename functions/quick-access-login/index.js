@@ -1,3 +1,10 @@
+import { installDnsPatch } from './_shared/dnsPatch.js';
+
+// This deployment's sandbox cannot resolve its own domain through getaddrinfo (EAI_AGAIN after
+// ~5s), which is the path Stripe's SDK and node-appwrite both use underneath. This function had NO
+// resolver workaround at all -- it is why a card sale could log its key selection and then hang for
+// the whole timeout without another line. Installed synchronously at import; it never blocks.
+installDnsPatch();
 /**
  * @file index.js
  * @description Appwrite Serverless Function: Quick Access Login
