@@ -12,7 +12,10 @@ const DATABASE_ID = '67c9ffd9003d68236514';
 const BARTENDERS_COLLECTION_ID = 'bartenders';
 const EVENTS_COLLECTION_ID = '68e400210008d19bb5c9';
 const SENDER = 'SkullPOS <SkullPOS@mail.shotty.tech>';
-const ALWAYS_CC = 'everett.bazzocchi@skullspace.ca';
+// The admin address. It is set as `reply_to` on every outgoing email (so replies reach the admin
+// without copying them on every send) and is also the address the `testing` redirect sends to.
+// It is deliberately NOT a CC any more -- was ALWAYS_CC.
+const ADMIN_EMAIL = 'everett.bazzocchi@skullspace.ca';
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const VALID_ACTIONS = ['event_assigned', 'custom'];
 const PIN_VALID_WINDOW_MS = 60 * 60 * 1000; // matches Verify-Pin's own window exactly
@@ -100,6 +103,7 @@ async function sendEmail({ to, cc, subject, html }) {
 			from: SENDER,
 			to: Array.isArray(to) ? to : [to],
 			...(cc && cc.length ? { cc } : {}),
+			reply_to: ADMIN_EMAIL,
 			subject,
 			html,
 		}),
@@ -110,12 +114,13 @@ async function sendEmail({ to, cc, subject, html }) {
 	}
 }
 
-// Same testing convention as Admin-EmailDj: redirect everything to ALWAYS_CC and drop the CC
-// (avoids a duplicate send to the same inbox) so nothing reaches a real bartender while testing.
+// Same testing convention as Admin-EmailDj: redirect everything to ADMIN_EMAIL and drop the CC
+// so nothing reaches a real bartender while testing. In the normal path there is no standing
+// admin CC at all -- the admin is reachable via `reply_to` instead (see sendEmail).
 function resolveRecipient(email, testing) {
-	if (testing) return { to: ALWAYS_CC, cc: [] };
+	if (testing) return { to: ADMIN_EMAIL, cc: [] };
 	if (!email || !EMAIL_PATTERN.test(email)) return null;
-	return { to: email, cc: [ALWAYS_CC] };
+	return { to: email, cc: [] };
 }
 
 // Coordinators assigned to an event are told a bartender was assigned -- but in a *separate*
@@ -177,8 +182,8 @@ export default async ({ req, res, log, error }) => {
 			return res.json({ error: "This event has no date set, so a pin-valid-window can't be shown" }, 400);
 		}
 
-		// The pin-bearing body goes to the bartender only (plus the admin, who can already read
-		// every pin in the `pins`/`bartenders` collections anyway).
+		// The pin-bearing body goes to the bartender only -- nobody is CC'd on it. The admin is
+		// carried as `reply_to`, which is a header, not a delivery: no copy of the pin is sent.
 		try {
 			await sendEmail({
 				to: recipient.to,
@@ -199,8 +204,9 @@ export default async ({ req, res, log, error }) => {
 
 		log(`Event-assigned email sent for bartender ${bartenderId} / event ${eventId} to ${recipient.to}`);
 
-		// Coordinators get their own pin-free notice. Skipped entirely while `testing`, same as
-		// the old CC was -- the testing convention is that nothing reaches a real coordinator.
+		// Coordinators get their own pin-free notice -- they are genuine recipients of the roster
+		// fact, not an oversight copy. Skipped entirely while `testing`: the testing convention is
+		// that nothing reaches a real coordinator.
 		const coordinatorEmails = testing ? [] : coordinatorEmailsFromEvent(event);
 		if (coordinatorEmails.length === 0) return res.json({ ok: true });
 

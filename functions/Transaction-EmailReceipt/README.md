@@ -9,7 +9,9 @@ self-checkout kiosk's post-payment screen.
 Sends through Resend's plain HTTP API (`POST https://api.resend.com/emails`),
 not Appwrite's SMTP — Appwrite's mailer only handles its own built-in auth email
 types (verification/recovery/magic-URL), and a receipt is arbitrary content.
-Every send CCs `everett.bazzocchi@skullspace.ca`.
+Every send sets `everett.bazzocchi@skullspace.ca` as **Reply-To**. It is not CC'd,
+so a customer replying to their receipt reaches the owner without the owner being
+copied on every receipt the bar issues.
 
 A receipt carries the whole sale: items, quantities, unit prices, discount, tip,
 total and the per-leg payment breakdown. Three rules stand in front of it.

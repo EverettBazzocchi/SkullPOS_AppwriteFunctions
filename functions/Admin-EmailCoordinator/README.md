@@ -22,9 +22,10 @@ caller check; the `execute` list is the whole control.
 { "coordinatorId": "...", "subject": "...", "message": "...", "testing": false }
 ```
 
-`testing: true` redirects to `everett.bazzocchi@skullspace.ca` and drops the CC,
-so nothing reaches a real coordinator. A live send goes to the coordinator with
-`everett.bazzocchi@skullspace.ca` CC'd.
+`testing: true` redirects to `everett.bazzocchi@skullspace.ca`, so nothing reaches
+a real coordinator. A live send goes to the coordinator, with
+`everett.bazzocchi@skullspace.ca` set as **Reply-To** rather than CC'd — the owner
+gets replies without a copy of every send.
 
 `message` is HTML-escaped and rendered with `white-space: pre-wrap`, so line
 breaks survive and markup does not.

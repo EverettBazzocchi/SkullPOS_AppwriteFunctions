@@ -56,11 +56,14 @@ SkullSpace is a single fixed venue.
 { "action": "custom", "bartenderId": "...", "subject": "...", "message": "...", "testing": false }
 ```
 
-**`testing: true` redirects everything** to `everett.bazzocchi@skullspace.ca`,
-drops the CC (it would duplicate to the same inbox) and skips the coordinator
-notice entirely, so nothing reaches a real bartender or coordinator.
+**`testing: true` redirects everything** to `everett.bazzocchi@skullspace.ca` and
+skips the coordinator notice entirely, so nothing reaches a real bartender or
+coordinator.
 
-A live send goes to the bartender with `everett.bazzocchi@skullspace.ca` CC'd.
+A live send goes to the bartender, with `everett.bazzocchi@skullspace.ca` set as
+**Reply-To** rather than CC'd — the owner gets replies without a copy of every
+send. The coordinator notice is a separate email addressed to the coordinators
+themselves, so they are still told who is booked.
 
 ## Responses
 

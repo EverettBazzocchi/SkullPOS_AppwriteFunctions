@@ -36,10 +36,12 @@ const RECEIPT_SENDER = 'SkullPOS <SkullPOS@mail.shotty.tech>';
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const ADMIN_TEAM_ID = '68e35aed00144b8cde9d';
-// Every email this system sends CCs this address and closes with the same contact line --
-// see the identical constants in Transaction-RecordPayment/Admin-EmailDj/Admin-EmailBartender/
+// Every email this system sends carries this address as `reply_to` (replies reach the admin
+// without copying them on every send) and closes with the same contact line -- see the identical
+// constants in Transaction-RecordPayment/Admin-EmailDj/Admin-EmailBartender/
 // Admin-EmailCoordinator (each function stays self-contained, no shared email module).
-const ALWAYS_CC = 'everett.bazzocchi@skullspace.ca';
+// Deliberately NOT a CC any more -- was ALWAYS_CC.
+const ADMIN_EMAIL = 'everett.bazzocchi@skullspace.ca';
 const FOOTER_HTML = '<p style="color:#999;font-size:0.8em;margin-top:24px;">Questions or concerns? Email <a href="mailto:admin@skullspace.ca">admin@skullspace.ca</a>.</p>';
 
 const PAYMENT_METHOD_LABELS = {
@@ -340,7 +342,7 @@ export default async ({ req, res, log, error }) => {
 			body: JSON.stringify({
 				from: RECEIPT_SENDER,
 				to: [email],
-				cc: [ALWAYS_CC],
+				reply_to: ADMIN_EMAIL,
 				subject: 'Your receipt from SkullPOS',
 				html,
 			}),

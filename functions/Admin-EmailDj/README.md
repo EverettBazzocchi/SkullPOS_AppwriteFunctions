@@ -45,11 +45,12 @@ assuming the barcodes are fine.
 ```
 
 `testing: true` redirects everything to `everett.bazzocchi@skullspace.ca` and
-drops the CC (which would duplicate to the same inbox), so nothing reaches a real
-DJ or coordinator.
+sends no coordinator copies, so nothing reaches a real DJ or coordinator.
 
-On a live voucher send, coordinators assigned to the event are **CC'd** alongside
-the admin — unlike `Admin-EmailBartender`, where the body carries a credential
+On a live voucher send, coordinators assigned to the event are **CC'd**;
+`everett.bazzocchi@skullspace.ca` is set as **Reply-To** rather than CC'd, so the
+owner gets replies without a copy of every send. Coordinators are a deliberate
+exception — unlike `Admin-EmailBartender`, where the body carries a credential
 and coordinators get a separate email. A voucher is a bar credit for their event,
 which is exactly what a coordinator is meant to know about. The coordinator list
 comes from the event's reverse `coordinators` attribute via

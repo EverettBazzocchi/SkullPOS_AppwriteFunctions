@@ -20,7 +20,7 @@ describe("Admin-EmailDj", () => {
 	});
 
 	describe("voucher action", () => {
-		test("sends the DJ their voucher barcode and CCs the admin", async () => {
+		test("sends the DJ their voucher barcode with the admin as reply_to (not a cc)", async () => {
 			mockDatabases.getDocument
 				.mockResolvedValueOnce({ $id: "gc1", UPC: "75855123456789", balance: 2000, djs: "dj1", events: "event1" })
 				.mockResolvedValueOnce({ $id: "dj1", name: "DJ Test", email: "dj@example.com" })
@@ -33,7 +33,8 @@ describe("Admin-EmailDj", () => {
 			expect(mockToBuffer).toHaveBeenCalledWith(expect.objectContaining({ text: "75855123456789", bcid: "code128" }));
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 			expect(sentBody.to).toEqual(["dj@example.com"]);
-			expect(sentBody.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
+			expect(sentBody.cc).toBeUndefined();
 			expect(sentBody.html).toContain("HAX 7.0");
 			expect(sentBody.html).toContain("$20.00");
 			expect(sentBody.html).toContain("75855123456789");
@@ -134,9 +135,10 @@ describe("Admin-EmailDj", () => {
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 			expect(sentBody.to).toEqual(["everett.bazzocchi@skullspace.ca"]);
 			expect(sentBody.cc).toBeUndefined();
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
 		});
 
-		test("CCs event coordinators alongside the admin (read from the event's own coordinators field)", async () => {
+		test("CCs event coordinators -- they are real recipients, unlike the old standing admin copy", async () => {
 			mockDatabases.getDocument
 				.mockResolvedValueOnce({ $id: "gc1", UPC: "75855123456789", balance: 2000, djs: "dj1", events: "event1" })
 				.mockResolvedValueOnce({ $id: "dj1", name: "DJ Test", email: "dj@example.com" })
@@ -159,13 +161,17 @@ describe("Admin-EmailDj", () => {
 			const [, , , eventQueries] = mockDatabases.getDocument.mock.calls[2];
 			expect(eventQueries.some((q) => q.includes("coordinators"))).toBe(true);
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
-			expect(sentBody.cc).toEqual(
-				expect.arrayContaining(["everett.bazzocchi@skullspace.ca", "coord1@example.com", "coord2@example.com"]),
-			);
-			expect(sentBody.cc).toHaveLength(3);
+			expect(sentBody.cc).toEqual(expect.arrayContaining(["coord1@example.com", "coord2@example.com"]));
+			expect(sentBody.cc).toHaveLength(2);
+			// the standing admin copy is gone -- the admin is reachable on reply_to instead
+			expect(sentBody.cc).not.toContain("everett.bazzocchi@skullspace.ca");
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
 		});
 
-		test("de-dupes a coordinator whose email matches the admin's, and drops one with no/invalid email", async () => {
+		test("de-dupes a repeated coordinator email, and drops one with no/invalid email", async () => {
+			// The admin address here belongs to a coordinator actually assigned to this event, so
+			// it is a genuine recipient and still gets CC'd -- that is not the old standing copy,
+			// which is gone (see the reply_to assertion). Listing it twice must still yield one CC.
 			mockDatabases.getDocument
 				.mockResolvedValueOnce({ $id: "gc1", UPC: "75855123456789", balance: 2000, djs: "dj1", events: "event1" })
 				.mockResolvedValueOnce({ $id: "dj1", name: "DJ Test", email: "dj@example.com" })
@@ -176,6 +182,7 @@ describe("Admin-EmailDj", () => {
 						{ $id: "co1", name: "Duplicate", email: "everett.bazzocchi@skullspace.ca" },
 						{ $id: "co2", name: "No Email" },
 						{ $id: "co3", name: "Bad Email", email: "not-an-email" },
+						{ $id: "co4", name: "Duplicate Again", email: "everett.bazzocchi@skullspace.ca" },
 					],
 				});
 			const ctx = makeContext({ body: { action: "voucher", giftcardId: "gc1" } });
@@ -185,6 +192,7 @@ describe("Admin-EmailDj", () => {
 			expect(result.body).toEqual({ ok: true });
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 			expect(sentBody.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
 		});
 
 		test("still sends (with a generic event name and no coordinator CC) if the linked event can't be read", async () => {
@@ -199,7 +207,8 @@ describe("Admin-EmailDj", () => {
 			expect(result.body).toEqual({ ok: true });
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 			expect(sentBody.html).toContain("your event");
-			expect(sentBody.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			expect(sentBody.cc).toBeUndefined();
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
 		});
 
 		test("404s when the giftcard doesn't exist", async () => {
@@ -226,7 +235,7 @@ describe("Admin-EmailDj", () => {
 	});
 
 	describe("custom action", () => {
-		test("sends a free-form message and CCs the admin", async () => {
+		test("sends a free-form message with the admin as reply_to (not a cc)", async () => {
 			mockDatabases.getDocument.mockResolvedValueOnce({ $id: "dj1", name: "DJ Test", email: "dj@example.com" });
 			const ctx = makeContext({
 				body: { action: "custom", djId: "dj1", subject: "Load in time", message: "Please arrive by 9pm." },
@@ -237,7 +246,8 @@ describe("Admin-EmailDj", () => {
 			expect(result).toEqual({ statusCode: 200, body: { ok: true } });
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 			expect(sentBody.to).toEqual(["dj@example.com"]);
-			expect(sentBody.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
+			expect(sentBody.cc).toBeUndefined();
 			expect(sentBody.subject).toBe("Load in time");
 			expect(sentBody.html).toContain("Please arrive by 9pm.");
 			expect(sentBody.html).toContain("admin@skullspace.ca");
@@ -261,6 +271,35 @@ describe("Admin-EmailDj", () => {
 
 			expect(result.statusCode).toBe(400);
 			expect(mockFetch).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("the admin is a reply_to, never a cc", () => {
+		// Guards the deliberate change away from the standing everett CC: replies still reach the
+		// admin, but no copy is delivered to that inbox. Coordinators (a real recipient list) are
+		// deliberately still CC'd -- see the coordinator tests above. A future edit that quietly
+		// reinstates the admin copy fails here.
+		test("no send site puts the admin address in cc when the admin is not a coordinator", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce({ $id: "gc1", UPC: "75855123456789", balance: 2000, djs: "dj1", events: "event1" })
+				.mockResolvedValueOnce({ $id: "dj1", name: "DJ Test", email: "dj@example.com" })
+				.mockResolvedValueOnce({
+					$id: "event1",
+					name: "HAX 7.0",
+					coordinators: [{ $id: "co1", name: "Coordinator One", email: "coord1@example.com" }],
+				})
+				.mockResolvedValueOnce({ $id: "dj1", name: "DJ Test", email: "dj@example.com" });
+
+			await handler(makeContext({ body: { action: "voucher", giftcardId: "gc1" } }));
+			await handler(makeContext({ body: { action: "custom", djId: "dj1", subject: "Hi", message: "Hello" } }));
+
+			expect(mockFetch).toHaveBeenCalledTimes(2);
+			mockFetch.mock.calls
+				.map((call) => JSON.parse(call[1].body))
+				.forEach((sentBody) => {
+					expect(sentBody.cc || []).not.toContain("everett.bazzocchi@skullspace.ca");
+					expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
+				});
 		});
 	});
 

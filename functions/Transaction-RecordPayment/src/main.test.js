@@ -666,8 +666,12 @@ describe("Transaction-RecordPayment", () => {
 				expect.objectContaining({ method: "POST" }),
 			);
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+			// `to` is the finance recipient -- here the test address, which happens to be the
+			// admin's (FINANCE_NOTIFICATION_EMAIL_TEST), not a standing CC.
 			expect(sentBody.to).toEqual(["everett.bazzocchi@skullspace.ca"]);
-			expect(sentBody.cc).toEqual(expect.arrayContaining(["everett.bazzocchi@skullspace.ca", "jane@example.com"]));
+			// the member is CC'd on their own dues receipt: a genuine recipient, so this survives
+			expect(sentBody.cc).toEqual(["jane@example.com"]);
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
 			expect(sentBody.html).toContain("Jane Member");
 			expect(sentBody.html).toContain("jane@example.com");
 			expect(sentBody.html).toContain("admin@skullspace.ca");
@@ -692,7 +696,43 @@ describe("Transaction-RecordPayment", () => {
 			await handler(ctx);
 
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
-			expect(sentBody.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			// no member to cc, and no standing admin copy -- so no cc field goes out at all
+			expect(sentBody.cc).toBeUndefined();
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
+		});
+
+		// Guards the deliberate change away from the standing everett CC. The member CC above is
+		// a genuine recipient and must keep working; the admin copy must not come back. Uses the
+		// non-testing path so the finance `to` is finance's own address, leaving cc unambiguous.
+		test("never puts the admin address in cc on the dues notice", async () => {
+			mockDatabases.getDocument.mockResolvedValue(
+				baseTransaction({
+					channel: "membership",
+					testing: false,
+					payment_due: 4000,
+					total: 4000,
+					member_name: "Jane Member",
+					member_email: "jane@example.com",
+				}),
+			);
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({
+				id: "pi_1",
+				status: "succeeded",
+				amount: 4000,
+				metadata: { transactionId: "t1" },
+			});
+			mockFetch.mockResolvedValue({ ok: true, text: () => Promise.resolve("{}") });
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "stripe", amount: 4000, paymentIntentId: "pi_1" },
+			});
+
+			await handler(ctx);
+
+			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+			expect(sentBody.cc || []).not.toContain("everett.bazzocchi@skullspace.ca");
+			expect(sentBody.cc).toEqual(["jane@example.com"]);
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
 		});
 
 		test("a non-testing membership payment notifies finance's real address, not the test one", async () => {

@@ -16,7 +16,7 @@ describe("Admin-EmailBartender", () => {
 	});
 
 	describe("event_assigned action", () => {
-		test("sends the bartender their event time window and pin, CCs the admin", async () => {
+		test("sends the bartender their event time window and pin, with the admin as reply_to (not a cc)", async () => {
 			mockDatabases.getDocument
 				.mockResolvedValueOnce({ $id: "bt1", name: "Alex", email: "alex@example.com", pin: "1234" })
 				.mockResolvedValueOnce({ $id: "event1", name: "HAX 7.0", date: "2026-06-01T22:00:00.000Z" });
@@ -27,7 +27,8 @@ describe("Admin-EmailBartender", () => {
 			expect(result).toEqual({ statusCode: 200, body: { ok: true } });
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 			expect(sentBody.to).toEqual(["alex@example.com"]);
-			expect(sentBody.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
+			expect(sentBody.cc).toBeUndefined();
 			expect(sentBody.subject).toContain("HAX 7.0");
 			expect(sentBody.html).toContain("1234");
 			expect(sentBody.html).toContain("admin@skullspace.ca");
@@ -82,14 +83,17 @@ describe("Admin-EmailBartender", () => {
 			const toBartender = JSON.parse(mockFetch.mock.calls[0][1].body);
 			const toCoordinators = JSON.parse(mockFetch.mock.calls[1][1].body);
 
-			// the credential-bearing body reaches the bartender and the admin, nobody else
+			// the credential-bearing body reaches the bartender and nobody else -- the admin is a
+			// reply_to header, which delivers no copy of the pin
 			expect(toBartender.to).toEqual(["alex@example.com"]);
-			expect(toBartender.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			expect(toBartender.cc).toBeUndefined();
+			expect(toBartender.reply_to).toBe("everett.bazzocchi@skullspace.ca");
 			expect(toBartender.html).toContain("1234");
 
 			// the coordinators' copy names the bartender and the event, and carries no pin
 			expect(toCoordinators.to).toEqual(["coord@example.com", "coord2@example.com"]);
 			expect(toCoordinators.cc).toBeUndefined();
+			expect(toCoordinators.reply_to).toBe("everett.bazzocchi@skullspace.ca");
 			expect(toCoordinators.html).toContain("Alex");
 			expect(toCoordinators.html).toContain("HAX 7.0");
 			expect(toCoordinators.html).not.toContain("1234");
@@ -116,7 +120,8 @@ describe("Admin-EmailBartender", () => {
 				.filter((sent) => JSON.stringify(sent).includes("9705"));
 			expect(bodiesContainingPin).toHaveLength(1);
 			expect(bodiesContainingPin[0].to).toEqual(["alex@example.com"]);
-			expect(bodiesContainingPin[0].cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			expect(bodiesContainingPin[0].cc).toBeUndefined();
+			expect(bodiesContainingPin[0].reply_to).toBe("everett.bazzocchi@skullspace.ca");
 		});
 
 		test("drops coordinators with a missing/invalid email and sends only the bartender's copy when none are left", async () => {
@@ -195,6 +200,7 @@ describe("Admin-EmailBartender", () => {
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 			expect(sentBody.to).toEqual(["everett.bazzocchi@skullspace.ca"]);
 			expect(sentBody.cc).toBeUndefined();
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
 		});
 
 		test("rejects an event with no date set", async () => {
@@ -240,7 +246,7 @@ describe("Admin-EmailBartender", () => {
 	});
 
 	describe("custom action", () => {
-		test("sends a free-form message and CCs the admin", async () => {
+		test("sends a free-form message with the admin as reply_to (not a cc)", async () => {
 			mockDatabases.getDocument.mockResolvedValueOnce({ $id: "bt1", name: "Alex", email: "alex@example.com" });
 			const ctx = makeContext({
 				body: { action: "custom", bartenderId: "bt1", subject: "Shift change", message: "Can you cover Friday?" },
@@ -251,7 +257,8 @@ describe("Admin-EmailBartender", () => {
 			expect(result).toEqual({ statusCode: 200, body: { ok: true } });
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 			expect(sentBody.to).toEqual(["alex@example.com"]);
-			expect(sentBody.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
+			expect(sentBody.cc).toBeUndefined();
 			expect(sentBody.html).toContain("Can you cover Friday?");
 			expect(sentBody.html).toContain("admin@skullspace.ca");
 		});
@@ -264,6 +271,37 @@ describe("Admin-EmailBartender", () => {
 
 			expect(result.statusCode).toBe(400);
 			expect(mockFetch).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("the admin is a reply_to, never a cc", () => {
+		// Guards the deliberate change away from the standing everett CC: replies still reach the
+		// admin, but no copy of any of this function's three sends is delivered to that inbox. A
+		// future edit that quietly reinstates the copy fails here.
+		test("no send site ever puts the admin address in cc", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce({ $id: "bt1", name: "Alex", email: "alex@example.com", pin: "1234" })
+				.mockResolvedValueOnce({
+					$id: "event1",
+					name: "HAX 7.0",
+					date: "2026-06-01T22:00:00.000Z",
+					coordinators: [{ $id: "co1", email: "coord@example.com" }],
+				})
+				.mockResolvedValueOnce({ $id: "bt1", name: "Alex", email: "alex@example.com" });
+
+			await handler(makeContext({ body: { action: "event_assigned", bartenderId: "bt1", eventId: "event1" } }));
+			await handler(
+				makeContext({ body: { action: "custom", bartenderId: "bt1", subject: "Hi", message: "Hello" } }),
+			);
+
+			// bartender copy, coordinator notice, custom message
+			expect(mockFetch).toHaveBeenCalledTimes(3);
+			mockFetch.mock.calls
+				.map((call) => JSON.parse(call[1].body))
+				.forEach((sentBody) => {
+					expect(sentBody.cc || []).not.toContain("everett.bazzocchi@skullspace.ca");
+					expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
+				});
 		});
 	});
 

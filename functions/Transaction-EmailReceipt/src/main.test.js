@@ -95,10 +95,26 @@ describe("Transaction-EmailReceipt", () => {
 		const sentBody = JSON.parse(options.body);
 		expect(sentBody.from).toBe("SkullPOS <SkullPOS@mail.shotty.tech>");
 		expect(sentBody.to).toEqual(["customer@example.com"]);
-		expect(sentBody.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+		expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
+		expect(sentBody.cc).toBeUndefined();
 		expect(sentBody.html).toContain("Beer");
 		expect(sentBody.html).toContain("$14.00");
 		expect(sentBody.html).toContain("admin@skullspace.ca");
+	});
+
+	// Guards the deliberate change away from the standing everett CC: the admin can still be
+	// replied to, but no copy of a customer's receipt is delivered to that inbox. A future edit
+	// that quietly reinstates the copy fails here.
+	test("never puts the admin address in cc", async () => {
+		mockDocuments();
+		mockResendSuccess();
+		const ctx = tillContext({ transactionId: "t1", email: "customer@example.com" });
+
+		await handler(ctx);
+
+		const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+		expect(sentBody.cc || []).not.toContain("everett.bazzocchi@skullspace.ca");
+		expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
 	});
 
 	test("sends a receipt for a refunded transaction, noting the refund", async () => {

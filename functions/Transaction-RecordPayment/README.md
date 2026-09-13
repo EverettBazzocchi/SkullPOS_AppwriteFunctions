@@ -126,8 +126,9 @@ What a bad re-price may do:
 ## Membership-dues notification
 
 When a leg completes a `channel: "membership"` transaction, finance is emailed
-via Resend with the payer's name/email, amount and date, CC'ing
-`everett.bazzocchi@skullspace.ca` and the member. It fires as a direct
+via Resend with the payer's name/email, amount and date, CC'ing the member on
+their own dues receipt and setting `everett.bazzocchi@skullspace.ca` as
+**Reply-To** rather than CC'ing them. It fires as a direct
 consequence of the payment completing here, not as a separate client call that
 could be skipped if the kiosk drops offline — and it never fails the payment
 response. Recipient follows the transaction's own `testing` flag.

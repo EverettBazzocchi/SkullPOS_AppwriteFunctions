@@ -18,7 +18,11 @@ const GIFTCARDS_COLLECTION_ID = 'giftcards';
 const DJS_COLLECTION_ID = 'djs';
 const EVENTS_COLLECTION_ID = '68e400210008d19bb5c9';
 const SENDER = 'SkullPOS <SkullPOS@mail.shotty.tech>';
-const ALWAYS_CC = 'everett.bazzocchi@skullspace.ca';
+// The admin address. Set as `reply_to` on every outgoing email (so replies reach the admin
+// without copying them on every send) and used as the `testing` redirect target. Not a CC any
+// more -- was ALWAYS_CC. Event coordinators are still CC'd on the voucher email; they are real
+// recipients, not an oversight copy.
+const ADMIN_EMAIL = 'everett.bazzocchi@skullspace.ca';
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const VALID_ACTIONS = ['voucher', 'custom'];
 const BARCODE_BUCKET_ID = 'voucher-barcodes';
@@ -108,6 +112,7 @@ async function sendEmail({ to, cc, subject, html }) {
 			from: SENDER,
 			to: [to],
 			...(cc && cc.length ? { cc } : {}),
+			reply_to: ADMIN_EMAIL,
 			subject,
 			html,
 		}),
@@ -119,18 +124,20 @@ async function sendEmail({ to, cc, subject, html }) {
 }
 
 // Resolves whether this send is allowed and who it actually goes to. When
-// `testing`, every email is redirected to ALWAYS_CC instead of the DJ's real
+// `testing`, every email is redirected to ADMIN_EMAIL instead of the DJ's real
 // address (and CC is dropped, since sending both `to` and `cc` to the same
 // inbox would just duplicate it) -- so nothing sent while building/testing
-// this feature ever reaches a real DJ or a real event coordinator.
+// this feature ever reaches a real DJ or a real event coordinator. In the
+// normal path the CC starts empty: the admin rides on `reply_to` instead, and
+// only genuine recipients (event coordinators) are ever added to it.
 function resolveRecipient(djEmail, testing) {
-	if (testing) return { to: ALWAYS_CC, cc: [] };
+	if (testing) return { to: ADMIN_EMAIL, cc: [] };
 	if (!djEmail || !EMAIL_PATTERN.test(djEmail)) return null;
-	return { to: djEmail, cc: [ALWAYS_CC] };
+	return { to: djEmail, cc: [] };
 }
 
-// Coordinators assigned to an event get CC'ed on the voucher-assignment email alongside the
-// admin, so they stay in the loop on which DJs were added and given credit for their event.
+// Coordinators assigned to an event get CC'ed on the voucher-assignment email, so they stay in
+// the loop on which DJs were added and given credit for their event.
 // `event_coordinators.events` is a many-to-many relationship -- Appwrite flatly rejects
 // Query.equal on a relationship attribute ("Cannot query on virtual relationship attribute"),
 // so this can't be looked up by querying that collection directly. Reading the *event's* own

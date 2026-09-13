@@ -38,10 +38,12 @@ const ITEM_LOOKUP_CHUNK = 50;
 // payment for the new higher amount still completes normally.
 const MEMBERSHIP_DUES_CENTS = 4000;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-// Every email this system sends CCs this address and closes with the same contact line -- see
-// the identical constants in Transaction-EmailReceipt/Admin-EmailDj/Admin-EmailBartender/
+// Every email this system sends carries this address as `reply_to` (replies reach the admin
+// without copying them on every send) and closes with the same contact line -- see the identical
+// constants in Transaction-EmailReceipt/Admin-EmailDj/Admin-EmailBartender/
 // Admin-EmailCoordinator (each function stays self-contained, no shared email module).
-const ALWAYS_CC = 'everett.bazzocchi@skullspace.ca';
+// Deliberately NOT a CC any more -- was ALWAYS_CC.
+const ADMIN_EMAIL = 'everett.bazzocchi@skullspace.ca';
 const FOOTER_HTML = '<p style="color:#999;font-size:0.8em;margin-top:24px;">Questions or concerns? Email <a href="mailto:admin@skullspace.ca">admin@skullspace.ca</a>.</p>';
 
 export default async ({ req, res, log, error }) => {
@@ -666,9 +668,10 @@ async function notifyFinanceOfMembershipPayment({ to, name, email, amount, date 
 	const amountStr = new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(
 		(parseInt(amount) || 0) / 100,
 	);
-	// CC the member on their own dues receipt (in addition to the standing everett CC) -- best
-	// effort: an invalid/missing member email just means one less CC, never blocks the notice.
-	const cc = [ALWAYS_CC];
+	// CC the member on their own dues receipt -- they are a genuine recipient of it, which is why
+	// this CC survives while the standing admin copy does not (the admin is on `reply_to` now).
+	// Best effort: an invalid/missing member email just means one less CC, never blocks the notice.
+	const cc = [];
 	if (email && EMAIL_PATTERN.test(email)) cc.push(email);
 
 	const response = await fetch('https://api.resend.com/emails', {
@@ -680,7 +683,8 @@ async function notifyFinanceOfMembershipPayment({ to, name, email, amount, date 
 		body: JSON.stringify({
 			from: 'SkullPOS <SkullPOS@mail.shotty.tech>',
 			to: [to],
-			cc,
+			...(cc.length ? { cc } : {}),
+			reply_to: ADMIN_EMAIL,
 			subject: `Membership dues paid: ${name || 'unknown member'}`,
 			html: `<p>A membership dues payment was just completed.</p>
 				<ul>

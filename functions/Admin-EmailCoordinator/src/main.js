@@ -10,7 +10,10 @@ import { createAppwriteClient } from './appwriteClient.js';
 const DATABASE_ID = '67c9ffd9003d68236514';
 const EVENT_COORDINATORS_COLLECTION_ID = 'event_coordinators';
 const SENDER = 'SkullPOS <SkullPOS@mail.shotty.tech>';
-const ALWAYS_CC = 'everett.bazzocchi@skullspace.ca';
+// The admin address. Set as `reply_to` on every outgoing email (so replies reach the admin
+// without copying them on every send) and used as the `testing` redirect target. Not a CC any
+// more -- was ALWAYS_CC.
+const ADMIN_EMAIL = 'everett.bazzocchi@skullspace.ca';
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const FOOTER_HTML = '<p style="color:#999;font-size:0.8em;margin-top:24px;">Questions or concerns? Email <a href="mailto:admin@skullspace.ca">admin@skullspace.ca</a>.</p>';
 
@@ -27,10 +30,12 @@ function buildCustomHtml({ coordinatorName, message }) {
 		</div>`;
 }
 
+// `testing` redirects the whole send to the admin instead of a real coordinator; the normal path
+// carries no CC at all, since the admin is reachable via `reply_to`.
 function resolveRecipient(email, testing) {
-	if (testing) return { to: ALWAYS_CC, cc: [] };
+	if (testing) return { to: ADMIN_EMAIL, cc: [] };
 	if (!email || !EMAIL_PATTERN.test(email)) return null;
-	return { to: email, cc: [ALWAYS_CC] };
+	return { to: email, cc: [] };
 }
 
 export default async ({ req, res, log, error }) => {
@@ -73,6 +78,7 @@ export default async ({ req, res, log, error }) => {
 				from: SENDER,
 				to: [recipient.to],
 				...(recipient.cc.length ? { cc: recipient.cc } : {}),
+				reply_to: ADMIN_EMAIL,
 				subject,
 				html: buildCustomHtml({ coordinatorName: coordinator.name || 'there', message }),
 			}),

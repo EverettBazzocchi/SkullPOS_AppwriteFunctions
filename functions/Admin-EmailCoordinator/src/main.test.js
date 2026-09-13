@@ -15,7 +15,7 @@ describe("Admin-EmailCoordinator", () => {
 		process.env.RESEND_API_KEY = "re_test_key";
 	});
 
-	test("sends a free-form message and CCs the admin", async () => {
+	test("sends a free-form message with the admin as reply_to (not a cc)", async () => {
 		mockDatabases.getDocument.mockResolvedValue({ $id: "co1", name: "Sam", email: "sam@example.com" });
 		const ctx = makeContext({
 			body: { coordinatorId: "co1", subject: "Next First Friday", message: "Can you cover load-in?" },
@@ -26,7 +26,8 @@ describe("Admin-EmailCoordinator", () => {
 		expect(result).toEqual({ statusCode: 200, body: { ok: true } });
 		const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 		expect(sentBody.to).toEqual(["sam@example.com"]);
-		expect(sentBody.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+		expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
+		expect(sentBody.cc).toBeUndefined();
 		expect(sentBody.subject).toBe("Next First Friday");
 		expect(sentBody.html).toContain("Can you cover load-in?");
 		expect(sentBody.html).toContain("admin@skullspace.ca");
@@ -44,6 +45,20 @@ describe("Admin-EmailCoordinator", () => {
 		const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 		expect(sentBody.to).toEqual(["everett.bazzocchi@skullspace.ca"]);
 		expect(sentBody.cc).toBeUndefined();
+		expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
+	});
+
+	// Guards the deliberate change away from the standing everett CC: replies still reach the
+	// admin, but no copy is delivered to that inbox. A future edit reinstating it fails here.
+	test("never puts the admin address in cc", async () => {
+		mockDatabases.getDocument.mockResolvedValue({ $id: "co1", name: "Sam", email: "sam@example.com" });
+		const ctx = makeContext({ body: { coordinatorId: "co1", subject: "Hi", message: "Hello" } });
+
+		await handler(ctx);
+
+		const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+		expect(sentBody.cc || []).not.toContain("everett.bazzocchi@skullspace.ca");
+		expect(sentBody.reply_to).toBe("everett.bazzocchi@skullspace.ca");
 	});
 
 	test("rejects a coordinator with no email on file (non-testing)", async () => {
