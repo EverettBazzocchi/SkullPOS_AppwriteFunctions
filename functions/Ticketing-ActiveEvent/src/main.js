@@ -56,6 +56,17 @@ const DEFAULT_CURRENCY = 'CAD';
 // Five is a deliberate over-fetch of a collection that holds three rows: the `total` the API
 // returns alongside them is the true count, so the log is accurate even in the (absurd) case that
 // more than five are active at once -- only the test-event step-past is limited to these five.
+//
+// DO NOT "TIDY UP" THE ORDER CLAUSE OR THE TEST-EVENT STEP-PAST. Another function's safety is
+// coupled to both of them. Admin-SetActiveEvent maintains `isActive` on a schedule and writes its
+// changeover as ACTIVATE-FIRST, DEACTIVATE-SECOND, deliberately, so that the transient between its
+// two writes is "two rows active" rather than "zero rows active" -- zero active mid-event hides
+// every alcohol item on the register and both boards and drops the door to the CA$30 default. That
+// transient is only harmless because the row it just wrote is the most recently updated one, so
+// `orderDesc('$updatedAt')` here serves it; and because pickActiveEvent below independently steps
+// past `testing === true`. Remove either and a crash between those two writes -- or the sub-second
+// gap between them -- starts serving the OLD event. The coupling is written out from the other side
+// in functions/Admin-SetActiveEvent/src/main.js and its README.
 const ACTIVE_EVENT_FETCH_LIMIT = 5;
 
 // Prefers the first non-test active event, but FALLS BACK to serving a test event rather than
