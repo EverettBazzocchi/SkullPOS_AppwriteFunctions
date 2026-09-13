@@ -420,20 +420,19 @@ describe("appwrite.config.json registration", () => {
 		expect(entry.entrypoint).toBe("src/main.js");
 	});
 
-	// Registered but DISARMED on purpose, and this test exists to keep it that way until a human
-	// decides otherwise. Arming it is not a neutral act: the first run clears the stale
-	// "Everetts Test event ignopre" and, with the next real event on 2026-09-26, the floor then
-	// carries NO active event for thirteen days -- alcohol hidden on the register and both boards,
-	// and the door back to its default ticket price. That may well be the correct end state, but it
-	// is an operator's decision made with their eyes open, not something a deploy does quietly.
+	// ARMED 2026-09-13, deliberately, by the operator. The consequence was stated first and
+	// accepted: the first run clears the stale "Everetts Test event ignopre", and with the next
+	// real event on 2026-09-26 the floor then carries NO active event for thirteen days --
+	// alcohol hidden on the register and both boards, door back to its default ticket price.
+	// That is the correct end state for a venue with nothing on tonight; it is only surprising
+	// if nobody was told.
 	//
-	// To arm it: set enabled true and schedule "*/15 * * * *" here, update this test in the same
-	// commit so the intent is recorded, push the config, then confirm a "trigger":"schedule"
-	// execution actually appears -- crons only register on deploy, and an unregistered schedule
-	// looks exactly like one that correctly decided nothing needed changing.
-	test("is registered DISARMED until deliberately enabled", () => {
-		expect(entry.enabled).toBe(false);
-		expect(entry.schedule).toBe("");
+	// A schedule in this file is not proof of a cron: crons register on DEPLOY, and an
+	// unregistered schedule is indistinguishable from one that correctly decided nothing needed
+	// changing. Confirm a "trigger":"schedule" execution exists before believing it runs.
+	test("is armed: enabled and scheduled", () => {
+		expect(entry.enabled).toBe(true);
+		expect(entry.schedule).toBe("*/15 * * * *");
 	});
 
 	test("can read and write documents, and a human can run it by hand", () => {
