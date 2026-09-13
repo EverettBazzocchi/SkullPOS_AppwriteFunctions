@@ -404,7 +404,7 @@
 			"enabled": true,
 			"logging": true,
 			"runtime": "node-16.0",
-			"scopes": ["documents.write"],
+			"scopes": ["documents.read", "documents.write"],
 			"events": [],
 			"schedule": "",
 			"timeout": 30,
