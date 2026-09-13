@@ -57,6 +57,22 @@ export default async ({ req, res, log, error }) => {
         }
     }
 
+    // REQUIRED, not optional, on the SkullPOS path. Transaction-RecordPayment hard-rejects any
+    // stripe leg whose intent does not carry `metadata.transactionId` matching the sale, and this
+    // intent is created with capture_method: 'automatic' -- so an intent minted without the stamp
+    // can still be tapped, captures immediately, and can then never be recorded against the sale.
+    // That was P0-1: money taken, sale unrecordable, every card sale, because the stamp was
+    // applied only "if asked" while the reader was never asked. Refusing here costs nothing (no
+    // intent exists yet, so nothing can have been captured) and it is the only way the two halves
+    // cannot drift apart again.
+    //
+    // Only the SkullPOS shape is bound this way. ShottyTicketing's door sales (handled above) have
+    // no Transactions row to point at.
+    if (!body.transactionId || typeof body.transactionId !== 'string') {
+        error('Refusing to create a PaymentIntent with no transactionId: it could be charged but never recorded.');
+        return res.json({ error: 'transactionId is required to create a payment intent' }, 400);
+    }
+
     try {
         const intent = await stripe.paymentIntents.create({
             amount: body.amount,
@@ -67,7 +83,7 @@ export default async ({ req, res, log, error }) => {
             // PaymentIntent was actually created for THIS transaction before
             // accepting it as payment -- otherwise a PaymentIntent that succeeded
             // against one sale could be replayed to "pay" a second, unrelated one.
-            ...(body.transactionId ? { metadata: { transactionId: body.transactionId } } : {}),
+            metadata: { transactionId: body.transactionId },
         });
 
         log('Stripe payment intent created successfully');

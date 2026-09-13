@@ -69,7 +69,7 @@ describe("Admin-VerifyZeffyTickets", () => {
 			const result = await handler(ctx);
 
 			expect(result.statusCode).toBe(200);
-			expect(result.body.failedWebhookRetry).toEqual({ retried: 0, succeeded: 0, stillFailing: [] });
+			expect(result.body.failedWebhookRetry).toEqual({ retried: 0, succeeded: 0, stillFailing: [], unreplayable: [] });
 		});
 
 		test("only queries failed_webhooks filtered to source ZEFFY", async () => {
@@ -91,7 +91,7 @@ describe("Admin-VerifyZeffyTickets", () => {
 
 			const result = await handler(ctx);
 
-			expect(result.body.failedWebhookRetry).toEqual({ retried: 1, succeeded: 1, stillFailing: [] });
+			expect(result.body.failedWebhookRetry).toEqual({ retried: 1, succeeded: 1, stillFailing: [], unreplayable: [] });
 			expect(mockDatabases.createDocument).toHaveBeenCalledWith(
 				expect.any(String),
 				"orders",
@@ -116,16 +116,91 @@ describe("Admin-VerifyZeffyTickets", () => {
 			expect(mockDatabases.deleteDocument).not.toHaveBeenCalled();
 		});
 
-		test("reports an unparseable dead-lettered payload without throwing", async () => {
+		// Previously this row landed in `stillFailing` and was re-parsed, re-failed and re-logged on
+		// every run forever. It is reported under `unreplayable` now and stamped so later runs skip
+		// it -- the assertion moved buckets, it wasn't weakened.
+		test("reports an unparseable dead-lettered payload as unreplayable, without throwing", async () => {
 			mockDatabases.listDocuments.mockResolvedValueOnce({ documents: [{ $id: "fw-bad", source: "ZEFFY", payload: "{not json" }] });
+			mockDatabases.updateDocument.mockResolvedValue({});
 			const ctx = makeContext({ body: {} });
 
 			const result = await handler(ctx);
 
 			expect(result.body.failedWebhookRetry.retried).toBe(1);
 			expect(result.body.failedWebhookRetry.succeeded).toBe(0);
-			expect(result.body.failedWebhookRetry.stillFailing[0].id).toBe("fw-bad");
+			expect(result.body.failedWebhookRetry.stillFailing).toEqual([]);
+			expect(result.body.failedWebhookRetry.unreplayable[0].id).toBe("fw-bad");
 			expect(mockDatabases.createDocument).not.toHaveBeenCalled();
+			expect(mockDatabases.deleteDocument).not.toHaveBeenCalled();
+			expect(mockDatabases.updateDocument).toHaveBeenCalledWith(expect.any(String), "failed_webhooks", "fw-bad", {
+				errorMessage: expect.stringMatching(/^UNREPLAYABLE: /),
+			});
+		});
+
+		test("an already-stamped unreplayable row is reported but not reprocessed on later runs", async () => {
+			mockDatabases.listDocuments.mockResolvedValueOnce({
+				documents: [
+					{ $id: "fw-bad", source: "ZEFFY", transactionId: "txn_bad", payload: "{not json", errorMessage: "UNREPLAYABLE: Unparseable dead-lettered payload: x" },
+				],
+			});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.failedWebhookRetry.unreplayable).toEqual([
+				{ id: "fw-bad", transactionId: "txn_bad", error: expect.stringMatching(/^UNREPLAYABLE: /) },
+			]);
+			expect(result.body.failedWebhookRetry.stillFailing).toEqual([]);
+			// no re-parse, no re-persist, and no second stamp write
+			expect(mockDatabases.createDocument).not.toHaveBeenCalled();
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("a truncation marker is never replayed as if it were a payload", async () => {
+			// Zeffy-Webhook writes this when the real payload doesn't fit failed_webhooks.payload.
+			// Persisting it would write an order with no tickets; phase 2 recovers it properly.
+			mockDatabases.listDocuments.mockResolvedValueOnce({
+				documents: [
+					{
+						$id: "fw-big",
+						source: "ZEFFY",
+						transactionId: "txn_big",
+						payload: JSON.stringify({ truncated: true, transactionId: "txn_big", itemCount: 40, originalLength: 8123 }),
+					},
+				],
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(mockDatabases.createDocument).not.toHaveBeenCalled();
+			expect(mockDatabases.deleteDocument).not.toHaveBeenCalled();
+			expect(result.body.failedWebhookRetry.succeeded).toBe(0);
+			expect(result.body.failedWebhookRetry.unreplayable).toEqual([
+				{ id: "fw-big", transactionId: "txn_big", error: expect.stringMatching(/Zeffy Payments API/) },
+			]);
+			expect(mockDatabases.updateDocument).toHaveBeenCalledWith(expect.any(String), "failed_webhooks", "fw-big", {
+				errorMessage: expect.stringMatching(/^UNREPLAYABLE: /),
+			});
+		});
+
+		test("a genuinely retryable row is still retried alongside an unreplayable one", async () => {
+			mockDatabases.listDocuments
+				.mockResolvedValueOnce({
+					documents: [{ $id: "fw-bad", source: "ZEFFY", payload: "{not json" }, failedWebhookDoc("fw-ok")],
+				})
+				.mockResolvedValue({ documents: [] });
+			mockDatabases.createDocument.mockResolvedValue({});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockDatabases.deleteDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.failedWebhookRetry.succeeded).toBe(1);
+			expect(result.body.failedWebhookRetry.unreplayable).toHaveLength(1);
+			expect(mockDatabases.deleteDocument).toHaveBeenCalledWith(expect.any(String), "failed_webhooks", "fw-ok");
 		});
 
 		test("processes multiple dead-lettered rows independently", async () => {
@@ -138,7 +213,7 @@ describe("Admin-VerifyZeffyTickets", () => {
 
 			const result = await handler(ctx);
 
-			expect(result.body.failedWebhookRetry).toEqual({ retried: 2, succeeded: 2, stillFailing: [] });
+			expect(result.body.failedWebhookRetry).toEqual({ retried: 2, succeeded: 2, stillFailing: [], unreplayable: [] });
 			expect(mockDatabases.deleteDocument).toHaveBeenCalledTimes(2);
 		});
 
@@ -149,7 +224,13 @@ describe("Admin-VerifyZeffyTickets", () => {
 			const result = await handler(ctx);
 
 			expect(result.statusCode).toBe(200);
-			expect(result.body.failedWebhookRetry).toEqual({ retried: 0, succeeded: 0, stillFailing: [], listError: "Failed to list failed_webhooks" });
+			expect(result.body.failedWebhookRetry).toEqual({
+				retried: 0,
+				succeeded: 0,
+				stillFailing: [],
+				unreplayable: [],
+				listError: "Failed to list failed_webhooks",
+			});
 		});
 	});
 
@@ -161,6 +242,7 @@ describe("Admin-VerifyZeffyTickets", () => {
 			const result = await handler(ctx);
 
 			expect(result.body.zeffyApiReconciliation).toEqual({ skipped: true, checked: 0, ordersCreated: 0, ticketsSaved: 0, failures: [] });
+			// no repairedOrders key at all -- the pass never ran, so it has nothing to say about it
 			expect(fetchMock).not.toHaveBeenCalled();
 		});
 
@@ -173,7 +255,14 @@ describe("Admin-VerifyZeffyTickets", () => {
 
 			const result = await handler(ctx);
 
-			expect(result.body.zeffyApiReconciliation).toEqual({ skipped: false, checked: 1, ordersCreated: 1, ticketsSaved: 1, failures: [] });
+			expect(result.body.zeffyApiReconciliation).toEqual({
+				skipped: false,
+				checked: 1,
+				ordersCreated: 1,
+				ticketsSaved: 1,
+				repairedOrders: [],
+				failures: [],
+			});
 			expect(fetchMock).toHaveBeenCalledWith(
 				expect.stringContaining("https://api.zeffy.com/api/v1/payments"),
 				expect.objectContaining({ headers: { Authorization: "Bearer test_key" } })
@@ -195,13 +284,103 @@ describe("Admin-VerifyZeffyTickets", () => {
 
 			const result = await handler(ctx);
 
-			expect(result.body.zeffyApiReconciliation).toEqual({ skipped: false, checked: 1, ordersCreated: 0, ticketsSaved: 0, failures: [] });
+			expect(result.body.zeffyApiReconciliation).toEqual({
+				skipped: false,
+				checked: 1,
+				ordersCreated: 0,
+				ticketsSaved: 0,
+				// nothing to repair: the order existed AND every one of its tickets did too
+				repairedOrders: [],
+				failures: [],
+			});
 			expect(mockDatabases.createDocument).toHaveBeenCalledWith(
 				expect.any(String),
 				"orders",
 				deriveDeterministicId("zfo", "pay_1"),
 				expect.objectContaining({ orderId: "pay_1" })
 			);
+		});
+
+		test("a payment with no line items still yields one ticket, like the webhook path does", async () => {
+			// The webhook parser synthesizes a single line item for an item-less payload; this
+			// parser didn't, so the same payment wrote an order and ZERO tickets here -- and every
+			// later run then 409'd on that order and reported nothing wrong while the buyer had no
+			// ticket to scan at the door.
+			process.env.ZEFFY_API_KEY = "test_key";
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
+			mockDatabases.createDocument.mockResolvedValue({});
+			fetchMock.mockResolvedValueOnce(apiPaymentsPage([zeffyPayment("pay_noitems", { items: [], amount: 4500 })]));
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.zeffyApiReconciliation).toMatchObject({ checked: 1, ordersCreated: 1, ticketsSaved: 1 });
+			const ticketCreate = mockDatabases.createDocument.mock.calls.find((c) => c[1] === "tickets");
+			expect(ticketCreate[3]).toMatchObject({ orderId: "pay_noitems", price: 4500, status: "VALID" });
+		});
+
+		test("re-reconciling an item-less payment does not mint a second ticket", async () => {
+			process.env.ZEFFY_API_KEY = "test_key";
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
+			const created = new Set();
+			mockDatabases.createDocument.mockImplementation((_db, collectionId, id) => {
+				const key = `${collectionId}/${id}`;
+				if (created.has(key)) return Promise.reject(conflictError());
+				created.add(key);
+				return Promise.resolve({});
+			});
+			fetchMock
+				.mockResolvedValueOnce(apiPaymentsPage([zeffyPayment("pay_noitems", { items: [], amount: 4500 })]))
+				.mockResolvedValueOnce(apiPaymentsPage([zeffyPayment("pay_noitems", { items: [], amount: 4500 })]));
+
+			const first = await handler(makeContext({ body: {} }));
+			const second = await handler(makeContext({ body: {} }));
+
+			expect(first.body.zeffyApiReconciliation).toMatchObject({ ordersCreated: 1, ticketsSaved: 1 });
+			expect(second.body.zeffyApiReconciliation).toMatchObject({ ordersCreated: 0, ticketsSaved: 0 });
+		});
+
+		test("an existing order that is missing tickets is repaired and reported, not passed over as healthy", async () => {
+			// The case an order row alone could never rule out: the order was written, its tickets
+			// were not (a run that died between the two writes, or the id-less-line-item bug that
+			// made the ticket writes non-idempotent). Every previous run 409'd on the order and
+			// reported a clean sweep while the buyer had nothing to scan.
+			process.env.ZEFFY_API_KEY = "test_key";
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
+			mockDatabases.createDocument.mockImplementation((_db, collectionId) =>
+				collectionId === "orders" ? Promise.reject(conflictError()) : Promise.resolve({})
+			);
+			fetchMock.mockResolvedValueOnce(
+				apiPaymentsPage([
+					zeffyPayment("pay_partial", {
+						items: [
+							{ id: "i1", amount: 1500, rate_title: "Standard Ticket" },
+							{ id: "i2", amount: 1500, rate_title: "Standard Ticket" },
+						],
+					}),
+				])
+			);
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.zeffyApiReconciliation).toMatchObject({
+				ordersCreated: 0,
+				ticketsSaved: 2,
+				repairedOrders: [{ id: "pay_partial", ticketsCreated: 2, ticketsExpected: 2 }],
+			});
+		});
+
+		test("an order and tickets that are all already present reports no repair", async () => {
+			process.env.ZEFFY_API_KEY = "test_key";
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [] });
+			mockDatabases.createDocument.mockRejectedValue(conflictError());
+			fetchMock.mockResolvedValueOnce(apiPaymentsPage([zeffyPayment("pay_complete")]));
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.zeffyApiReconciliation.repairedOrders).toEqual([]);
 		});
 
 		test("pages through more than one page of Zeffy payments", async () => {

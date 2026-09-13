@@ -140,6 +140,31 @@ describe("Stripe-RefundPayment", () => {
 		expect(mockDatabases.updateDocument.mock.calls.some((c) => c[3] && c[3].status === "refunded")).toBe(true);
 	});
 
+	// The legacy shape from P1-3: `giftcard_amount` with no relationship. Before the derivation
+	// was keyed off the amount alone this came back as a CASH leg, and the cash branch is "staff
+	// hand the money back physically" -- so refunding a $5 gift-card sale handed over $5 in real
+	// cash and left the card's balance untouched.
+	test("a legacy giftcard sale with no card id is reported for manual credit, never refunded as cash", async () => {
+		mockDatabases.getDocument.mockResolvedValueOnce({
+			status: "complete",
+			testing: true,
+			giftcard_amount: 500,
+			total: 500,
+			payment_due: 0,
+		});
+		mockDatabases.updateDocument.mockResolvedValue({});
+		const ctx = makeContext({ body: { transactionId: "t1" } });
+
+		const result = await handler(ctx);
+
+		expect(result.statusCode).toBe(500);
+		expect(result.body.legs).toEqual([
+			expect.objectContaining({ method: "giftcard", amount: 500, reversed: false }),
+		]);
+		expect(result.body.error).toMatch(/credited by hand/);
+		expect(mockStripe.refunds.create).not.toHaveBeenCalled();
+	});
+
 	test("retrying an already-refunded transaction is safely rejected, not double-processed", async () => {
 		// Simulates calling the function again after a prior call already
 		// succeeded in flipping status (the idempotency guard doing its job).

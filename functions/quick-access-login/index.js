@@ -18,8 +18,12 @@
  * a client instead of hand-edited via the console/CLI, and so the PIN is hashed at rest instead
  * of stored in plaintext.
  *
- * Failed attempts are throttled per source IP (see _shared/rateLimit.js) and persisted in the
- * 'rate_limits' collection, since a short PIN on a public endpoint is otherwise brute-forceable.
+ * Failed attempts are throttled and persisted in the 'rate_limits' collection, since a short PIN
+ * on a public endpoint is otherwise brute-forceable. Two buckets are counted per attempt (see
+ * rateLimitBuckets): a small per-caller budget, and a much larger per-IP backstop keyed on the
+ * *trusted* (rightmost) forwarding element. A failed attempt that cannot be persisted refuses the
+ * login rather than answering it, since an attempt that isn't counted is an attempt that doesn't
+ * exist.
  *
  * Ported from ShottyTicketing's own standalone project, now that it shares SkullPOS's Appwrite
  * project: DB_ID points at the shared database's 'rate_limits'/'pins' collections, and
@@ -39,7 +43,14 @@ const https = require('https');
 const crypto = require('crypto');
 const dns = require('dns');
 const { getAppwriteEndpoints, needsHostOverride } = require('./_shared/appwriteEndpoints');
-const { checkLockout, recordFailedAttempt, resetState } = require('./_shared/rateLimit');
+const {
+  checkLockout,
+  recordFailedAttempt,
+  resetState,
+  toPersistedState,
+  MAX_ATTEMPTS,
+  IP_MAX_ATTEMPTS,
+} = require('./_shared/rateLimit');
 
 // This self-hosted instance's function-execution sandbox can't resolve its own public
 // hostname via the normal getaddrinfo path (used internally by Node's http/https modules) --
@@ -115,35 +126,79 @@ function httpRequest(urlStr, method = 'GET', headers = {}, bodyObj = null, timeo
 }
 
 /** Appwrite document IDs must be a restricted charset; a short hash keeps this valid regardless
- * of the raw IP format (IPv4, IPv6, or a comma-separated x-forwarded-for chain). */
-function rateLimitDocId(ip) {
-  return 'qa_' + crypto.createHash('sha1').update(ip).digest('hex').slice(0, 16);
-}
-
-function extractClientIp(req) {
-  const forwarded = (req.headers && (req.headers['x-forwarded-for'] || req.headers['x-real-ip'])) || '';
-  return String(forwarded).split(',')[0].trim() || 'unknown';
+ * of the raw value's format (IPv4, IPv6, or an Appwrite user id). */
+function rateLimitDocId(prefix, value) {
+  return prefix + crypto.createHash('sha1').update(value).digest('hex').slice(0, 16);
 }
 
 /**
- * Finds a reachable Appwrite endpoint and fetches the rate-limit doc for this key, if any.
- * Returns null (fail-open) if every endpoint is unreachable, so a DB hiccup never locks staff
- * out of the app entirely - the PIN check itself still uses the same trusted secret comparison.
+ * The **rightmost** element of x-forwarded-for, not the leftmost. Each proxy appends the address
+ * it received the request from, so the last element is the one written by the trusted proxy in
+ * front of this runtime; everything to its left is whatever the caller chose to send. That matters
+ * because Appwrite's own createExecution API lets a caller supply an arbitrary `headers` map, so
+ * the leftmost element is literally attacker-authored - keying the throttle on it meant every
+ * attempt landed in a fresh bucket, and that a chosen value could pin a lockout on somebody else's
+ * bucket (P0-4b).
+ *
+ * Assumption: exactly one trusted proxy appends to this header in front of the function runtime,
+ * which is what the deployment behind api.cloud.shotty.tech does. If another proxy is ever put in
+ * front, the trusted element moves and this must take the Nth-from-last instead.
  */
-async function loadRateLimitState(headersBase, docId, log) {
+function extractClientIp(req) {
+  const forwarded = (req.headers && req.headers['x-forwarded-for']) || '';
+  const chain = String(forwarded)
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (chain.length > 0) return chain[chain.length - 1];
+  // x-real-ip is written by the proxy as a single value (no chain to pick from). Only reached
+  // when there is no x-forwarded-for at all.
+  const realIp = (req.headers && req.headers['x-real-ip']) || '';
+  return String(realIp).trim() || 'unknown';
+}
+
+/**
+ * Two buckets are checked and written on every failed attempt:
+ *
+ *   caller (`qa_c_`, MAX_ATTEMPTS) - the calling session where there is one, else the trusted IP.
+ *     A caller can mint a fresh anonymous session to get a fresh bucket, so this can only ever
+ *     *narrow* the budget, never escape it.
+ *   ip (`qa_ip_`, IP_MAX_ATTEMPTS) - the trusted proxy-supplied address. The ceiling that cannot be
+ *     walked away from, which is why it, not the caller bucket, is the real brute-force limit.
+ */
+function rateLimitBuckets(ip, callerId) {
+  return [
+    { id: rateLimitDocId('qa_c_', callerId || ip), max: MAX_ATTEMPTS, label: callerId ? 'caller' : 'caller(ip)' },
+    { id: rateLimitDocId('qa_ip_', ip), max: IP_MAX_ATTEMPTS, label: 'ip' },
+  ];
+}
+
+/**
+ * Finds a reachable Appwrite endpoint and fetches every rate-limit doc named in `docIds`.
+ * Returns null if every endpoint is unreachable. The caller fails OPEN on a correct PIN (a DB
+ * hiccup must never lock door staff out of the app) but fails CLOSED on an incorrect one, since
+ * an attempt that cannot be counted is an attempt that does not exist.
+ */
+async function loadRateLimitState(headersBase, docIds, log) {
   for (const endpoint of getAppwriteEndpoints()) {
     const headers = { ...headersBase };
     if (needsHostOverride(endpoint)) headers['Host'] = 'api.cloud.shotty.tech';
 
     try {
-      const result = await httpRequest(`${endpoint}/databases/${DB_ID}/collections/${RATE_LIMIT_COLLECTION}/documents/${docId}`, 'GET', headers);
-      if (result.status === 404) {
-        return { endpoint, headers, state: null };
+      const states = {};
+      for (const docId of docIds) {
+        const result = await httpRequest(`${endpoint}/databases/${DB_ID}/collections/${RATE_LIMIT_COLLECTION}/documents/${docId}`, 'GET', headers);
+        if (result.status === 404) {
+          states[docId] = null;
+          continue;
+        }
+        if (result.ok) {
+          states[docId] = result.data;
+          continue;
+        }
+        throw new Error(`[HTTP ${result.status}] ${JSON.stringify(result.data)}`);
       }
-      if (result.ok) {
-        return { endpoint, headers, state: result.data };
-      }
-      throw new Error(`[HTTP ${result.status}] ${JSON.stringify(result.data)}`);
+      return { endpoint, headers, states };
     } catch (err) {
       if (log) log(`Rate-limit lookup via ${endpoint} failed: ${err.message}. Trying next...`);
     }
@@ -151,15 +206,47 @@ async function loadRateLimitState(headersBase, docId, log) {
   return null;
 }
 
-async function saveRateLimitState(endpoint, headers, docId, existed, data, log) {
+/**
+ * Persists one bucket's counter. Returns true only if the write actually landed.
+ *
+ * `httpRequest` resolves (rather than rejecting) on a non-2xx, and this function used to ignore
+ * `result.ok` entirely - so every write silently failed and nothing was ever logged. It was
+ * failing on every single call: `justLocked` (a control flag, not one of the collection's three
+ * attributes) was passed straight through as a document field and Appwrite 400'd the payload, so
+ * `rate_limits` held zero rows and this endpoint had no brute-force protection whatsoever (P0-4a).
+ * Only `toPersistedState`'s three attributes are ever sent now, and a non-2xx is surfaced loudly.
+ */
+async function saveRateLimitState(endpoint, headers, docId, existed, state, log, error) {
+  const data = toPersistedState(state);
+  const report = (message) => {
+    if (error) error(message);
+    else if (log) log(message);
+  };
+
   try {
+    let result;
     if (existed) {
-      await httpRequest(`${endpoint}/databases/${DB_ID}/collections/${RATE_LIMIT_COLLECTION}/documents/${docId}`, 'PATCH', headers, { data });
+      result = await httpRequest(`${endpoint}/databases/${DB_ID}/collections/${RATE_LIMIT_COLLECTION}/documents/${docId}`, 'PATCH', headers, { data });
     } else {
-      await httpRequest(`${endpoint}/databases/${DB_ID}/collections/${RATE_LIMIT_COLLECTION}/documents`, 'POST', headers, { documentId: docId, data });
+      result = await httpRequest(`${endpoint}/databases/${DB_ID}/collections/${RATE_LIMIT_COLLECTION}/documents`, 'POST', headers, { documentId: docId, data });
+      // 409: a concurrent execution created this bucket between our read and our write. That is
+      // someone else's failed attempt, not a reason to drop ours.
+      if (result.status === 409) {
+        result = await httpRequest(`${endpoint}/databases/${DB_ID}/collections/${RATE_LIMIT_COLLECTION}/documents/${docId}`, 'PATCH', headers, { data });
+      }
     }
+
+    if (!result.ok) {
+      report(
+        `RATE-LIMIT-WRITE-FAILED doc=${docId} via ${endpoint} [HTTP ${result.status}] ` +
+          (typeof result.data === 'string' ? result.data : JSON.stringify(result.data))
+      );
+      return false;
+    }
+    return true;
   } catch (err) {
-    if (log) log(`Failed to persist rate-limit state via ${endpoint}: ${err.message}`);
+    report(`RATE-LIMIT-WRITE-FAILED doc=${docId} via ${endpoint}: ${err.message}`);
+    return false;
   }
 }
 
@@ -253,20 +340,24 @@ module.exports = async function (context) {
   const projectId = process.env.APPWRITE_FUNCTION_PROJECT_ID || '68f2ac7b00002e7563a8';
   const headersBase = { 'x-appwrite-project': projectId, 'x-appwrite-key': apiKey };
 
+  const callerId = req.headers && req.headers['x-appwrite-user-id'];
   const ip = extractClientIp(req);
-  const docId = rateLimitDocId(ip);
+  const buckets = rateLimitBuckets(ip, callerId);
   const now = Date.now();
 
-  const rateLimitLookup = await loadRateLimitState(headersBase, docId, log);
+  const rateLimitLookup = await loadRateLimitState(headersBase, buckets.map((bucket) => bucket.id), log);
   if (rateLimitLookup) {
-    const { locked, retryAfterMs } = checkLockout(rateLimitLookup.state, now);
-    if (locked) {
-      const retryAfterSec = Math.ceil(retryAfterMs / 1000);
-      if (log) log(`Quick access locked out for ${ip} - ${retryAfterSec}s remaining.`);
+    for (const bucket of buckets) {
+      bucket.state = rateLimitLookup.states[bucket.id] || null;
+    }
+    const lockedBucket = buckets.find((bucket) => checkLockout(bucket.state, now).locked);
+    if (lockedBucket) {
+      const retryAfterSec = Math.ceil(checkLockout(lockedBucket.state, now).retryAfterMs / 1000);
+      if (log) log(`Quick access locked out (${lockedBucket.label} bucket) for ${ip} - ${retryAfterSec}s remaining.`);
       return res.json({ error: 'Too many incorrect PIN attempts. Please wait and try again.', retryAfterSeconds: retryAfterSec }, 429);
     }
-  } else if (log) {
-    log('⚠️ Could not reach Appwrite Database to check rate limit - proceeding without throttling for this request.');
+  } else if (error) {
+    error('RATE-LIMIT-UNAVAILABLE could not reach the rate_limits collection - a correct PIN will still be honoured, an incorrect one will be refused.');
   }
 
   const submittedPinHash = crypto.createHash('sha256').update(submittedPin).digest('hex');
@@ -279,19 +370,48 @@ module.exports = async function (context) {
   const pinIsValid = !!pinLookup.doc;
 
   if (!pinIsValid) {
+    let persistedAll = !!rateLimitLookup;
+    let locked = null;
+
     if (rateLimitLookup) {
-      const nextState = recordFailedAttempt(rateLimitLookup.state, now);
-      await saveRateLimitState(rateLimitLookup.endpoint, rateLimitLookup.headers, docId, !!rateLimitLookup.state, nextState, log);
-      if (nextState.justLocked) {
-        if (log) log(`Quick access now locked out for ${ip} after repeated incorrect PIN attempts.`);
-        return res.json({ error: 'Too many incorrect PIN attempts. Please wait and try again.', retryAfterSeconds: Math.ceil((Date.parse(nextState.lockedUntil) - now) / 1000) }, 429);
+      for (const bucket of buckets) {
+        const nextState = recordFailedAttempt(bucket.state, now, bucket.max);
+        const persisted = await saveRateLimitState(
+          rateLimitLookup.endpoint,
+          rateLimitLookup.headers,
+          bucket.id,
+          !!bucket.state,
+          nextState,
+          log,
+          error
+        );
+        persistedAll = persistedAll && persisted;
+        if (persisted && nextState.justLocked && !locked) locked = nextState;
       }
+    }
+
+    // Fail CLOSED: if the counter could not be written, this attempt leaves no trace and the next
+    // one starts from zero - i.e. this endpoint, which mints a session token for the shared
+    // door-staff account on a 4-digit PIN, is running with no brute-force defence at all. Refusing
+    // to answer turns a silent, permanent hole into a visible outage. A *correct* PIN is still
+    // honoured above, so a database hiccup never locks real door staff out of the app.
+    if (!persistedAll) {
+      if (error) error('RATE-LIMIT-UNAVAILABLE refusing quick-access login: a failed attempt could not be recorded.');
+      return res.json({ error: 'Quick access is temporarily unavailable. Please try again shortly.' }, 503);
+    }
+
+    if (locked) {
+      if (log) log(`Quick access now locked out for ${ip} after repeated incorrect PIN attempts.`);
+      return res.json({ error: 'Too many incorrect PIN attempts. Please wait and try again.', retryAfterSeconds: Math.ceil((Date.parse(locked.lockedUntil) - now) / 1000) }, 429);
     }
     return res.json({ error: 'Incorrect PIN' }, 401);
   }
 
-  if (rateLimitLookup && rateLimitLookup.state) {
-    await saveRateLimitState(rateLimitLookup.endpoint, rateLimitLookup.headers, docId, true, resetState(), log);
+  // Clear this caller's accumulated failures. Deliberately only the caller bucket: the shared-IP
+  // backstop keeps counting (it expires on its own window), so one successful login can't wipe the
+  // venue-wide evidence of a brute-force walk in progress from the same egress.
+  if (rateLimitLookup && buckets[0].state) {
+    await saveRateLimitState(rateLimitLookup.endpoint, rateLimitLookup.headers, buckets[0].id, true, resetState(), log, error);
   }
 
   const allEndpoints = getAppwriteEndpoints();
@@ -315,7 +435,13 @@ module.exports = async function (context) {
       );
 
       if (result.ok && result.data && result.data.secret) {
-        if (log) log(`Issued quick-access session token via ${endpoint}`);
+        // Every ticketing PIN resolves to the same shared door-staff account, so the session
+        // itself carries no attribution. Logging which PIN row minted it is the only per-
+        // credential trail that exists - and the only handle for revocation after the fact, since
+        // marking the row `active: false` does NOT end a session it already granted (P1-2: the
+        // token's 60s expiry bounds the *token*, not the session the client exchanges it for).
+        const matched = pinLookup.doc || {};
+        if (log) log(`Issued quick-access session token via ${endpoint} for pin=${matched.$id || 'unknown'} label=${matched.label || 'unlabeled'}`);
         return res.json({ userId: result.data.userId, secret: result.data.secret });
       }
 

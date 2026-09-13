@@ -53,6 +53,44 @@ fails, the PIN check itself still succeeds -- the session just won't be
 able to charge a card until that's resolved (logged as an error, not
 surfaced to the caller).
 
+**Known gap:** this grant has no expiry and nothing deletes it, so setting a
+PIN row to `active: false` does not revoke access already handed out to a
+device that used it. It can't simply be given a TTL here -- a self-checkout
+kiosk is designed never to re-enter its PIN, so expiring the membership
+server-side would strand it mid-shift. The durable fix is to replace the
+team grant with a short-lived claim the Stripe functions validate. Until
+then, every grant is logged as `PIN-GRANT user=<id> label=<pin label>` so a
+revoke can be carried out by hand against the team's member list.
+
+## Rate limiting
+
+Failed attempts are counted in the shared `rate_limits` collection, which
+has exactly three attributes -- `attempts`, `windowStart`, `lockedUntil`.
+Nothing else may appear in a document payload (Appwrite's structure
+validator 400s the whole write), so every write goes through
+`toPersistedState()`; `justLocked` is a return value only, never a field.
+
+Two buckets are counted per failed attempt:
+
+| bucket | key | ceiling | why |
+| --- | --- | --- | --- |
+| caller | `pin_c_<sha1>` of `x-appwrite-user-id`, else the IP | 5 | per device, so one till's typos don't lock out the venue |
+| IP | `pin_ip_<sha1>` of the trusted IP | 30 | a caller can mint a fresh session for a fresh caller bucket, so this is the ceiling that can't be walked away from |
+
+The IP is the **rightmost** element of `x-forwarded-for` -- the one the
+trusted proxy appended. Everything to its left is caller-supplied, and
+Appwrite's `createExecution` lets a caller set headers outright. This
+assumes exactly one trusted proxy in front of the runtime; add another and
+the trusted element moves.
+
+Reads fail **open** (a database hiccup must not lock staff out of the till)
+but writes fail **closed**: if a failed attempt cannot be recorded, the
+request is answered `503` rather than with a normal wrong-PIN response,
+because an attempt that isn't counted is an attempt that doesn't exist.
+
+A correct bartender PIN presented outside its event window is **not** a
+failed attempt -- the credential was right, only the timing was wrong.
+
 ## Configuration
 
 | Setting     | Value                                               |

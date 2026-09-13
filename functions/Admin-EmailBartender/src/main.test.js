@@ -51,9 +51,56 @@ describe("Admin-EmailBartender", () => {
 			expect(sentBody.html).not.toContain("3:00");
 		});
 
-		test("CCs event coordinators alongside the admin (read from the event's own coordinators field)", async () => {
+		// This test used to assert the opposite -- that coordinators were merged into the CC of
+		// the bartender's own (pin-bearing) email. That was the bug: one HTML body goes to `to`
+		// and every `cc`, so every coordinator received a working till pin. The roster fact is
+		// still delivered, now as its own pin-free email.
+		test("tells coordinators a bartender was assigned WITHOUT ever sending them the pin", async () => {
 			mockDatabases.getDocument
 				.mockResolvedValueOnce({ $id: "bt1", name: "Alex", email: "alex@example.com", pin: "1234" })
+				.mockResolvedValueOnce({
+					$id: "event1",
+					name: "HAX 7.0",
+					date: "2026-06-01T22:00:00.000Z",
+					coordinators: [
+						{ $id: "co1", email: "coord@example.com" },
+						{ $id: "co2", email: "coord2@example.com" },
+					],
+				});
+			const ctx = makeContext({ body: { action: "event_assigned", bartenderId: "bt1", eventId: "event1" } });
+
+			const result = await handler(ctx);
+
+			expect(result).toEqual({ statusCode: 200, body: { ok: true } });
+			// verifies coordinators are read via a select on the event, not a (broken) query
+			// against event_coordinators directly -- Appwrite rejects Query.equal on a
+			// many-to-many relationship attribute outright
+			const [, , , eventQueries] = mockDatabases.getDocument.mock.calls[1];
+			expect(eventQueries.some((q) => q.includes("coordinators"))).toBe(true);
+
+			expect(mockFetch).toHaveBeenCalledTimes(2);
+			const toBartender = JSON.parse(mockFetch.mock.calls[0][1].body);
+			const toCoordinators = JSON.parse(mockFetch.mock.calls[1][1].body);
+
+			// the credential-bearing body reaches the bartender and the admin, nobody else
+			expect(toBartender.to).toEqual(["alex@example.com"]);
+			expect(toBartender.cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+			expect(toBartender.html).toContain("1234");
+
+			// the coordinators' copy names the bartender and the event, and carries no pin
+			expect(toCoordinators.to).toEqual(["coord@example.com", "coord2@example.com"]);
+			expect(toCoordinators.cc).toBeUndefined();
+			expect(toCoordinators.html).toContain("Alex");
+			expect(toCoordinators.html).toContain("HAX 7.0");
+			expect(toCoordinators.html).not.toContain("1234");
+			expect(toCoordinators.subject).not.toContain("1234");
+		});
+
+		test("a pin that happens to appear in no other field still never reaches a coordinator", async () => {
+			// Guards the general rule rather than the literal string "1234": whatever the
+			// bartender's pin is, it must appear in exactly one of the two outgoing bodies.
+			mockDatabases.getDocument
+				.mockResolvedValueOnce({ $id: "bt1", name: "Alex", email: "alex@example.com", pin: "9705" })
 				.mockResolvedValueOnce({
 					$id: "event1",
 					name: "HAX 7.0",
@@ -64,13 +111,49 @@ describe("Admin-EmailBartender", () => {
 
 			await handler(ctx);
 
-			// verifies coordinators are read via a select on the event, not a (broken) query
-			// against event_coordinators directly -- Appwrite rejects Query.equal on a
-			// many-to-many relationship attribute outright
-			const [, , , eventQueries] = mockDatabases.getDocument.mock.calls[1];
-			expect(eventQueries.some((q) => q.includes("coordinators"))).toBe(true);
-			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
-			expect(sentBody.cc).toEqual(expect.arrayContaining(["everett.bazzocchi@skullspace.ca", "coord@example.com"]));
+			const bodiesContainingPin = mockFetch.mock.calls
+				.map((call) => JSON.parse(call[1].body))
+				.filter((sent) => JSON.stringify(sent).includes("9705"));
+			expect(bodiesContainingPin).toHaveLength(1);
+			expect(bodiesContainingPin[0].to).toEqual(["alex@example.com"]);
+			expect(bodiesContainingPin[0].cc).toEqual(["everett.bazzocchi@skullspace.ca"]);
+		});
+
+		test("drops coordinators with a missing/invalid email and sends only the bartender's copy when none are left", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce({ $id: "bt1", name: "Alex", email: "alex@example.com", pin: "1234" })
+				.mockResolvedValueOnce({
+					$id: "event1",
+					name: "HAX 7.0",
+					date: "2026-06-01T22:00:00.000Z",
+					coordinators: [{ $id: "co1", name: "No Email" }, { $id: "co2", name: "Bad", email: "not-an-email" }],
+				});
+			const ctx = makeContext({ body: { action: "event_assigned", bartenderId: "bt1", eventId: "event1" } });
+
+			const result = await handler(ctx);
+
+			expect(result).toEqual({ statusCode: 200, body: { ok: true } });
+			expect(mockFetch).toHaveBeenCalledTimes(1);
+		});
+
+		test("a failed coordinator notice does not fail the assignment (the bartender already got her pin)", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce({ $id: "bt1", name: "Alex", email: "alex@example.com", pin: "1234" })
+				.mockResolvedValueOnce({
+					$id: "event1",
+					name: "HAX 7.0",
+					date: "2026-06-01T22:00:00.000Z",
+					coordinators: [{ $id: "co1", email: "coord@example.com" }],
+				});
+			mockFetch
+				.mockResolvedValueOnce({ ok: true, text: () => Promise.resolve("{}") })
+				.mockResolvedValueOnce({ ok: false, status: 500, text: () => Promise.resolve("resend down") });
+			const ctx = makeContext({ body: { action: "event_assigned", bartenderId: "bt1", eventId: "event1" } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(200);
+			expect(result.body).toEqual({ ok: true, coordinatorNoticeSent: false });
 		});
 
 		test("rejects a bartender with no pin generated yet", async () => {
@@ -94,15 +177,21 @@ describe("Admin-EmailBartender", () => {
 			expect(mockFetch).not.toHaveBeenCalled();
 		});
 
-		test("testing:true redirects the recipient and drops the cc", async () => {
+		test("testing:true redirects the recipient, drops the cc, and sends no coordinator notice", async () => {
 			mockDatabases.getDocument
 				.mockResolvedValueOnce({ $id: "bt1", name: "Alex", pin: "1234" })
-				.mockResolvedValueOnce({ $id: "event1", name: "HAX 7.0", date: "2026-06-01T22:00:00.000Z" });
+				.mockResolvedValueOnce({
+					$id: "event1",
+					name: "HAX 7.0",
+					date: "2026-06-01T22:00:00.000Z",
+					coordinators: [{ $id: "co1", email: "coord@example.com" }],
+				});
 			const ctx = makeContext({ body: { action: "event_assigned", bartenderId: "bt1", eventId: "event1", testing: true } });
 
 			const result = await handler(ctx);
 
 			expect(result.body).toEqual({ ok: true });
+			expect(mockFetch).toHaveBeenCalledTimes(1);
 			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
 			expect(sentBody.to).toEqual(["everett.bazzocchi@skullspace.ca"]);
 			expect(sentBody.cc).toBeUndefined();

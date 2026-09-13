@@ -129,6 +129,17 @@ export default async ({ req, res, log, error }) => {
 				});
 				log(`Stripe refund created for ${leg.stripeId} (${leg.amount})`);
 			} else if (leg.method === 'giftcard') {
+				// A legacy row can record `giftcard_amount` with no `giftcards` relationship --
+				// nothing ever wrote that attribute, so this is the shape of every pre-migration
+				// gift-card sale. There is no card to credit, and the one thing that must NOT
+				// happen is falling through to the cash branch and handing real money over the bar
+				// for a payment that came off a gift card (P1-3). Report it instead: the loop below
+				// surfaces it as a leg that needs handling by hand.
+				if (!leg.giftcardId) {
+					throw new Error(
+						'this sale records a gift-card amount but no gift-card id, so the balance has to be credited by hand -- do NOT refund it as cash',
+					);
+				}
 				const giftcard = await databases.getDocument(DATABASE_ID, GIFTCARDS_COLLECTION_ID, leg.giftcardId);
 				await databases.updateDocument(DATABASE_ID, GIFTCARDS_COLLECTION_ID, leg.giftcardId, {
 					balance: (parseInt(giftcard.balance) || 0) + leg.amount,

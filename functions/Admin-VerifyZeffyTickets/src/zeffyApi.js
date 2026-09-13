@@ -49,19 +49,27 @@ export async function fetchAllZeffySucceededPayments(apiKey, log) {
  */
 export function parsedFromZeffyPayment(payment) {
 	const buyer = payment.buyer || {};
+	const amount = parseInt(payment.amount, 10) || 0;
+	const items = (payment.items || []).map((item) => ({
+		id: item.id,
+		type: item.rate_title || item.type || 'Standard Ticket',
+		amount: item.amount,
+	}));
+
 	return {
 		eventType: 'payment.completed',
 		transactionId: payment.id,
 		eventName: payment.description || 'Zeffy Event',
-		amount: parseInt(payment.amount, 10) || 0,
+		amount,
 		currency: (payment.currency || 'CAD').toUpperCase(),
 		buyerName: `${buyer.first_name || 'Guest'} ${buyer.last_name || 'User'}`.trim(),
 		email: buyer.email || 'guest@example.com',
 		paymentMethodType: (payment.payment_method && payment.payment_method.type) || 'zeffy_checkout',
-		items: (payment.items || []).map((item) => ({
-			id: item.id,
-			type: item.rate_title || item.type || 'Standard Ticket',
-			amount: item.amount,
-		})),
+		// Same one-item fallback parseZeffyPayload() applies to a webhook body with no `items`.
+		// Without it the two paths disagreed about the very same payment: the webhook wrote one
+		// ticket, this reconciliation pass wrote the order and ZERO tickets -- and every later run
+		// then 409'd on that order and reported nothing wrong, so the buyer was refused at the door
+		// with the data looking healthy.
+		items: items.length > 0 ? items : [{ name: 'Standard Ticket', amount }],
 	};
 }

@@ -39,11 +39,21 @@ export function derivePaymentLegs(transaction) {
 	const legs = [];
 	let remaining = parseInt(transaction.total) || 0;
 
+	// Keyed off `giftcard_amount` ALONE, never off the relationship as well. Requiring both is
+	// what buried $458.25 of gift-card redemptions in the cash bucket (P1-3): of the 77 rows
+	// carrying a positive `giftcard_amount`, not one has a non-empty `giftcards` relationship --
+	// nothing has ever written that attribute -- so `giftcardIds.length > 0 && ...` was false on
+	// every legacy row, the leg was skipped, and the whole amount fell through to the cash leg
+	// synthesized from the remainder below. The card id is attached when the relationship does
+	// carry one and simply omitted when it does not: a giftcard leg with no id still buckets the
+	// revenue correctly, and Stripe-RefundPayment reports it as needing a manual credit instead of
+	// handing the customer cash for a gift-card payment.
 	const giftcardIds = Array.isArray(transaction.giftcards) ? transaction.giftcards : [];
 	const giftcardAmount = parseInt(transaction.giftcard_amount) || 0;
-	if (giftcardIds.length > 0 && giftcardAmount > 0) {
-		const giftcardId = typeof giftcardIds[0] === 'object' ? giftcardIds[0].$id : giftcardIds[0];
-		legs.push({ method: 'giftcard', amount: giftcardAmount, giftcardId });
+	if (giftcardAmount > 0) {
+		const rawId = giftcardIds.length > 0 ? giftcardIds[0] : null;
+		const giftcardId = rawId && typeof rawId === 'object' ? rawId.$id : rawId;
+		legs.push({ method: 'giftcard', amount: giftcardAmount, ...(giftcardId ? { giftcardId } : {}) });
 		remaining -= giftcardAmount;
 	}
 

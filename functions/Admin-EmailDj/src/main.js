@@ -46,7 +46,21 @@ async function uploadBarcodeImage(storage, code) {
 		textxalign: 'center',
 	});
 	const fileId = ID.unique();
-	await storage.createFile(BARCODE_BUCKET_ID, fileId, InputFile.fromBuffer(png, `${code}.png`));
+	// Two separate rules, both needed, because this barcode IS a live bar credit:
+	//
+	// 1. The filename must NEVER be the giftcard code. Appwrite serves list and read off the same
+	//    bucket permission, so a bucket anyone can read is also a bucket anyone can *list* -- and
+	//    naming the file `${code}.png` turned that listing into a public, plaintext index of every
+	//    live voucher code this function has ever emailed (and it grows by one per send, forever).
+	// 2. The read grant goes on the *file*, not the bucket. A random fileId is only a bearer token
+	//    while the set of fileIds is secret, and a listable bucket hands that set out -- from which
+	//    every barcode image is one GET away, with the code printed underneath it (includetext,
+	//    above). So the bucket must be `fileSecurity: true` with no `read("any")` on the bucket
+	//    itself (which is what gates list), and each file carries its own public read instead.
+	//
+	// Written as the literal permission string rather than Permission.read(Role.any()) only to
+	// avoid pulling two more symbols in for one call; it is the identical wire value.
+	await storage.createFile(BARCODE_BUCKET_ID, fileId, InputFile.fromBuffer(png, `${fileId}.png`), ['read("any")']);
 	const endpoint = process.env.APPWRITE_FUNCTION_API_ENDPOINT;
 	const projectId = process.env.APPWRITE_FUNCTION_PROJECT_ID;
 	return `${endpoint}/storage/buckets/${BARCODE_BUCKET_ID}/files/${fileId}/view?project=${projectId}`;

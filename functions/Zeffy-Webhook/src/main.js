@@ -37,6 +37,48 @@ function verifySignature(req, log, error) {
 	return { ok: true };
 }
 
+// failed_webhooks.payload is a size=5000 string column.
+const MAX_PAYLOAD_CHARS = 4999;
+
+/**
+ * Serializes a parsed payload for the dead-letter row, DETECTING an over-long payload rather than
+ * cutting one.
+ *
+ * A raw `.slice(0, 4999)` of a JSON document is not itself JSON: the retry job's `JSON.parse` of it
+ * could only ever throw, so any dead-lettered payload big enough to be cut (a large group order --
+ * exactly the ones worth recovering) was permanently unreplayable, and re-failed on every 12-hourly
+ * run forever. A marker object is valid JSON, carries the transaction id the Zeffy Payments API
+ * reconciliation pass needs to recover the payment properly, and is recognisable as "there is no
+ * payload here" instead of masquerading as one.
+ */
+function serializeForDeadLetter(parsed, error) {
+	const serialized = JSON.stringify(parsed);
+	if (serialized.length <= MAX_PAYLOAD_CHARS) return serialized;
+
+	if (error) {
+		error(
+			`Zeffy payload for transaction ${parsed.transactionId} is ${serialized.length} chars, over the ${MAX_PAYLOAD_CHARS}-char ` +
+				'failed_webhooks limit -- dead-lettering a marker instead. This payment can only be recovered by the Zeffy API ' +
+				'reconciliation pass (ZEFFY_API_KEY must be set).',
+		);
+	}
+
+	const marker = {
+		truncated: true,
+		transactionId: String(parsed.transactionId || ''),
+		eventType: parsed.eventType,
+		eventName: String(parsed.eventName || '').slice(0, 255),
+		amount: parsed.amount,
+		itemCount: Array.isArray(parsed.items) ? parsed.items.length : 0,
+		originalLength: serialized.length,
+	};
+	const markerJson = JSON.stringify(marker);
+	// Belt and braces: even the marker has to fit, so fall back to the bare minimum a retry needs.
+	return markerJson.length <= MAX_PAYLOAD_CHARS
+		? markerJson
+		: JSON.stringify({ truncated: true, transactionId: String(parsed.transactionId || ''), originalLength: serialized.length });
+}
+
 /** Best-effort record of a webhook that couldn't be persisted, so Admin-VerifyZeffyTickets can
  * replay it later instead of the payment silently vanishing. Never throws. */
 async function recordFailedWebhook(databases, log, error, parsed, errorMessage) {
@@ -45,7 +87,7 @@ async function recordFailedWebhook(databases, log, error, parsed, errorMessage) 
 			source: 'ZEFFY',
 			eventType: parsed.eventType,
 			transactionId: String(parsed.transactionId || ''),
-			payload: JSON.stringify(parsed).slice(0, 4999),
+			payload: serializeForDeadLetter(parsed, error),
 			errorMessage: String(errorMessage).slice(0, 999),
 			createdAt: new Date().toISOString(),
 		});

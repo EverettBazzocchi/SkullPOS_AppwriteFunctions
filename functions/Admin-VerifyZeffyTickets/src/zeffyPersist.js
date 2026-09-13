@@ -1,5 +1,5 @@
 import { ID } from 'node-appwrite';
-import { generateFallbackTicketCode } from './ticketId.js';
+import { deriveFallbackTicketCode } from './ticketId.js';
 import { deriveDeterministicId } from './deterministicId.js';
 
 /**
@@ -58,8 +58,9 @@ export async function persistZeffyPayment(databases, parsed, log) {
 	}
 
 	let ticketsSaved = 0;
-	for (const item of items) {
-		const ticketCode = String(item.id || generateFallbackTicketCode(transactionId));
+	let ticketsAlreadyPresent = 0;
+	for (const [index, item] of items.entries()) {
+		const ticketCode = String(item.id || deriveFallbackTicketCode(transactionId, index));
 
 		try {
 			await databases.createDocument(DATABASE_ID, TICKETS_COLLECTION_ID, ID.custom(deriveDeterministicId('zft', ticketCode)), {
@@ -70,7 +71,12 @@ export async function persistZeffyPayment(databases, parsed, log) {
 				ticketType: item.type || 'Standard Ticket',
 				attendeeName: buyerName,
 				attendeeEmail: email,
-				price: parseInt(item.amount || amount, 10),
+				// Only ever this line item's own amount. Falling back to the ORDER total here
+				// priced every amount-less line of a multi-ticket order at the whole order's
+				// value, which then went straight into that event's rolled-up ticket revenue.
+				// (A payload with no `items` array at all still prices correctly: the single
+				// item parseZeffyPayload synthesizes for it carries the order amount as its own.)
+				price: parseInt(item.amount, 10) || 0,
 				currency,
 				status: 'VALID',
 				paymentMode: 'LIVE',
@@ -79,9 +85,14 @@ export async function persistZeffyPayment(databases, parsed, log) {
 			ticketsSaved++;
 		} catch (err) {
 			if (!isConflict(err)) throw err;
+			ticketsAlreadyPresent++;
 			if (log) log(`Ticket ${ticketCode} already recorded -- skipping.`);
 		}
 	}
 
-	return { orderCreated, ticketsSaved };
+	// ticketsSaved + ticketsAlreadyPresent === items.length on a healthy run. Reported (rather
+	// than only counting what was created) so the reconciliation job can tell "this order was
+	// already complete" apart from "this order exists but its tickets are missing" -- an existing
+	// order row on its own was never proof that its tickets landed.
+	return { orderCreated, ticketsSaved, ticketsAlreadyPresent, ticketsExpected: items.length };
 }

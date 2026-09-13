@@ -52,7 +52,7 @@
 			"enabled": true,
 			"logging": true,
 			"runtime": "node-16.0",
-			"scopes": [],
+			"scopes": ["users.read"],
 			"events": [],
 			"schedule": "",
 			"timeout": 15,
@@ -134,12 +134,16 @@
 		},
 		{
 			"$id": "6a9c5c1acb643536564a",
-			"execute": ["users"],
+			"execute": [
+				"team:68e35aed00144b8cde9d",
+				"team:68ffcecc0026f78f0af8",
+				"team:6a9cbb1c95ea7d59dd8c"
+			],
 			"name": "Giftcard-Lookup",
 			"enabled": true,
 			"logging": true,
 			"runtime": "node-16.0",
-			"scopes": ["documents.read"],
+			"scopes": ["documents.read", "documents.write", "users.read"],
 			"events": [],
 			"schedule": "",
 			"timeout": 15,
@@ -230,12 +234,16 @@
 		},
 		{
 			"$id": "6a9cd1ed552967ba3560",
-			"execute": ["users"],
+			"execute": [
+				"team:68e35aed00144b8cde9d",
+				"team:68ffcecc0026f78f0af8",
+				"team:6a9cbb1c95ea7d59dd8c"
+			],
 			"name": "Transaction-EmailReceipt",
 			"enabled": true,
 			"logging": true,
 			"runtime": "node-16.0",
-			"scopes": ["documents.read"],
+			"scopes": ["documents.read", "documents.write", "users.read"],
 			"events": [],
 			"schedule": "",
 			"timeout": 15,

@@ -16,8 +16,8 @@ const pastEvent = (id, overrides = {}) => ({
 	$id: id,
 	name: "Past Event",
 	date: "2020-01-01T01:00:00.000Z", // always in the past relative to any test run
-	event_start: 7,
-	event_end: 4,
+	barOpenTime: "19:00",
+	barCloseTime: "04:00",
 	...overrides,
 });
 
@@ -25,8 +25,8 @@ const futureEvent = (id) => ({
 	$id: id,
 	name: "Future Event",
 	date: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
-	event_start: 7,
-	event_end: 4,
+	barOpenTime: "19:00",
+	barCloseTime: "04:00",
 });
 
 function wireCollections({ events = [], categories = [], ingredients = [], transactions = [], tickets = [] } = {}) {
@@ -52,17 +52,30 @@ describe("Admin-RollupEventSales", () => {
 		const result = await handler(ctx);
 
 		expect(result.statusCode).toBe(200);
-		expect(result.body).toEqual({ processed: 0, updated: [], failures: [] });
+		expect(result.body).toEqual({ processed: 0, updated: [], failures: [], skipped: [], needsReview: [] });
 		expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
 	});
 
-	test("skips an event with no date", async () => {
-		wireCollections({ events: [{ $id: "no-date", name: "No Date", event_start: 7, event_end: 4 }] });
+	test("skips an event with no date, silently", async () => {
+		wireCollections({ events: [{ $id: "no-date", name: "No Date", barOpenTime: "19:00", barCloseTime: "04:00" }] });
 		const ctx = makeContext({ body: {} });
 
 		const result = await handler(ctx);
 
-		expect(result.body).toEqual({ processed: 0, updated: [], failures: [] });
+		expect(result.body).toEqual({ processed: 0, updated: [], failures: [], skipped: [], needsReview: [] });
+	});
+
+	test("reports (and does not zero out) an event whose window is degenerate", async () => {
+		// open === close is a 0-length window: it matches no transactions, and writing that result
+		// would overwrite the event's real figures with zeroes and count as a success.
+		wireCollections({ events: [pastEvent("degenerate", { barOpenTime: "20:00", barCloseTime: "20:00" })] });
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(result.body.processed).toBe(0);
+		expect(result.body.skipped).toEqual([{ id: "degenerate", name: "Past Event", reason: expect.stringMatching(/no usable sales window/i) }]);
+		expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
 	});
 
 	test("rolls up sales for a past event and writes them onto the event document", async () => {
@@ -138,6 +151,138 @@ describe("Admin-RollupEventSales", () => {
 		expect(queries).toContain('notEqual("testing", true)');
 		expect(queries.some((q) => q.startsWith("greaterThanEqual"))).toBe(true);
 		expect(queries.some((q) => q.startsWith("lessThanEqual"))).toBe(true);
+	});
+
+	describe("the window the transaction query is scoped to", () => {
+		function windowOf(result) {
+			const call = mockDatabases.listDocuments.mock.calls.find((c) => c[1] === TRANSACTIONS_ID);
+			const from = call[2].find((q) => q.startsWith("greaterThanEqual"));
+			const to = call[2].find((q) => q.startsWith("lessThanEqual"));
+			const iso = (q) => q.match(/"([^"]+T[^"]+)"/)[1];
+			return new Date(iso(to)).getTime() - new Date(iso(from)).getTime();
+		}
+
+		test("comes from the admin-editable bar hours, not from event_start/event_end", async () => {
+			// The admin app writes only barOpenTime/barCloseTime -- event_start/event_end are not
+			// editable anywhere, so honouring them meant shortening an event's bar hours moved
+			// Verify-Pin's window and left this one frozen, folding the tail into the event.
+			wireCollections({ events: [pastEvent("e1", { barOpenTime: "22:00", barCloseTime: "02:00", event_start: 22, event_end: 4 })] });
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.updated).toEqual(["e1"]);
+			expect(windowOf(result)).toBe(4 * 60 * 60 * 1000); // bar hours, not the 6h event_start/end span
+		});
+
+		test("falls back to event_start/event_end for a row with no bar hours set", async () => {
+			wireCollections({ events: [pastEvent("e1", { barOpenTime: null, barCloseTime: null, event_start: 8, event_end: 3 })] });
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			await handler(ctx);
+
+			expect(windowOf()).toBe(7 * 60 * 60 * 1000);
+		});
+	});
+
+	describe("attributing tickets when the same event name runs more than once", () => {
+		const occurrence = (id, dateIso) => ({
+			$id: id,
+			name: "Goth Night",
+			date: dateIso,
+			barOpenTime: "22:00",
+			barCloseTime: "02:00",
+		});
+
+		function ticketQueriesFor(callIndex) {
+			return mockDatabases.listDocuments.mock.calls.filter((c) => c[1] === TICKETS_ID)[callIndex][2];
+		}
+
+		test("a name that occurs once is matched with no date bound at all", async () => {
+			// Unbounded is what keeps a LATE-written ticket counted -- a door sale rung up after
+			// close, or a Zeffy payment recovered days later by Admin-VerifyZeffyTickets.
+			wireCollections({ events: [pastEvent("e1")], transactions: [] });
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			await handler(ctx);
+
+			const queries = ticketQueriesFor(0);
+			expect(queries.some((q) => q.startsWith("greaterThanEqual") || q.startsWith("lessThanEqual"))).toBe(false);
+		});
+
+		test("two occurrences split the timeline between them instead of each counting the other's tickets", async () => {
+			const first = occurrence("jan", "2020-01-05T22:00:00.000Z");
+			const second = occurrence("feb", "2020-02-05T22:00:00.000Z");
+			wireCollections({ events: [first, second], transactions: [] });
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.updated).toEqual(["jan", "feb"]);
+			const janQueries = ticketQueriesFor(0);
+			const febQueries = ticketQueriesFor(1);
+			// January is bounded above only, February below only -- the same midpoint instant.
+			const janUpper = janQueries.find((q) => q.startsWith("lessThanEqual"));
+			const febLower = febQueries.find((q) => q.startsWith("greaterThanEqual"));
+			expect(janUpper).toBeDefined();
+			expect(febLower).toBeDefined();
+			expect(janQueries.some((q) => q.startsWith("greaterThanEqual"))).toBe(false);
+			expect(febQueries.some((q) => q.startsWith("lessThanEqual"))).toBe(false);
+			// the same split instant, with February starting 1ms after January's inclusive bound
+			const msOf = (q) => new Date(q.match(/"([^"]+T[^"]+)"/)[1]).getTime();
+			expect(msOf(febLower) - msOf(janUpper)).toBe(1);
+		});
+
+		test("a still-future occurrence still bounds the past one", async () => {
+			const past = occurrence("past", "2020-01-05T22:00:00.000Z");
+			const future = occurrence("future", new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString());
+			wireCollections({ events: [past, future], transactions: [] });
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.updated).toEqual(["past"]);
+			expect(ticketQueriesFor(0).some((q) => q.startsWith("lessThanEqual"))).toBe(true);
+		});
+	});
+
+	test("refuses to erase an event's recorded ticket revenue when the name no longer matches any ticket", async () => {
+		// The tickets keep the old eventName after a rename; the write below is an unconditional
+		// overwrite, so this used to zero out real, already-banked ticket revenue with nothing
+		// logged.
+		wireCollections({
+			events: [pastEvent("renamed", { name: "HAX 7.0 EDM Community Nite", revenue: 81384, pos_revenue: 61650 })],
+			transactions: [],
+			tickets: [],
+		});
+		mockDatabases.updateDocument.mockResolvedValue({});
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		expect(result.body.updated).toEqual([]);
+		expect(result.body.needsReview).toEqual([{ id: "renamed", name: "HAX 7.0 EDM Community Nite", reason: expect.stringMatching(/renamed/i) }]);
+	});
+
+	test("still rolls up an event that has recorded revenue but never had any ticket revenue", async () => {
+		wireCollections({
+			events: [pastEvent("pos-only", { revenue: 61650, pos_revenue: 61650 })],
+			transactions: [{ cart: JSON.stringify([]), tip: 0, discount: 0, total: 1000, payment_due: 1000 }],
+			tickets: [],
+		});
+		mockDatabases.updateDocument.mockResolvedValue({});
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(result.body.updated).toEqual(["pos-only"]);
+		expect(result.body.needsReview).toEqual([]);
 	});
 
 	test("processes multiple due events independently and reports per-event failures", async () => {

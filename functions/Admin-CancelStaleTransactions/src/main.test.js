@@ -130,9 +130,133 @@ describe("Admin-CancelStaleTransactions", () => {
 
 			expect(result.body.cancelled).toBe(0);
 			expect(result.body.needsManualReview).toEqual([
-				{ transactionId: "t1", reason: expect.stringMatching(/captured stripe leg/i) },
+				{ transactionId: "t1", reason: expect.stringMatching(/stripe 1000 \(pi_1\)/i) },
 			]);
 			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("skips auto-cancelling a transaction with a recorded CASH leg instead of silently cancelling it", async () => {
+			// The money is already in the drawer: cancelling the row outright leaves that cash
+			// corresponding to no recorded sale, and (before this) it wasn't even reported.
+			mockDatabases.listDocuments.mockResolvedValue({
+				documents: [docWithLegs("t1", [{ method: "cash", amount: 2000 }])],
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.cancelled).toBe(0);
+			expect(result.body.needsManualReview).toEqual([{ transactionId: "t1", reason: expect.stringMatching(/cash 2000/i) }]);
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("skips a part-cash/part-giftcard split rather than cancelling and reversing half of it", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({
+				documents: [
+					docWithLegs("t1", [
+						{ method: "giftcard", amount: 500, giftcardId: "gc1" },
+						{ method: "cash", amount: 2000 },
+					]),
+				],
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.cancelled).toBe(0);
+			expect(result.body.needsManualReview).toHaveLength(1);
+			// the giftcard leg must NOT be credited back on its own -- a human settles the whole row
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("skips a leg whose method this sweep has never heard of", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({
+				documents: [docWithLegs("t1", [{ method: "interac", amount: 900 }])],
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.cancelled).toBe(0);
+			expect(result.body.needsManualReview).toHaveLength(1);
+		});
+
+		test("skips a transaction carrying a stripe_id even with no recorded legs at all", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({
+				documents: [{ $id: "t1", status: "pending", stripe_id: "pi_legacy" }],
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.cancelled).toBe(0);
+			expect(result.body.needsManualReview).toEqual([{ transactionId: "t1", reason: expect.stringMatching(/pi_legacy/) }]);
+		});
+
+		describe("flagging cancellations that may already have been charged", () => {
+			test("a card sale with no recorded leg is still cancelled, but reported as possibly charged", async () => {
+				// Exactly the shape a captured card that failed to record leaves behind: the charge
+				// went through Stripe, no leg was ever written, payment_due is still the full amount.
+				mockDatabases.listDocuments.mockResolvedValue({
+					documents: [{ $id: "t1", status: "pending", payment_method: "stripe", payment_due: 1200 }],
+				});
+				mockDatabases.updateDocument.mockResolvedValue({});
+				const ctx = makeContext({ body: {} });
+
+				const result = await handler(ctx);
+
+				expect(result.body.cancelled).toBe(1);
+				expect(result.body.cancelledPossiblyCharged).toEqual([
+					{ transactionId: "t1", paymentMethod: "stripe", amount: 1200, reason: expect.stringMatching(/reconcile against Stripe/i) },
+				]);
+			});
+
+			test("flags a split and a giftcard+stripe sale the same way", async () => {
+				mockDatabases.listDocuments.mockResolvedValue({
+					documents: [
+						{ $id: "split-tx", status: "pending", payment_method: "split", payment_due: 4000 },
+						{ $id: "gc-card-tx", status: "pending", payment_method: "giftcard+stripe", payment_due: 1500 },
+					],
+				});
+				mockDatabases.updateDocument.mockResolvedValue({});
+				const ctx = makeContext({ body: {} });
+
+				const result = await handler(ctx);
+
+				expect(result.body.cancelled).toBe(2);
+				expect(result.body.cancelledPossiblyCharged.map((f) => f.transactionId)).toEqual(["split-tx", "gc-card-tx"]);
+			});
+
+			test("a plain cash sale that never took any money is cancelled with no flag", async () => {
+				mockDatabases.listDocuments.mockResolvedValue({
+					documents: [{ $id: "t1", status: "pending", payment_method: "cash", payment_due: 800 }],
+				});
+				mockDatabases.updateDocument.mockResolvedValue({});
+				const ctx = makeContext({ body: {} });
+
+				const result = await handler(ctx);
+
+				expect(result.body.cancelled).toBe(1);
+				expect(result.body.cancelledPossiblyCharged).toEqual([]);
+			});
+
+			test("a card-intent transaction that failed to cancel isn't reported as a cancellation", async () => {
+				mockDatabases.listDocuments.mockResolvedValue({
+					documents: [{ $id: "t1", status: "pending", payment_method: "stripe", payment_due: 1200 }],
+				});
+				mockDatabases.updateDocument.mockRejectedValue(new Error("locked"));
+				const ctx = makeContext({ body: {} });
+
+				const result = await handler(ctx);
+
+				expect(result.body.cancelled).toBe(0);
+				expect(result.body.cancelledPossiblyCharged).toEqual([]);
+				expect(result.body.failures).toEqual([{ transactionId: "t1", error: "locked" }]);
+			});
 		});
 
 		test("a mixed run: one plain cancel, one giftcard reversal, one skipped stripe leg", async () => {

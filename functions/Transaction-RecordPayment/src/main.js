@@ -2,6 +2,7 @@ import Stripe from 'stripe';
 import { Databases, Query } from 'node-appwrite';
 import fetch from 'node-fetch';
 import { createAppwriteClient } from './appwriteClient.js';
+import { cartItemIds, parseCart, priceTransaction } from './pricing.js';
 
 // Records one payment leg (cash amount, verified card charge, or giftcard
 // redemption) against a pending transaction, appending it to the
@@ -16,11 +17,26 @@ import { createAppwriteClient } from './appwriteClient.js';
 // did -- a card leg is independently verified against the real Stripe API
 // (status + amount), a giftcard leg re-reads the actual current balance --
 // never trusting client-supplied amounts for anything but the split itself.
+// The transaction's own `cart` is re-priced here too (see the note by the
+// call to repriceTransaction): `payment_due` is written by the client, so on
+// its own it is not evidence of anything.
 const DATABASE_ID = '67c9ffd9003d68236514';
 const TRANSACTIONS_COLLECTION_ID = '68e4cd3500179ce661c6';
 const GIFTCARDS_COLLECTION_ID = 'giftcards';
 const EVENTS_COLLECTION_ID = '68e400210008d19bb5c9';
+const POS_ITEMS_COLLECTION_ID = 'pos_items';
+const DISCOUNTS_COLLECTION_ID = 'discounts';
 const ALLOWED_METHODS = ['cash', 'stripe', 'giftcard'];
+// How many pos_items ids to resolve per listDocuments call -- a real cart is
+// a handful of lines, this only exists so a pathological one still works.
+const ITEM_LOOKUP_CHUNK = 50;
+// Membership dues are not a pos_items cart: the kiosk rings one synthetic
+// "Membership Dues" line with no $id, so the server price for that channel is
+// the dues amount itself. Kept in sync by hand with MEMBERSHIP_DUES_CENTS in
+// POS/src/components/selfCheckout/selfCheckout.js -- and used only as a floor
+// (see the re-pricing note below), so if dues are ever raised there first, a
+// payment for the new higher amount still completes normally.
+const MEMBERSHIP_DUES_CENTS = 4000;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // Every email this system sends CCs this address and closes with the same contact line -- see
 // the identical constants in Transaction-EmailReceipt/Admin-EmailDj/Admin-EmailBartender/
@@ -39,6 +55,11 @@ export default async ({ req, res, log, error }) => {
 	const transactionId = body.transactionId;
 	const method = body.method;
 	const amount = parseInt(body.amount);
+	// Per-leg idempotency key, generated once by the client and re-sent
+	// unchanged on every retry of the SAME leg (POS/src/utils/splitPayment.js's
+	// newLegId). Optional rather than required so a caller that predates it
+	// still works -- it just doesn't get replay protection.
+	const legId = typeof body.legId === 'string' && body.legId.length > 0 && body.legId.length <= 64 ? body.legId : null;
 
 	if (!transactionId || !ALLOWED_METHODS.includes(method)) {
 		return res.json({ error: `method must be one of: ${ALLOWED_METHODS.join(', ')}` }, 400);
@@ -58,6 +79,32 @@ export default async ({ req, res, log, error }) => {
 		return res.json({ error: 'Transaction not found' }, 404);
 	}
 
+	let payments;
+	try {
+		payments = JSON.parse(transaction.payments || '[]');
+	} catch (err) {
+		payments = [];
+	}
+	if (!Array.isArray(payments)) payments = [];
+
+	// Replay protection. The client retries a leg whose response never arrived
+	// (an Appwrite execution that already committed its writes isn't cancelled
+	// by the tablet losing the reply), so "same leg sent twice" is a normal
+	// event, not an attack: recognise it and report the state that leg already
+	// produced instead of appending a second one and debiting the customer
+	// twice. Deliberately ahead of the pending check -- a retry of the leg that
+	// finished the sale has to succeed idempotently, not come back as "this
+	// transaction is not pending".
+	if (legId && payments.some((recorded) => recorded && recorded.legId === legId)) {
+		log(`Leg ${legId} was already recorded on ${transactionId} -- returning the existing state`);
+		return res.json({
+			ok: true,
+			remaining: parseInt(transaction.payment_due) || 0,
+			status: transaction.status,
+			replay: true,
+		});
+	}
+
 	if (transaction.status !== 'pending') {
 		return res.json({ error: `Transaction is not pending (status: ${transaction.status})` }, 400);
 	}
@@ -71,12 +118,62 @@ export default async ({ req, res, log, error }) => {
 		return res.json({ error: 'Self-checkout transactions can only be paid by card' }, 400);
 	}
 
-	const paymentDue = parseInt(transaction.payment_due) || 0;
+	// Re-price the cart server-side before looking at any client-supplied
+	// balance. `cart`, `total`, `discount` and `payment_due` are all written
+	// by the same client that's now asking to record a payment (Transactions
+	// is create("users")), so `amount <= payment_due` on its own compares a
+	// client number to a client number: a $100 cart created with
+	// `payment_due: 1` passes every other check in this function. `pricing.total`
+	// is what this sale is worth according to `pos_items.sale_price` and the
+	// `discounts` collection.
+	//
+	// It is used as a FLOOR on what must be paid before the transaction may
+	// reach `complete`, never as a cap on a single leg -- a price edited
+	// between ringing up the cart and tapping the card must not be able to
+	// make this function refuse a leg Stripe has already captured.
+	//
+	// And that is the whole rule for what a bad re-price may do, because this
+	// function runs AFTER the reader has captured: re-pricing may DETECT a
+	// problem, it may never turn an already-captured payment into one that
+	// cannot be written down (that is P0-1, the worst bug in the system). So:
+	//
+	//   * a leg carrying money that is already gone (`stripe`: the intent is
+	//     verified `succeeded` below) is always recorded, with the reason
+	//     stamped onto the leg itself, returned to the till as `warning`, and
+	//     logged at error level. The server floor still applies, so an
+	//     underpaid sale stays `pending` with the balance visible rather than
+	//     silently completing;
+	//   * a cart that cannot be priced at all refuses every OTHER leg here,
+	//     which is BEFORE anything irreversible happens -- the giftcard is not
+	//     debited until further down, and cash is still in the drawer.
+	//
+	// An unverifiable *discount* is not a refusal in either case: it is simply
+	// not applied, which moves the price up, never down. That is flagged (it
+	// leaves a real balance the till has to deal with) but it is not "this sale
+	// cannot be priced".
+	const pricing = await repriceTransaction(databases, transaction, error);
+	let priceWarning = null;
+	if (!pricing.trusted) {
+		error(`Server-side re-pricing of ${transactionId} is not trustworthy: ${pricing.reason}`);
+		if (!pricing.priceable && method !== 'stripe') {
+			return pricing.unavailable
+				? res.json({ error: 'Failed to verify this sale', reason: pricing.reason }, 500)
+				: res.json({ error: 'This sale could not be priced server-side', reason: pricing.reason }, 400);
+		}
+		priceWarning = pricing.reason;
+	}
+
+	const alreadyPaid = payments.reduce((sum, recorded) => sum + (parseInt(recorded && recorded.amount) || 0), 0);
+
+	const storedDue = parseInt(transaction.payment_due) || 0;
+	const serverDue = Math.max(pricing.total - alreadyPaid, 0);
+	const paymentDue = Math.max(storedDue, serverDue);
 	if (amount > paymentDue) {
 		return res.json({ error: `Amount ${amount} exceeds remaining balance ${paymentDue}` }, 400);
 	}
 
 	const leg = { method, amount };
+	if (legId) leg.legId = legId;
 	let tipDelta = 0;
 
 	if (method === 'giftcard') {
@@ -155,8 +252,27 @@ export default async ({ req, res, log, error }) => {
 		if (paymentIntent.status !== 'succeeded') {
 			return res.json({ error: `PaymentIntent is not succeeded (status: ${paymentIntent.status})` }, 400);
 		}
-		if (paymentIntent.amount !== amount) {
-			error(`PaymentIntent amount ${paymentIntent.amount} does not match leg amount ${amount}`);
+		// A card-present sale can pick up a tip on the reader itself: the POS
+		// charges with `config_override.update_payment_intent: true`, whose
+		// whole purpose is to let the reader rewrite the intent's amount to
+		// "cart total + tip" and report the tip back separately in
+		// `amount_details.tip.amount`. So what has to equal this leg is the
+		// captured amount MINUS that tip, not the captured amount: requiring
+		// strict equality made a tipped card sale impossible to record at all
+		// (claiming the tip-inclusive amount as the leg instead just fails the
+		// payment_due check above, since a tip isn't payment toward the cart).
+		//
+		// The anti-forgery property is unchanged -- both numbers still come
+		// from Stripe, so a caller still can't claim a leg larger than what
+		// was actually captured for the cart, and an overpayment that is NOT a
+		// declared tip is still rejected. The tip is clamped into
+		// [0, captured] first so a malformed `amount_details` can't be used to
+		// inflate the base.
+		const capturedAmount = parseInt(paymentIntent.amount) || 0;
+		const reportedTip = parseInt(paymentIntent.amount_details?.tip?.amount) || 0;
+		const tip = Math.min(Math.max(reportedTip, 0), capturedAmount);
+		if (capturedAmount - tip !== amount) {
+			error(`PaymentIntent amount ${capturedAmount} (tip ${tip}) does not match leg amount ${amount}`);
 			return res.json({ error: 'PaymentIntent amount does not match this payment leg' }, 400);
 		}
 
@@ -171,11 +287,23 @@ export default async ({ req, res, log, error }) => {
 			return res.json({ error: 'PaymentIntent was not created for this transaction' }, 400);
 		}
 
-		// Anti-reuse: even with matching metadata, confirm this exact
-		// PaymentIntent hasn't already been recorded as a leg on some OTHER
-		// transaction. `stripe_id` is kept in sync below whenever a stripe leg
-		// is recorded, so this Query.equal lookup catches reuse regardless of
-		// which transaction the id was originally recorded against.
+		// Anti-reuse, this transaction: a retry that lost its `legId` (or a
+		// second call hand-made from the same PaymentIntent) would otherwise
+		// sail past every check while the sale is still part-paid, appending
+		// the same card charge twice. `payments` is the authoritative list --
+		// `stripe_id` on the document only remembers the last of several card
+		// legs.
+		if (payments.some((recorded) => recorded && recorded.stripeId === paymentIntent.id)) {
+			error(`PaymentIntent ${paymentIntent.id} is already recorded as a leg on ${transactionId}`);
+			return res.json({ error: 'This payment has already been recorded on this transaction' }, 400);
+		}
+
+		// Anti-reuse, other transactions: even with matching metadata, confirm
+		// this exact PaymentIntent hasn't already been recorded as a leg on
+		// some OTHER transaction. `stripe_id` is kept in sync below whenever a
+		// stripe leg is recorded, so this Query.equal lookup catches reuse
+		// regardless of which transaction the id was originally recorded
+		// against.
 		let reuseCheck;
 		try {
 			reuseCheck = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION_ID, [
@@ -191,20 +319,27 @@ export default async ({ req, res, log, error }) => {
 			return res.json({ error: 'This payment has already been used on another transaction' }, 400);
 		}
 
-		tipDelta = parseInt(paymentIntent.amount_details?.tip?.amount || 0);
+		// `leg.amount` stays tip-exclusive and the tip is carried alongside it
+		// -- the convention Transactions.tip, Events.tips_earned and
+		// derivePaymentLegs already assume.
+		tipDelta = tip;
 		leg.stripeId = paymentIntent.id;
 		leg.tip = tipDelta;
 	}
 
-	let payments;
-	try {
-		payments = JSON.parse(transaction.payments || '[]');
-	} catch (err) {
-		payments = [];
-	}
+	// Stamped onto the leg itself (not just logged) so the flag survives in the
+	// document: `payments` is what every report, receipt and refund reads, so a
+	// sale recorded on a price the server could not stand behind is visible
+	// wherever that sale is, not only in one function's execution log.
+	if (priceWarning) leg.priceWarning = priceWarning;
+
 	payments.push(leg);
 
-	const newPaymentDue = Math.max(paymentDue - amount, 0);
+	// The transaction is only finished once BOTH ledgers are satisfied: what
+	// the document says is outstanding, and what the cart is actually worth
+	// server-side. A forged `payment_due` therefore no longer buys a
+	// `complete` sale -- the remainder stays visible as payment_due.
+	const newPaymentDue = Math.max(Math.max(storedDue - amount, 0), Math.max(pricing.total - alreadyPaid - amount, 0));
 	const newStatus = newPaymentDue <= 0 ? 'complete' : 'pending';
 	// Only one leg so far -> keep the legacy single-method label for
 	// backward-compatible display; more than one -> "split". Purely
@@ -221,9 +356,49 @@ export default async ({ req, res, log, error }) => {
 			// Kept in sync (not just appended into `payments`) so the reuse-guard
 			// Query.equal lookup above can find this leg from a future request.
 			...(method === 'stripe' ? { stripe_id: leg.stripeId } : {}),
+			// Same idea for the giftcard total: `giftcard_amount` is the field
+			// every report's legacy derivation buckets gift-card revenue from,
+			// and nothing had been writing it since this function replaced
+			// Transaction-ApplyGiftcard -- which is how gift-card redemptions
+			// end up reported (and refunded) as cash. Rows written from here
+			// carry `payments`, so their legs are read from that directly, but
+			// leaving the column silently wrong for new rows is what created
+			// the problem in the first place.
+			...(method === 'giftcard'
+				? { giftcard_amount: (parseInt(transaction.giftcard_amount) || 0) + amount }
+				: {}),
 		});
 	} catch (err) {
 		error('Failed to record payment leg: ' + err.message);
+		// The giftcard was debited ~100 lines above and that write has already
+		// committed on its own -- Appwrite gives no multi-document transaction
+		// here. Nothing downstream can put it back either: Transaction-SetStatus
+		// and Admin-CancelStaleTransactions both reverse from `payments`, which
+		// this leg never reached. So credit it back here, and if even that
+		// fails, say so in terms someone can act on rather than returning a bare
+		// "Failed to update transaction" over a customer's missing money (P0-13).
+		if (method === 'giftcard') {
+			try {
+				const current = await databases.getDocument(DATABASE_ID, GIFTCARDS_COLLECTION_ID, leg.giftcardId);
+				await databases.updateDocument(DATABASE_ID, GIFTCARDS_COLLECTION_ID, leg.giftcardId, {
+					balance: (parseInt(current.balance) || 0) + amount,
+				});
+				log(`Credited ${amount} back to giftcard ${leg.giftcardId} after the leg write failed`);
+				return res.json({ error: 'Failed to update transaction', giftcardRestored: true }, 500);
+			} catch (creditErr) {
+				error(
+					`ORPHANED GIFTCARD DEBIT -- giftcard ${leg.giftcardId} was debited ${amount} for transaction ${transactionId}, the leg could not be recorded, and the credit-back also failed (${creditErr.message}). This balance must be restored by hand.`,
+				);
+				return res.json(
+					{
+						error: 'Failed to update transaction',
+						giftcardRestored: false,
+						manualCredit: { giftcardId: leg.giftcardId, amount },
+					},
+					500,
+				);
+			}
+		}
 		return res.json({ error: 'Failed to update transaction' }, 500);
 	}
 
@@ -256,8 +431,85 @@ export default async ({ req, res, log, error }) => {
 		}
 	}
 
-	return res.json({ ok: true, remaining: newPaymentDue, status: newStatus });
+	// `warning` is the till-facing half of the flag: the payment IS recorded
+	// (ok: true), but staff are told the sale could not be verified against the
+	// catalogue, and `remaining` shows exactly what the server still thinks is
+	// outstanding -- never a silent rejection of money that was taken.
+	return res.json({
+		ok: true,
+		remaining: newPaymentDue,
+		status: newStatus,
+		...(priceWarning
+			? { warning: `Recorded, but this sale could not be fully verified server-side: ${priceWarning}` }
+			: {}),
+	});
 };
+
+// Resolves what this transaction is actually worth, server-side. Never throws:
+// a pos_items/discounts collection this function cannot read is reported as an
+// untrusted price (`unavailable: true`) rather than as an exception, because
+// the caller's only two options at that point are "refuse" and "record and
+// flag", and which of those is safe depends on whether money has already
+// changed hands -- not on whether Appwrite happened to answer. A failed read
+// still never prices the cart at zero: `total` is 0 and `trusted` is false, so
+// the client's own stored balance becomes the floor and the sale is flagged.
+async function repriceTransaction(databases, transaction, error) {
+	if (transaction.channel === 'membership') {
+		return {
+			ok: true,
+			trusted: true,
+			reason: null,
+			subtotal: MEMBERSHIP_DUES_CENTS,
+			discount: 0,
+			discountVerified: true,
+			total: MEMBERSHIP_DUES_CENTS,
+		};
+	}
+
+	const cart = parseCart(transaction.cart);
+	if (!cart) {
+		return { ok: false, trusted: false, reason: 'cart is missing or unreadable', subtotal: 0, discount: 0, discountVerified: false, total: 0 };
+	}
+
+	const salePriceById = {};
+	const ids = cartItemIds(cart);
+	let discountOptions = [];
+	try {
+		for (let i = 0; i < ids.length; i += ITEM_LOOKUP_CHUNK) {
+			const chunk = ids.slice(i, i + ITEM_LOOKUP_CHUNK);
+			const result = await databases.listDocuments(DATABASE_ID, POS_ITEMS_COLLECTION_ID, [
+				Query.equal('$id', chunk),
+				Query.limit(chunk.length),
+			]);
+			(result?.documents || []).forEach((item) => {
+				const salePrice = parseInt(item.sale_price);
+				if (Number.isFinite(salePrice)) salePriceById[item.$id] = salePrice;
+			});
+		}
+
+		// Only two discounts exist and they're only needed when the transaction
+		// claims one, so this read is skipped on the overwhelming majority of
+		// sales.
+		if ((parseInt(transaction.discount) || 0) > 0) {
+			const result = await databases.listDocuments(DATABASE_ID, DISCOUNTS_COLLECTION_ID, [Query.limit(100)]);
+			discountOptions = result?.documents || [];
+		}
+	} catch (err) {
+		error('Failed to re-price cart: ' + err.message);
+		return {
+			ok: false,
+			trusted: false,
+			unavailable: true,
+			reason: 'the item/discount catalogue could not be read: ' + err.message,
+			subtotal: 0,
+			discount: 0,
+			discountVerified: false,
+			total: 0,
+		};
+	}
+
+	return priceTransaction({ cart, discount: transaction.discount }, { salePriceById, discountOptions });
+}
 
 async function notifyFinanceOfMembershipPayment({ to, name, email, amount, date }) {
 	const amountStr = new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(

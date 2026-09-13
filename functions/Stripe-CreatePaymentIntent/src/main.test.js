@@ -12,7 +12,7 @@ describe("Stripe-CreatePaymentIntent", () => {
 	describe("SkullPOS's { test, amount } shape", () => {
 		test("creates an intent with the test key and returns it nested under `intent`, unchanged", async () => {
 			mockStripe.paymentIntents.create.mockResolvedValue({ id: "pi_1", client_secret: "secret_1" });
-			const ctx = makeContext({ body: { test: "test", amount: 500 } });
+			const ctx = makeContext({ body: { test: "test", amount: 500, transactionId: "txn_abc" } });
 
 			const result = await handler(ctx);
 
@@ -22,11 +22,12 @@ describe("Stripe-CreatePaymentIntent", () => {
 				currency: 'cad',
 				payment_method_types: ['card_present', 'interac_present'],
 				capture_method: 'automatic',
+				metadata: { transactionId: "txn_abc" },
 			});
 			expect(mockStripe.lastConstructedWithKey).toBe("sk_test_fake");
 		});
 
-		test("passes transactionId through as PaymentIntent metadata when provided", async () => {
+		test("passes transactionId through as PaymentIntent metadata", async () => {
 			mockStripe.paymentIntents.create.mockResolvedValue({ id: "pi_1", client_secret: "secret_1" });
 			const ctx = makeContext({ body: { test: "test", amount: 500, transactionId: "txn_abc" } });
 
@@ -37,19 +38,24 @@ describe("Stripe-CreatePaymentIntent", () => {
 			);
 		});
 
-		test("omits metadata entirely when no transactionId is provided", async () => {
+		// The server half of P0-1. An unstamped intent is still chargeable and captures
+		// immediately, and Transaction-RecordPayment then refuses the leg for want of the stamp:
+		// money taken, sale unrecordable. Refusing to mint it is free -- nothing has been captured
+		// at this point -- and it is what stops the POS and the server drifting apart again.
+		test.each([undefined, "", null, 123])("refuses to mint an intent with no usable transactionId (%p)", async (transactionId) => {
 			mockStripe.paymentIntents.create.mockResolvedValue({ id: "pi_1", client_secret: "secret_1" });
-			const ctx = makeContext({ body: { test: "test", amount: 500 } });
+			const ctx = makeContext({ body: { test: "test", amount: 500, transactionId } });
 
-			await handler(ctx);
+			const result = await handler(ctx);
 
-			const callArgs = mockStripe.paymentIntents.create.mock.calls[0][0];
-			expect(callArgs.metadata).toBeUndefined();
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(/transactionId is required/);
+			expect(mockStripe.paymentIntents.create).not.toHaveBeenCalled();
 		});
 
 		test("an empty test flag uses the live key", async () => {
 			mockStripe.paymentIntents.create.mockResolvedValue({ id: "pi_2", client_secret: "secret_2" });
-			const ctx = makeContext({ body: { test: "", amount: 1200 } });
+			const ctx = makeContext({ body: { test: "", amount: 1200, transactionId: "txn_abc" } });
 
 			await handler(ctx);
 
@@ -58,7 +64,7 @@ describe("Stripe-CreatePaymentIntent", () => {
 
 		test("a Stripe API failure returns a 500 with the error message", async () => {
 			mockStripe.paymentIntents.create.mockRejectedValue(new Error("stripe down"));
-			const ctx = makeContext({ body: { test: "test", amount: 500 } });
+			const ctx = makeContext({ body: { test: "test", amount: 500, transactionId: "txn_abc" } });
 
 			const result = await handler(ctx);
 
@@ -115,6 +121,18 @@ describe("Stripe-CreatePaymentIntent", () => {
 			expect(result.statusCode).toBe(500);
 			expect(result.body.error).toBe("card declined");
 		});
+	});
+
+	// ShottyTicketing's door sales have no Transactions row, so the requirement above must not
+	// reach them -- they are detected by their own fields, not by the absence of a transactionId.
+	test("a ticketing-shaped request is not subject to the transactionId requirement", async () => {
+		mockStripe.paymentIntents.create.mockResolvedValue({ client_secret: "pi_secret_123" });
+		const ctx = makeContext({ body: { amount: 3000, currency: "cad", isLive: true } });
+
+		const result = await handler(ctx);
+
+		expect(result.statusCode).toBe(200);
+		expect(result.body.clientSecret).toBe("pi_secret_123");
 	});
 
 	test("an invalid JSON body is rejected with a 400", async () => {

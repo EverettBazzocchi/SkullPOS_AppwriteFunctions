@@ -1,18 +1,21 @@
 import { Databases, Query } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
 
-// Returns the currently-active event, reduced to the handful of fields a door-ticketing client
-// legitimately needs to sell a ticket (name, price, currency, date/location for display).
+// Returns the currently-active event, reduced to the handful of fields a front-of-house client
+// legitimately needs: the door needs name/price/currency/date/location to sell a ticket, and the
+// register and menu boards need the alcohol gate (sellsAlcohol + the barOpenTime/barCloseTime
+// window) to decide whether the alcohol categories may be displayed and rung up.
 //
-// Why this exists at all rather than the client querying `Events` directly: ShottyTicketing's
-// door sessions authenticate as a single shared Quick Access account that belongs to no team,
-// while the Events collection is read-restricted to the admin team -- so the client's own read
-// 401s and the app silently falls back to a generic "Standard Entry Pass" label. The obvious
-// shortcut (granting that account read on Events) would hand a device sitting on the bar full
-// read access to every event's sales rollup -- revenue, profit, cogs, tips, cash/card splits --
-// since Appwrite permissions are per-collection, never per-field. This function is the field
-// filter that Appwrite itself can't express: it reads as the server, returns only what the door
-// needs, and never lets the financial columns off the box.
+// Why this exists at all rather than the client querying `Events` directly: every one of those
+// surfaces authenticates as an anonymous or shared session that belongs to no team, while the
+// Events collection is read-restricted to the admin team -- so the client's own read 401s. The
+// door app then silently falls back to a generic "Standard Entry Pass" label; the register and
+// the menu board silently treat the alcohol gate as closed and drop every alcohol item. The
+// obvious shortcut (granting those sessions read on Events) would hand a device sitting on the
+// bar -- or a menu board facing the room -- full read access to every event's sales rollup:
+// revenue, profit, cogs, tips, cash/card splits. Appwrite permissions are per-collection, never
+// per-field. This function is the field filter Appwrite itself can't express: it reads as the
+// server, returns only what the floor needs, and never lets the financial columns off the box.
 const DATABASE_ID = '67c9ffd9003d68236514';
 const EVENTS_COLLECTION_ID = '68e400210008d19bb5c9';
 
@@ -32,10 +35,24 @@ function toPublicEvent(doc) {
 		description: doc.description ?? null,
 		date: doc.date ?? null,
 		location: doc.location ?? null,
-		standardTicketPrice: parseInt(doc.standardTicketPrice) || DEFAULT_TICKET_PRICE_CENTS,
+		standardTicketPrice: normalizeTicketPrice(doc.standardTicketPrice),
 		currency: doc.currency || DEFAULT_CURRENCY,
 		isActive: doc.isActive === true,
+		// The alcohol gate. `sellsAlcohol` mirrors the column's own `false` default, and the two
+		// window strings stay raw "HH:mm" -- the clients already own the parsing (POS's
+		// isWithinBarHours) and all fail closed on null, so an unset window hides alcohol rather
+		// than opening the bar. None of these three carry any financial meaning.
+		sellsAlcohol: doc.sellsAlcohol === true,
+		barOpenTime: doc.barOpenTime ?? null,
+		barCloseTime: doc.barCloseTime ?? null,
 	};
+}
+
+// `|| DEFAULT` would rewrite a legitimately free (0-cent) event into a CA$30 charge, so the
+// fallback has to fire on "no usable number" only, not on falsiness.
+function normalizeTicketPrice(value) {
+	const price = parseInt(value, 10);
+	return Number.isFinite(price) ? price : DEFAULT_TICKET_PRICE_CENTS;
 }
 
 export default async ({ req, res, log, error }) => {

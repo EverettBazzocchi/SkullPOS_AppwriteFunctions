@@ -17,6 +17,17 @@ const GIFTCARDS_COLLECTION_ID = 'giftcards';
 const STALE_AFTER_MS = 60 * 60 * 1000; // 1 hour
 const PAGE_SIZE = 100;
 
+// The methods a transaction's `payment_method` can carry that mean "a card charge was part of
+// this sale's plan" -- set at creation time by the register/kiosk (POS/src/utils/checkout.js),
+// before the terminal is ever tapped. A stale pending row with one of these and NO recorded
+// stripe leg is ambiguous: usually an abandoned cart, but it is also the exact shape a card that
+// WAS captured and then failed to record leaves behind (the leg only exists once
+// Transaction-RecordPayment succeeds). Cancelling those is still right -- leaving every abandoned
+// tap-that-never-happened pending forever helps nobody -- but each one has to come out of the run
+// flagged, so the morning reconciliation can check it against Stripe instead of discovering it at
+// a chargeback.
+const CARD_CAPABLE_PAYMENT_METHODS = new Set(['stripe', 'giftcard+stripe', 'split']);
+
 // A split-tender sale can have one or more legs already recorded (by
 // Transaction-RecordPayment) against a transaction that's STILL "pending"
 // (e.g. giftcard covered part of the total, the card portion never
@@ -35,6 +46,40 @@ function getRecordedLegs(transaction) {
 	} catch (err) {
 		return [];
 	}
+}
+
+// A giftcard leg is the ONLY leg this unattended sweep knows how to reverse by itself (credit the
+// balance back -- a pure ledger fix, no external money movement). Everything else means real money
+// already moved outside this database: a stripe leg is a captured card that needs a real refund, a
+// cash leg is notes already in the drawer that need a manual payout/void decision. Enumerating
+// what to skip (the previous shape: `method === 'stripe'`) meant any method that wasn't explicitly
+// listed -- cash, and any method added later -- fell through to a silent cancel with no reversal
+// and no review entry, so the money it moved corresponded to no recorded sale. Enumerate what is
+// SAFE instead, and treat everything else as needing a human.
+function unreversibleLegs(legs) {
+	return legs.filter((leg) => leg.method !== 'giftcard');
+}
+
+/** Why this stale transaction may already have taken money, or null if there's no sign it did. */
+function chargeEvidence(transaction, legs) {
+	const risky = unreversibleLegs(legs);
+	if (risky.length > 0) {
+		const summary = risky.map((leg) => `${leg.method || 'unknown'} ${leg.amount}${leg.stripeId ? ` (${leg.stripeId})` : ''}`).join(', ');
+		return {
+			hard: true,
+			reason: `has recorded payment leg(s) this sweep cannot reverse on its own -- ${summary} -- settle them manually first`,
+		};
+	}
+	if (transaction.stripe_id) {
+		return { hard: true, reason: `carries stripe_id ${transaction.stripe_id} -- check Stripe and refund it properly before cancelling` };
+	}
+	if (CARD_CAPABLE_PAYMENT_METHODS.has(transaction.payment_method)) {
+		return {
+			hard: false,
+			reason: `cancelled, but payment_method "${transaction.payment_method}" means a card charge was started and no leg was ever recorded -- reconcile against Stripe`,
+		};
+	}
+	return null;
 }
 
 async function listStalePendingTransactions(databases, cutoffIso) {
@@ -79,22 +124,19 @@ export default async ({ req, res, log, error }) => {
 	let cancelled = 0;
 	const failures = [];
 	const needsManualReview = [];
+	const cancelledPossiblyCharged = [];
 
 	for (const transaction of staleTransactions) {
 		const legs = getRecordedLegs(transaction);
+		const evidence = chargeEvidence(transaction, legs);
 
-		// A stripe leg means real money was already captured -- reversing that is a real Stripe
-		// refund, not just a ledger fix, and this unattended daily sweep must never trigger one
-		// on its own. Skip it (not a "failure") and surface it so a human decides: refund it
+		// Hard evidence (an unreversible recorded leg, or a stripe_id on the row) means real money
+		// already moved and reversing it is not a status change this unattended sweep can make on
+		// its own. Skip it (not a "failure") and surface it so a human decides: refund/void it
 		// properly, or leave the sale as-is.
-		const stripeLegs = legs.filter((leg) => leg.method === 'stripe');
-		if (stripeLegs.length > 0) {
-			error(
-				`Skipping auto-cancel of ${transaction.$id}: it already has a captured card payment leg (${stripeLegs
-					.map((leg) => leg.stripeId)
-					.join(', ')}) that needs a real Stripe refund, not just a status change.`,
-			);
-			needsManualReview.push({ transactionId: transaction.$id, reason: 'has a captured stripe leg -- refund it manually first' });
+		if (evidence && evidence.hard) {
+			error(`Skipping auto-cancel of ${transaction.$id}: it ${evidence.reason}.`);
+			needsManualReview.push({ transactionId: transaction.$id, reason: evidence.reason });
 			continue;
 		}
 
@@ -109,6 +151,18 @@ export default async ({ req, res, log, error }) => {
 			error(`Failed to cancel transaction ${transaction.$id}: ` + err.message);
 			failures.push({ transactionId: transaction.$id, error: err.message });
 			continue;
+		}
+
+		// Soft evidence: cancelled, but it might have taken money without leaving a leg behind.
+		// Reported (and logged as an error, not a log line) so it lands in front of a human.
+		if (evidence) {
+			error(`Auto-cancelled ${transaction.$id} but it may already have been charged: ${evidence.reason}.`);
+			cancelledPossiblyCharged.push({
+				transactionId: transaction.$id,
+				paymentMethod: transaction.payment_method,
+				amount: transaction.payment_due,
+				reason: evidence.reason,
+			});
 		}
 
 		const giftcardLegs = legs.filter((leg) => leg.method === 'giftcard' && leg.giftcardId);
@@ -130,7 +184,8 @@ export default async ({ req, res, log, error }) => {
 
 	log(
 		`Cancelled ${cancelled}/${staleTransactions.length} stale pending transaction(s) (pending 1+ hour, cutoff ${cutoff.toISOString()}).` +
-			(needsManualReview.length > 0 ? ` ${needsManualReview.length} skipped for manual review (captured card leg).` : ''),
+			(needsManualReview.length > 0 ? ` ${needsManualReview.length} skipped for manual review (money already moved).` : '') +
+			(cancelledPossiblyCharged.length > 0 ? ` ${cancelledPossiblyCharged.length} cancelled but flagged as possibly charged.` : ''),
 	);
 
 	return res.json({
@@ -139,5 +194,6 @@ export default async ({ req, res, log, error }) => {
 		cancelled,
 		failures,
 		needsManualReview,
+		cancelledPossiblyCharged,
 	});
 };

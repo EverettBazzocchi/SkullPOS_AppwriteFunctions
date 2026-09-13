@@ -15,6 +15,34 @@ Stripe API (status + amount), a giftcard leg re-reads the actual current
 balance -- never trusting client-supplied amounts for anything but the
 split itself.
 
+## Server-side re-pricing, and what it is allowed to do
+
+`Transactions` is `create("users")`, so `cart`, `total`, `discount` and
+`payment_due` are all written by the same client that then asks to record a
+payment against them -- `amount <= payment_due` compares a client number to a
+client number. Every leg therefore re-prices the cart from `pos_items.sale_price`
+and the `discounts` collection (`src/pricing.js`), and the result is used as a
+**floor** on what must be paid before the sale may reach `complete`, never as a
+cap on a single leg.
+
+This function runs **after** the reader has captured, so the re-price is
+deliberately bounded in what it may cause:
+
+- It may **refuse** a leg only where refusing costs nothing -- `cash` (still in
+  the drawer) and `giftcard` (not debited until later in the same request). A
+  cart that cannot be priced gets a 400 there.
+- On a `stripe` leg the money is already gone, so the leg is **always
+  recorded**. The reason is stamped on the leg itself as `priceWarning`,
+  returned to the till as `warning`, and logged at error level; the floor still
+  applies, so a sale that really is underpaid stays `pending` with the balance
+  visible. It is never refused -- "captured, then refused, sale unrecordable" is
+  the failure this whole path exists to prevent.
+- An item deleted between ring-up and the tap is valued at the price the cart
+  was rung up at rather than treated as unpriceable, so the ordinary race
+  settles normally (and is still flagged).
+- An unverifiable **discount** is simply not applied, which moves the price up,
+  never down. That is flagged, not refused.
+
 ## Request body
 
 ```json
@@ -28,6 +56,11 @@ split itself.
 `{ "ok": true, "remaining": 0, "status": "complete" }` (or `status:
 "pending"` if more legs are still needed) or `{ "error": "<message>" }`
 with a 4xx/5xx status.
+
+A recorded leg whose sale could not be fully verified server-side also carries
+`warning: "<why>"` -- the payment IS recorded, and the till should show this to
+staff. A failed giftcard leg additionally reports `giftcardRestored` (and
+`manualCredit: {giftcardId, amount}` when the balance could not be put back).
 
 ## Payments array shape
 

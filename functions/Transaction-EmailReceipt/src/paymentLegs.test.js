@@ -79,6 +79,28 @@ describe("derivePaymentLegs", () => {
 		]);
 	});
 
+	// The shape 77 real rows are actually in: `giftcard_amount` set, `giftcards` never written by
+	// anything. Requiring both used to skip the leg entirely and fold the whole amount into the
+	// synthesized cash leg -- $458.25 of gift-card redemptions reported as cash, and refunded as
+	// cash handed over the bar for a payment that came off a card (P1-3).
+	test("legacy fallback: giftcard_amount with an empty relationship is a giftcard leg, not cash", () => {
+		const transaction = { giftcards: [], giftcard_amount: 500, total: 500, payment_due: 0 };
+
+		const legs = derivePaymentLegs(transaction);
+
+		expect(legs).toEqual([{ method: "giftcard", amount: 500 }]);
+		expect(legs.some((leg) => leg.method === "cash")).toBe(false);
+	});
+
+	test("legacy fallback: a missing relationship still nets the card leg down correctly", () => {
+		const transaction = { giftcard_amount: 300, stripe_id: "pi_1", total: 1000, payment_due: 0 };
+
+		expect(derivePaymentLegs(transaction)).toEqual([
+			{ method: "giftcard", amount: 300 },
+			{ method: "stripe", amount: 700, stripeId: "pi_1" },
+		]);
+	});
+
 	test("legacy fallback: giftcard relationship stored as an expanded object, not a bare id", () => {
 		const transaction = {
 			giftcards: [{ $id: "gc1", balance: 999 }],

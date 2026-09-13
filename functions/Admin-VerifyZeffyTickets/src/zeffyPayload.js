@@ -28,7 +28,12 @@ export function parseZeffyPayload(payload) {
 	const buyerName = `${firstName} ${lastName}`.trim();
 
 	const paymentMethodType = (dataObj.payment_method && dataObj.payment_method.type) || 'zeffy_checkout';
-	const items = dataObj.items || payload.items || [{ name: 'Standard Ticket', amount }];
+	// An EMPTY `items` array has to fall back the same way a missing one does. `[] || fallback`
+	// keeps the empty array (an array is truthy), which persisted the order and zero tickets --
+	// a paid buyer with nothing to scan at the door, and an order row that every later
+	// reconciliation run then 409s on and reports as healthy.
+	const rawItems = dataObj.items || payload.items;
+	const items = Array.isArray(rawItems) && rawItems.length > 0 ? rawItems : [{ name: 'Standard Ticket', amount }];
 
 	return { eventType, transactionId, eventName, amount, currency, buyerName, email, paymentMethodType, items };
 }

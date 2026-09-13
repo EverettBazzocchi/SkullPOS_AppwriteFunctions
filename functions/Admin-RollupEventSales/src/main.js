@@ -2,7 +2,7 @@ import { Databases, Query } from 'node-appwrite';
 import { createAppwriteClient } from './appwriteClient.js';
 import { eventSalesWindow } from './eventWindow.js';
 import { buildEventSales } from './eventSales.js';
-import { fetchEventTicketRevenue } from './ticketRevenue.js';
+import { fetchEventTicketRevenue, buildTicketBoundsByEventId } from './ticketRevenue.js';
 
 // Runs daily. For every event whose computed window (see eventWindow.js) has already ended,
 // (re)computes its sales figures from live (non-test), complete Transactions created within
@@ -57,14 +57,32 @@ export default async ({ req, res, log, error }) => {
 		return res.json({ error: 'Failed to list events' }, 500);
 	}
 
-	const dueEvents = events
-		.map((event) => ({ event, window: eventSalesWindow(event) }))
-		.filter(({ window }) => window && window.end <= now);
+	const withWindows = events.map((event) => ({ event, window: eventSalesWindow(event) }));
+
+	// An event with a date but no usable window (its bar open and close are the same, so the window
+	// is zero-length) must NOT be rolled up: it matches no transactions, and writing that result
+	// would overwrite the event's already-correct figures with zeroes and report it as a success.
+	// Reported instead, the way a per-event failure already is. An event with no date at all is a
+	// draft that was never scheduled -- skipped silently, as always.
+	const skipped = withWindows
+		.filter(({ event, window }) => !window && event.date)
+		.map(({ event }) => ({
+			id: event.$id,
+			name: event.name,
+			reason: 'no usable sales window (check barOpenTime/barCloseTime -- open and close are the same, or unparseable)',
+		}));
+	skipped.forEach((s) => error(`Skipping rollup for event ${s.id} ("${s.name}"): ${s.reason}.`));
+
+	const dueEvents = withWindows.filter(({ window }) => window && window.end <= now);
 
 	if (dueEvents.length === 0) {
 		log('No events with a completed window to roll up.');
-		return res.json({ processed: 0, updated: [], failures: [] });
+		return res.json({ processed: 0, updated: [], failures: [], skipped, needsReview: [] });
 	}
+
+	// Computed across ALL events with a window, not just the due ones -- a repeating event name's
+	// next occurrence may still be in the future, and it is what bounds this one's tickets.
+	const ticketBoundsByEventId = buildTicketBoundsByEventId(withWindows.filter(({ window }) => window));
 
 	let categoriesById = {};
 	let ingredientCostById = {};
@@ -89,6 +107,7 @@ export default async ({ req, res, log, error }) => {
 
 	const updated = [];
 	const failures = [];
+	const needsReview = [];
 
 	for (const { event, window } of dueEvents) {
 		try {
@@ -100,7 +119,31 @@ export default async ({ req, res, log, error }) => {
 			]);
 
 			const posSales = buildEventSales(transactions, categoriesById, ingredientCostById);
-			const ticketRevenue = await fetchEventTicketRevenue(databases, DATABASE_ID, event.name, fetchAllDocuments);
+			const ticketRevenue = await fetchEventTicketRevenue(
+				databases,
+				DATABASE_ID,
+				event.name,
+				fetchAllDocuments,
+				ticketBoundsByEventId[event.$id] || null,
+			);
+
+			// Tickets are joined to an event by its free-text NAME, which an admin can edit at any
+			// time while the already-written tickets keep the old string. Recomputing zero ticket
+			// revenue for an event that currently records some is the exact signature of that
+			// rename (or of tickets having been re-pointed elsewhere) -- and the write below is an
+			// unconditional overwrite, so going ahead would silently erase real, already-banked
+			// ticket revenue with nothing logged. Refuse the write and report it; a real
+			// full-refund of every ticket produces the same signature, and is rare enough to be
+			// worth a human confirming rather than losing the figure to a typo fix.
+			const recordedTicketRevenue = (event.revenue || 0) - (event.pos_revenue || 0);
+			if (ticketRevenue === 0 && recordedTicketRevenue > 0) {
+				const reason =
+					`rollup found no tickets matching the name "${event.name}" but the event already records ` +
+					`${recordedTicketRevenue} in ticket revenue -- refusing to overwrite it (was the event renamed?)`;
+				error(`Skipping rollup for event ${event.$id}: ${reason}.`);
+				needsReview.push({ id: event.$id, name: event.name, reason });
+				continue;
+			}
 
 			const sales = {
 				...posSales,
@@ -116,6 +159,10 @@ export default async ({ req, res, log, error }) => {
 		}
 	}
 
-	log(`Rolled up sales for ${updated.length}/${dueEvents.length} due event(s).`);
-	return res.json({ processed: dueEvents.length, updated, failures });
+	log(
+		`Rolled up sales for ${updated.length}/${dueEvents.length} due event(s).` +
+			(skipped.length > 0 ? ` ${skipped.length} skipped for having no usable window.` : '') +
+			(needsReview.length > 0 ? ` ${needsReview.length} left untouched pending review.` : ''),
+	);
+	return res.json({ processed: dueEvents.length, updated, failures, skipped, needsReview });
 };

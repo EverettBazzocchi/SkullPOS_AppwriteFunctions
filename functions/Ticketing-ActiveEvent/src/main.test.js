@@ -21,6 +21,7 @@ const activeEventDoc = {
 	sellsAlcohol: true,
 	barOpenTime: "18:00",
 	barCloseTime: "02:00",
+	sales: ['{"item":"Pilsner","qty":42,"revenue":33600}'],
 	alcohol_sales: 120000,
 	food_sales: 34000,
 	drink_sales: 15000,
@@ -36,6 +37,8 @@ const activeEventDoc = {
 };
 
 const FINANCIAL_FIELDS = [
+	// `sales` is the per-item rollup array, not a scalar -- just as sensitive as the scalars below.
+	"sales",
 	"alcohol_sales",
 	"food_sales",
 	"drink_sales",
@@ -55,7 +58,7 @@ describe("Ticketing-ActiveEvent", () => {
 		resetAppwriteMocks();
 	});
 
-	test("returns the active event reduced to the door-facing fields", async () => {
+	test("returns the active event reduced to the floor-facing fields", async () => {
 		mockDatabases.listDocuments.mockResolvedValue({ documents: [activeEventDoc] });
 		const ctx = makeContext({ body: {} });
 
@@ -72,7 +75,66 @@ describe("Ticketing-ActiveEvent", () => {
 			standardTicketPrice: 100,
 			currency: "CAD",
 			isActive: true,
+			sellsAlcohol: true,
+			barOpenTime: "18:00",
+			barCloseTime: "02:00",
 		});
+	});
+
+	// Stronger than the financial-leak test below: this pins the allowlist *closed*, so adding any
+	// new key to toPublicEvent -- financial or not -- has to be a deliberate edit here too.
+	test("emits exactly the allowlisted keys and nothing else", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({ documents: [activeEventDoc] });
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(Object.keys(result.body.event).sort()).toEqual([
+			"$id",
+			"barCloseTime",
+			"barOpenTime",
+			"currency",
+			"date",
+			"description",
+			"eventId",
+			"isActive",
+			"location",
+			"name",
+			"sellsAlcohol",
+			"standardTicketPrice",
+		]);
+	});
+
+	// The register and both menu boards gate their alcohol categories on exactly these three
+	// fields; if they stop coming through, the bar silently cannot sell alcohol all night.
+	test("passes the alcohol gate through so the register and menu boards can read it", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({
+			documents: [{ ...activeEventDoc, barOpenTime: "20:30", barCloseTime: "02:00" }],
+		});
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(result.body.event.sellsAlcohol).toBe(true);
+		// Raw "HH:mm" -- the clients parse these themselves, so the strings must survive verbatim.
+		expect(result.body.event.barOpenTime).toBe("20:30");
+		expect(result.body.event.barCloseTime).toBe("02:00");
+	});
+
+	test("fails the alcohol gate closed when the event does not sell alcohol or has no window", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({
+			documents: [{ $id: "evt3", name: "Dry Night", isActive: true }],
+		});
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		// sellsAlcohol must be a hard false, never undefined -- the clients test it for truthiness
+		// and a missing key would read the same, but null times are what keeps a sellsAlcohol:true
+		// event with an unset window from being treated as open.
+		expect(result.body.event.sellsAlcohol).toBe(false);
+		expect(result.body.event.barOpenTime).toBeNull();
+		expect(result.body.event.barCloseTime).toBeNull();
 	});
 
 	// The entire reason this function exists instead of a collection read permission -- if this
@@ -87,10 +149,10 @@ describe("Ticketing-ActiveEvent", () => {
 		for (const field of FINANCIAL_FIELDS) {
 			expect(result.body.event).not.toHaveProperty(field);
 			expect(serialized).not.toContain(field);
+			// ...and no stray value from those columns rode along under a different key -- every
+			// financial figure in the fixture, not just the two headline ones.
+			expect(serialized).not.toContain(String(activeEventDoc[field]));
 		}
-		// ...and no stray value from those columns rode along under a different key.
-		expect(serialized).not.toContain("215000");
-		expect(serialized).not.toContain("151000");
 	});
 
 	test("queries only for the active event", async () => {
@@ -125,6 +187,19 @@ describe("Ticketing-ActiveEvent", () => {
 		expect(result.body.event.currency).toBe("CAD");
 		expect(result.body.event.eventId).toBeNull();
 		expect(result.body.event.description).toBeNull();
+	});
+
+	// A free event is a real thing (members' night). The old `parseInt(...) || 3000` turned it into
+	// a CA$30.00 charge per patron at the door.
+	test("keeps a 0-cent event free instead of falling back to the default price", async () => {
+		mockDatabases.listDocuments.mockResolvedValue({
+			documents: [{ $id: "evt4", name: "Free Entry Night", isActive: true, standardTicketPrice: 0 }],
+		});
+		const ctx = makeContext({ body: {} });
+
+		const result = await handler(ctx);
+
+		expect(result.body.event.standardTicketPrice).toBe(0);
 	});
 
 	test("surfaces a 500 if the query itself fails, rather than pretending nothing is on", async () => {

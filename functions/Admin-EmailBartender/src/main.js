@@ -64,6 +64,21 @@ function buildEventAssignedHtml({ bartenderName, eventName, eventDate, window, p
 		</div>`;
 }
 
+// The PIN-free counterpart of buildEventAssignedHtml, sent to the event's coordinators as its own
+// email. Coordinators are a distinct role from bartenders -- they're meant to know *who* is behind
+// the bar for their event, not to be able to log into the till as her -- so this body deliberately
+// carries the roster fact and nothing that authenticates.
+function buildCoordinatorNoticeHtml({ bartenderName, eventName, eventDate }) {
+	return `
+		<div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
+			<h2 style="margin-bottom:0;">Bartender assigned</h2>
+			<p><strong>${escapeHtml(bartenderName)}</strong> has been added as a bartender for
+				<strong>${escapeHtml(eventName)}</strong>, starting ${escapeHtml(formatDateTime(eventDate))}.</p>
+			<p>They've been emailed their own POS pin and the hours it works in.</p>
+			${FOOTER_HTML}
+		</div>`;
+}
+
 function buildCustomHtml({ bartenderName, message }) {
 	return `
 		<div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
@@ -83,7 +98,7 @@ async function sendEmail({ to, cc, subject, html }) {
 		},
 		body: JSON.stringify({
 			from: SENDER,
-			to: [to],
+			to: Array.isArray(to) ? to : [to],
 			...(cc && cc.length ? { cc } : {}),
 			subject,
 			html,
@@ -103,7 +118,10 @@ function resolveRecipient(email, testing) {
 	return { to: email, cc: [ALWAYS_CC] };
 }
 
-// Coordinators assigned to an event get CC'ed on this too, same as the DJ voucher email.
+// Coordinators assigned to an event are told a bartender was assigned -- but in a *separate*
+// email (buildCoordinatorNoticeHtml), never as a CC on the bartender's own copy, because that
+// copy carries her live POS pin. One HTML body goes to `to` and every `cc`, so CC'ing them here
+// would hand a working till credential to a role that is never meant to hold one.
 // `event_coordinators.events` is a many-to-many relationship -- Appwrite flatly rejects
 // Query.equal on a relationship attribute ("Cannot query on virtual relationship attribute"),
 // so this can't be looked up by querying that collection directly. Reading the *event's* own
@@ -159,10 +177,8 @@ export default async ({ req, res, log, error }) => {
 			return res.json({ error: "This event has no date set, so a pin-valid-window can't be shown" }, 400);
 		}
 
-		if (!testing) {
-			recipient.cc = Array.from(new Set([...recipient.cc, ...coordinatorEmailsFromEvent(event)]));
-		}
-
+		// The pin-bearing body goes to the bartender only (plus the admin, who can already read
+		// every pin in the `pins`/`bartenders` collections anyway).
 		try {
 			await sendEmail({
 				to: recipient.to,
@@ -182,6 +198,31 @@ export default async ({ req, res, log, error }) => {
 		}
 
 		log(`Event-assigned email sent for bartender ${bartenderId} / event ${eventId} to ${recipient.to}`);
+
+		// Coordinators get their own pin-free notice. Skipped entirely while `testing`, same as
+		// the old CC was -- the testing convention is that nothing reaches a real coordinator.
+		const coordinatorEmails = testing ? [] : coordinatorEmailsFromEvent(event);
+		if (coordinatorEmails.length === 0) return res.json({ ok: true });
+
+		try {
+			await sendEmail({
+				to: coordinatorEmails,
+				cc: [],
+				subject: `${bartender.name || 'A bartender'} is bartending ${event.name}`,
+				html: buildCoordinatorNoticeHtml({
+					bartenderName: bartender.name || 'A bartender',
+					eventName: event.name,
+					eventDate: event.date,
+				}),
+			});
+		} catch (err) {
+			// The bartender -- the one who actually needs the pin -- already has her email. Don't
+			// fail the whole assignment (and don't let a retry re-send her pin) over the notice.
+			error('Failed to send coordinator assignment notice: ' + err.message);
+			return res.json({ ok: true, coordinatorNoticeSent: false });
+		}
+
+		log(`Coordinator assignment notice sent for event ${eventId} to ${coordinatorEmails.join(', ')}`);
 		return res.json({ ok: true });
 	}
 

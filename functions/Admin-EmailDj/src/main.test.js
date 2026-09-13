@@ -45,12 +45,57 @@ describe("Admin-EmailDj", () => {
 			expect(mockStorage.createFile).toHaveBeenCalledWith(
 				"voucher-barcodes",
 				"unique-id-1",
-				expect.objectContaining({ filename: "75855123456789.png" }),
+				expect.objectContaining({ filename: "unique-id-1.png" }),
+				['read("any")'],
 			);
 			expect(sentBody.html).toContain(
 				"https://api.cloud.shotty.tech/v1/storage/buckets/voucher-barcodes/files/unique-id-1/view?project=proj1",
 			);
 			expect(sentBody.html).not.toContain("data:image/png;base64,");
+		});
+
+		test("never names the uploaded barcode file after the giftcard code", async () => {
+			// The bucket is served with a bucket-level read permission, and Appwrite grants list
+			// from that same permission -- so whatever this file is *named* is readable by every
+			// principal that can read the bucket. Naming it after the code made the bucket an
+			// enumerable index of live voucher codes; the random fileId must be the only
+			// identifier that ever reaches the object store.
+			mockDatabases.getDocument
+				.mockResolvedValueOnce({ $id: "gc1", UPC: "75855666666666", balance: 2000, djs: "dj1", events: "event1" })
+				.mockResolvedValueOnce({ $id: "dj1", name: "DJ Test", email: "dj@example.com" })
+				.mockResolvedValueOnce({ $id: "event1", name: "HAX 7.0" });
+			const ctx = makeContext({ body: { action: "voucher", giftcardId: "gc1" } });
+
+			await handler(ctx);
+
+			const [bucketId, fileId, file] = mockStorage.createFile.mock.calls[0];
+			expect(bucketId).toBe("voucher-barcodes");
+			expect(fileId).not.toContain("75855666666666");
+			expect(file.filename).not.toContain("75855666666666");
+			expect(file.filename).toBe(`${fileId}.png`);
+			// the code still has to be *inside* the barcode -- that's what the bar scans
+			expect(mockToBuffer).toHaveBeenCalledWith(expect.objectContaining({ text: "75855666666666" }));
+		});
+
+		test("grants public read on the file, never relying on a bucket-wide read", async () => {
+			// A random fileId is only a bearer token while the set of fileIds stays secret, and a
+			// bucket carrying read("any") is also listable -- which hands that whole set out, and
+			// each image prints its code in plaintext under the bars. So the grant has to travel
+			// with the file (bucket fileSecurity:true, no bucket-level read("any")); if this
+			// argument is ever dropped, the bucket has to go back to being world-readable for the
+			// Gmail <img> to work and the enumeration is back.
+			mockDatabases.getDocument
+				.mockResolvedValueOnce({ $id: "gc1", UPC: "75855666666666", balance: 2000, djs: "dj1", events: "event1" })
+				.mockResolvedValueOnce({ $id: "dj1", name: "DJ Test", email: "dj@example.com" })
+				.mockResolvedValueOnce({ $id: "event1", name: "HAX 7.0" });
+			const ctx = makeContext({ body: { action: "voucher", giftcardId: "gc1" } });
+
+			await handler(ctx);
+
+			const permissions = mockStorage.createFile.mock.calls[0][3];
+			expect(permissions).toEqual(['read("any")']);
+			// read only -- nobody gets to overwrite or delete a voucher barcode by URL
+			expect(permissions.some((p) => /update|delete|write|create/.test(p))).toBe(false);
 		});
 
 		test("rejects a giftcard with no linked dj", async () => {
