@@ -52,6 +52,78 @@ describe("Admin-EmailBartender", () => {
 			expect(sentBody.html).not.toContain("3:00");
 		});
 
+		// --- the migrated time model -----------------------------------------------------------
+		//
+		// 2026-09-27T03:00:00Z is 10:00 p.m. the evening before in America/Winnipeg, and
+		// 2026-09-27T07:00:00Z is 2:00 a.m. -- the same 22:00-02:00 shift the legacy row above
+		// describes with `date` + barOpenTime/barCloseTime.
+
+		test("renders the start from startsAt for a row that no longer carries a legacy date", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce({ $id: "bt1", name: "Alex", email: "alex@example.com", pin: "1234" })
+				.mockResolvedValueOnce({
+					$id: "event1",
+					name: "The NB Afterparty",
+					startsAt: "2026-09-27T03:00:00.000Z",
+					endsAt: "2026-09-27T07:00:00.000Z",
+					barOpensAt: "2026-09-27T03:00:00.000Z",
+					barClosesAt: "2026-09-27T07:00:00.000Z",
+				});
+
+			const result = await handler(makeContext({ body: { action: "event_assigned", bartenderId: "bt1", eventId: "event1" } }));
+
+			expect(result.statusCode).toBe(200);
+			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+			expect(sentBody.html).toContain("10:00");
+			expect(sentBody.html).toMatch(/p\.?m\.?/i);
+		});
+
+		// `date`'s time half is junk. When both shapes are present the email must state the real
+		// start, not the stored placeholder -- a bartender who reads the wrong hour shows up late.
+		test("prefers startsAt over the legacy date's junk time when both are present", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce({ $id: "bt1", name: "Alex", email: "alex@example.com", pin: "1234" })
+				.mockResolvedValueOnce({
+					$id: "event1",
+					name: "The NB Afterparty",
+					date: "2026-09-27T05:00:00.000Z", // midnight local -- meaningless time
+					startsAt: "2026-09-27T03:00:00.000Z", // the real 10 p.m. start
+					endsAt: "2026-09-27T07:00:00.000Z",
+					barOpenTime: "22:00",
+					barCloseTime: "02:00",
+					barOpensAt: "2026-09-27T03:00:00.000Z",
+					barClosesAt: "2026-09-27T07:00:00.000Z",
+				});
+
+			await handler(makeContext({ body: { action: "event_assigned", bartenderId: "bt1", eventId: "event1" } }));
+
+			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+			expect(sentBody.html).toContain("10:00");
+			expect(sentBody.html).not.toContain("12:00");
+		});
+
+		// The hours quoted to the bartender have to be the hours Verify-Pin will actually honour:
+		// barOpensAt-1h to barClosesAt+1h, i.e. 9:00 p.m. to 3:00 a.m. for this shift.
+		test("quotes the pin-valid window from the new instants, buffer included", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce({ $id: "bt1", name: "Alex", email: "alex@example.com", pin: "1234" })
+				.mockResolvedValueOnce({
+					$id: "event1",
+					name: "The NB Afterparty",
+					startsAt: "2026-09-27T03:00:00.000Z",
+					endsAt: "2026-09-27T07:00:00.000Z",
+					barOpensAt: "2026-09-27T03:00:00.000Z",
+					barClosesAt: "2026-09-27T07:00:00.000Z",
+				});
+
+			await handler(makeContext({ body: { action: "event_assigned", bartenderId: "bt1", eventId: "event1" } }));
+
+			const sentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+			expect(sentBody.html).toContain("9:00");
+			expect(sentBody.html).toContain("3:00");
+			expect(sentBody.html).toContain("covers the whole event");
+		});
+
 		// This test used to assert the opposite -- that coordinators were merged into the CC of
 		// the bartender's own (pin-bearing) email. That was the bug: one HTML body goes to `to`
 		// and every `cc`, so every coordinator received a working till pin. The roster fact is

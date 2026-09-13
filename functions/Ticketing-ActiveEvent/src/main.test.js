@@ -21,6 +21,12 @@ const activeEventDoc = {
 	sellsAlcohol: true,
 	barOpenTime: "18:00",
 	barCloseTime: "02:00",
+	// The migrated shape, carried alongside the legacy fields exactly as a live row does during the
+	// rollout: 18:00-02:00 local in Winnipeg (CDT, UTC-5).
+	startsAt: "2026-09-10T23:00:00.000Z",
+	endsAt: "2026-09-11T07:00:00.000Z",
+	barOpensAt: "2026-09-10T23:00:00.000Z",
+	barClosesAt: "2026-09-11T07:00:00.000Z",
 	sales: ['{"item":"Pilsner","qty":42,"revenue":33600}'],
 	alcohol_sales: 120000,
 	food_sales: 34000,
@@ -78,6 +84,10 @@ describe("Ticketing-ActiveEvent", () => {
 			sellsAlcohol: true,
 			barOpenTime: "18:00",
 			barCloseTime: "02:00",
+			startsAt: "2026-09-10T23:00:00.000Z",
+			endsAt: "2026-09-11T07:00:00.000Z",
+			barOpensAt: "2026-09-10T23:00:00.000Z",
+			barClosesAt: "2026-09-11T07:00:00.000Z",
 		});
 	});
 
@@ -92,16 +102,20 @@ describe("Ticketing-ActiveEvent", () => {
 		expect(Object.keys(result.body.event).sort()).toEqual([
 			"$id",
 			"barCloseTime",
+			"barClosesAt",
 			"barOpenTime",
+			"barOpensAt",
 			"currency",
 			"date",
 			"description",
+			"endsAt",
 			"eventId",
 			"isActive",
 			"location",
 			"name",
 			"sellsAlcohol",
 			"standardTicketPrice",
+			"startsAt",
 		]);
 	});
 
@@ -135,6 +149,74 @@ describe("Ticketing-ActiveEvent", () => {
 		expect(result.body.event.sellsAlcohol).toBe(false);
 		expect(result.body.event.barOpenTime).toBeNull();
 		expect(result.body.event.barCloseTime).toBeNull();
+		// The migrated pair fails closed the same way -- a client that has already moved to the
+		// instants must not read `undefined` as "open".
+		expect(result.body.event.barOpensAt).toBeNull();
+		expect(result.body.event.barClosesAt).toBeNull();
+		expect(result.body.event.startsAt).toBeNull();
+		expect(result.body.event.endsAt).toBeNull();
+	});
+
+	// --- the migrated time model ---------------------------------------------------------------
+	//
+	// POS and both menu boards read the alcohol gate through this function, and they are migrating
+	// to the instants on their own schedule. So the instants must be projected ALONGSIDE the legacy
+	// strings -- never instead of them -- in any deploy order.
+	describe("startsAt/endsAt/barOpensAt/barClosesAt projection", () => {
+		test("projects the four instants through to the floor", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [activeEventDoc] });
+
+			const result = await handler(makeContext({ body: {} }));
+
+			expect(result.body.event.startsAt).toBe("2026-09-10T23:00:00.000Z");
+			expect(result.body.event.endsAt).toBe("2026-09-11T07:00:00.000Z");
+			expect(result.body.event.barOpensAt).toBe("2026-09-10T23:00:00.000Z");
+			expect(result.body.event.barClosesAt).toBe("2026-09-11T07:00:00.000Z");
+		});
+
+		// A row that has not been backfilled yet still has to drive the gate the old way, or the bar
+		// goes dry for that event.
+		test("still carries the legacy HH:mm strings for a row with no instants yet", async () => {
+			const notBackfilled = { ...activeEventDoc };
+			delete notBackfilled.startsAt;
+			delete notBackfilled.endsAt;
+			delete notBackfilled.barOpensAt;
+			delete notBackfilled.barClosesAt;
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [notBackfilled] });
+
+			const result = await handler(makeContext({ body: {} }));
+
+			expect(result.body.event.barOpenTime).toBe("18:00");
+			expect(result.body.event.barCloseTime).toBe("02:00");
+			expect(result.body.event.date).toBe("2026-09-10T00:00:06.000Z");
+			expect(result.body.event.barOpensAt).toBeNull();
+			expect(result.body.event.barClosesAt).toBeNull();
+		});
+
+		// A backfilled row keeps both shapes. Dropping the strings here would black out every client
+		// that has not shipped its own migration yet.
+		test("emits both shapes at once for a backfilled row", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({ documents: [activeEventDoc] });
+
+			const result = await handler(makeContext({ body: {} }));
+
+			expect(result.body.event.barOpenTime).toBe("18:00");
+			expect(result.body.event.barCloseTime).toBe("02:00");
+			expect(result.body.event.barOpensAt).toBe("2026-09-10T23:00:00.000Z");
+			expect(result.body.event.barClosesAt).toBe("2026-09-11T07:00:00.000Z");
+		});
+
+		test("normalizes a blank or unparseable instant to null so a client fails the gate closed", async () => {
+			mockDatabases.listDocuments.mockResolvedValue({
+				documents: [{ ...activeEventDoc, barOpensAt: "", barClosesAt: "tonight", startsAt: null }],
+			});
+
+			const result = await handler(makeContext({ body: {} }));
+
+			expect(result.body.event.barOpensAt).toBeNull();
+			expect(result.body.event.barClosesAt).toBeNull();
+			expect(result.body.event.startsAt).toBeNull();
+		});
 	});
 
 	// The entire reason this function exists instead of a collection read permission -- if this

@@ -203,6 +203,97 @@ describe("Verify-Pin", () => {
 			expect(result.body.ok).toBe(true);
 		});
 
+		// --- the migrated time model ---------------------------------------------------------
+		//
+		// An event row may carry the legacy shape (`date` + HH:mm bar hours), the new instants
+		// (`startsAt`/`endsAt`/`barOpensAt`/`barClosesAt`), or both while the backfill runs. All
+		// three have to authenticate the same bartender at the same moments, in any deploy order.
+
+		function shiftRows({ openedMinutesAgo = 30, lengthHours = 4, dateOffsetHours = 0 } = {}) {
+			const opensAt = Date.now() - openedMinutesAgo * 60 * 1000;
+			const closesAt = opensAt + lengthHours * 60 * 60 * 1000;
+			return {
+				legacy: {
+					// `date`'s time half is junk: dateOffsetHours is how far it drifts from the real
+					// bar open. barOpenTime/barCloseTime still describe the true shift length.
+					date: new Date(opensAt + dateOffsetHours * 60 * 60 * 1000).toISOString(),
+					barOpenTime: "22:00",
+					barCloseTime: "02:00",
+				},
+				instants: {
+					startsAt: new Date(opensAt).toISOString(),
+					endsAt: new Date(closesAt).toISOString(),
+					barOpensAt: new Date(opensAt).toISOString(),
+					barClosesAt: new Date(closesAt).toISOString(),
+				},
+			};
+		}
+
+		async function verifyWithEvent(event) {
+			mockDatabases.listDocuments
+				.mockResolvedValueOnce({ documents: [] })
+				.mockResolvedValueOnce({ documents: [mockBartenderRow({ pin: "5678", events: [event] })] });
+			return handler(makeContext({ body: { pin: "5678" } }));
+		}
+
+		test("accepts a bartender whose event carries only the new instants and no legacy fields", async () => {
+			const { instants } = shiftRows();
+			const result = await verifyWithEvent(instants);
+			expect(result.body.ok).toBe(true);
+		});
+
+		test("a row with only the old fields, only the new, and both all authenticate the same shift", async () => {
+			const { legacy, instants } = shiftRows();
+
+			const legacyOnly = await verifyWithEvent(legacy);
+			const newOnly = await verifyWithEvent(instants);
+			const both = await verifyWithEvent({ ...legacy, ...instants });
+
+			expect(legacyOnly.body.ok).toBe(true);
+			expect(newOnly.body.ok).toBe(true);
+			expect(both.body.ok).toBe(true);
+		});
+
+		// The owner's "the time it says is irrelevant" bug, end to end: `date` sits two hours after
+		// the bar actually opens, so the legacy derivation puts the whole window two hours late and
+		// the bartender is refused at the top of her own shift. barOpensAt removes the guess.
+		test("barOpensAt stops a junk date-time from locking a bartender out at the start of her shift", async () => {
+			const { legacy, instants } = shiftRows({ openedMinutesAgo: 30, dateOffsetHours: 2 });
+
+			const beforeMigration = await verifyWithEvent(legacy);
+			const afterMigration = await verifyWithEvent({ ...legacy, ...instants });
+
+			expect(beforeMigration.body.ok).toBe(false);
+			expect(afterMigration.body.ok).toBe(true);
+		});
+
+		// The flip side: the instants must still SHUT the window. A pin that outlives its shift is
+		// as bad as one that starts late.
+		test("rejects a pin presented well after the new-field window has closed", async () => {
+			const closedAt = Date.now() - 3 * 60 * 60 * 1000;
+			const result = await verifyWithEvent({
+				startsAt: new Date(closedAt - 4 * 60 * 60 * 1000).toISOString(),
+				endsAt: new Date(closedAt).toISOString(),
+				barOpensAt: new Date(closedAt - 4 * 60 * 60 * 1000).toISOString(),
+				barClosesAt: new Date(closedAt).toISOString(),
+			});
+
+			// Byte-identical to a pin matching nothing (P2-13) -- the window reason never leaves the log.
+			expect(result).toEqual({ statusCode: 200, body: { ok: false } });
+		});
+
+		test("rejects a pin presented well before the new-field window opens", async () => {
+			const opensAt = Date.now() + 3 * 60 * 60 * 1000;
+			const result = await verifyWithEvent({
+				startsAt: new Date(opensAt).toISOString(),
+				endsAt: new Date(opensAt + 4 * 60 * 60 * 1000).toISOString(),
+				barOpensAt: new Date(opensAt).toISOString(),
+				barClosesAt: new Date(opensAt + 4 * 60 * 60 * 1000).toISOString(),
+			});
+
+			expect(result).toEqual({ statusCode: 200, body: { ok: false } });
+		});
+
 		test("rejects a bartender with no assigned events at all", async () => {
 			mockDatabases.listDocuments
 				.mockResolvedValueOnce({ documents: [] })

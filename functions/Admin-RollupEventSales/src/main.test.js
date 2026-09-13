@@ -78,6 +78,65 @@ describe("Admin-RollupEventSales", () => {
 		expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
 	});
 
+	// --- the migrated time model ---------------------------------------------------------------
+
+	test("rolls up an event that carries only the new timestamps and no legacy date", async () => {
+		wireCollections({
+			events: [
+				{
+					$id: "migrated",
+					name: "Migrated Event",
+					startsAt: "2020-01-01T01:00:00.000Z",
+					endsAt: "2020-01-01T10:00:00.000Z",
+					barOpensAt: "2020-01-01T01:00:00.000Z",
+					barClosesAt: "2020-01-01T10:00:00.000Z",
+				},
+			],
+			transactions: [{ cart: JSON.stringify([{ name: "Beer", price: 500, quantity: 2, alcohol: true }]), tip: 100, discount: 0, total: 1100, payment_due: 1100 }],
+		});
+		mockDatabases.updateDocument.mockResolvedValue({});
+
+		const result = await handler(makeContext({ body: {} }));
+
+		expect(result.body.processed).toBe(1);
+		expect(result.body.updated).toEqual(["migrated"]);
+		expect(result.body.skipped).toEqual([]);
+	});
+
+	// A fully-migrated row whose window is unusable still has to be REPORTED, not silently ignored
+	// the way a never-scheduled draft is -- the old `event.date` test would have dropped it.
+	test("reports a fully-migrated event whose window is degenerate instead of ignoring it", async () => {
+		wireCollections({
+			events: [{ $id: "degenerate-new", name: "Migrated Event", startsAt: "2020-01-01T01:00:00.000Z", endsAt: "2020-01-01T01:00:00.000Z" }],
+		});
+
+		const result = await handler(makeContext({ body: {} }));
+
+		expect(result.body.processed).toBe(0);
+		expect(result.body.skipped).toEqual([
+			{ id: "degenerate-new", name: "Migrated Event", reason: expect.stringMatching(/no usable sales window/i) },
+		]);
+		expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+	});
+
+	test("leaves an event alone while its new-field window is still open", async () => {
+		wireCollections({
+			events: [
+				{
+					$id: "running",
+					name: "Tonight",
+					startsAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+					endsAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+				},
+			],
+		});
+
+		const result = await handler(makeContext({ body: {} }));
+
+		expect(result.body).toEqual({ processed: 0, updated: [], failures: [], skipped: [], needsReview: [] });
+		expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+	});
+
 	test("rolls up sales for a past event and writes them onto the event document", async () => {
 		const transactions = [
 			{

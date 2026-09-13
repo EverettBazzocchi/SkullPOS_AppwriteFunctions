@@ -74,12 +74,18 @@ export default async ({ req, res, log, error }) => {
 	// would overwrite the event's already-correct figures with zeroes and report it as a success.
 	// Reported instead, the way a per-event failure already is. An event with no date at all is a
 	// draft that was never scheduled -- skipped silently, as always.
+	// "Scheduled" means the row carries a start instant of any shape -- the new `startsAt`/
+	// `barOpensAt` timestamps or the legacy `date`. Testing `event.date` alone would silently
+	// downgrade a fully-migrated row (one whose window came out unusable) from "reported" to
+	// "ignored" the day `date` stops being written.
+	const isScheduled = (event) => !!(event.startsAt || event.barOpensAt || event.date);
 	const skipped = withWindows
-		.filter(({ event, window }) => !window && event.date)
+		.filter(({ event, window }) => !window && isScheduled(event))
 		.map(({ event }) => ({
 			id: event.$id,
 			name: event.name,
-			reason: 'no usable sales window (check barOpenTime/barCloseTime -- open and close are the same, or unparseable)',
+			reason:
+				'no usable sales window (check startsAt/endsAt and barOpensAt/barClosesAt, or the legacy barOpenTime/barCloseTime -- start and end are the same, inverted, or unparseable)',
 		}));
 	skipped.forEach((s) => error(`Skipping rollup for event ${s.id} ("${s.name}"): ${s.reason}.`));
 

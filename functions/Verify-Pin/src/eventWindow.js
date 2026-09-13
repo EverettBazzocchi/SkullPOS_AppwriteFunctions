@@ -1,13 +1,24 @@
-// Computes the [start, end] instants a bartender pin should actually work for: from the event's
-// `date` (trusted as the real start instant, already an absolute timestamp -- no timezone
-// reconstruction needed) extended by the bar's open-to-close DURATION, so it covers the whole
-// shift rather than just a fixed window around the start. Mirrors Admin-RollupEventSales's own
-// eventSalesWindow() -- same "add a duration on top of `date`" approach, just derived from
-// barOpenTime/barCloseTime (admin-editable HH:mm strings) instead of event_start/event_end.
+// Computes the [start, end] instants a bartender pin should actually work for.
 //
-// `date`'s local wall-clock time is expected to line up with barOpenTime (an event created for
-// "10pm-2am" has `date` set to that 10pm instant) -- the duration is purely open-to-close, with
-// no assumption about which absolute timezone that is, so this works correctly regardless of DST.
+// PREFERRED -- the event carries real timestamps: `barOpensAt`/`barClosesAt` for the bar's own
+// shift and `startsAt`/`endsAt` for the event itself. Each is a full instant written by the admin
+// app, which is the only place a real timezone (America/Winnipeg) exists, so nothing on the server
+// ever recombines a calendar day with a wall clock or infers a zone. It only ever compares instants.
+//
+// FALLBACK -- a row that has not been backfilled yet: the legacy shape, `date` as the start instant
+// extended by the open-to-close DURATION derived from the `barOpenTime`/`barCloseTime` "HH:mm"
+// strings. Kept behaviour-for-behaviour identical to what shipped before the migration, so an
+// un-backfilled row still authenticates exactly the bartender it always did and any deploy order
+// (or a rollback of any single component) is safe.
+//
+// Why the legacy path is the one that needed fixing: `date`'s TIME half is junk -- the owner's own
+// words are "the date is the date of the event, the time it says is irrelevant". Taking its raw
+// instant as the window START means a row stored as 20:00 against an 18:00 bar open locks the
+// bartender out of the first two hours of her own shift. `barOpensAt` deletes that guess entirely.
+//
+// The window spans the UNION of the bar's hours and the event's own, so a bartender rostered before
+// doors (or kept on past last call) is never cut off by whichever of the two is narrower. The
+// caller still pads this by its own ±1h buffer (PIN_VALID_WINDOW_MS).
 
 function parseTimeToMinutes(value) {
 	if (!value) return null;
@@ -20,20 +31,48 @@ function parseTimeToMinutes(value) {
 	return hour * 60 + minute;
 }
 
-export function computeEventWindow(event) {
-	if (!event || !event.date) return null;
-	const startMs = new Date(event.date).getTime();
-	if (Number.isNaN(startMs)) return null;
+// An Appwrite datetime attribute arrives as an ISO string; a Date is accepted too so a caller that
+// has already parsed one doesn't have to stringify it back. Anything absent, empty or unparseable
+// is null, which is what makes the fallback chain below fire instead of producing a NaN window.
+function toMs(value) {
+	if (value === null || value === undefined || value === '') return null;
+	const ms = value instanceof Date ? value.getTime() : Date.parse(String(value));
+	return Number.isNaN(ms) ? null : ms;
+}
 
+// Open-to-close duration in minutes from the legacy HH:mm strings, or null when they aren't usable.
+function legacyBarDurationMinutes(event) {
 	const openMinutes = parseTimeToMinutes(event.barOpenTime);
 	const closeMinutes = parseTimeToMinutes(event.barCloseTime);
-	if (openMinutes === null || closeMinutes === null) {
+	if (openMinutes === null || closeMinutes === null) return null;
+	// Wraps past midnight correctly (open 22:00 / close 02:00 -> 240 minutes, not negative).
+	return (((closeMinutes - openMinutes) % 1440) + 1440) % 1440;
+}
+
+export function computeEventWindow(event) {
+	if (!event) return null;
+
+	const starts = [toMs(event.barOpensAt), toMs(event.startsAt)].filter((ms) => ms !== null);
+	const ends = [toMs(event.barClosesAt), toMs(event.endsAt)].filter((ms) => ms !== null);
+
+	// A row with no new timestamp at all anchors on `date`, exactly as before. A half-migrated row
+	// (say `barClosesAt` written but `barOpensAt` not yet) anchors on whichever side it does have,
+	// so a partial backfill can only ever improve the window, never void it.
+	const startMs = starts.length > 0 ? Math.min(...starts) : toMs(event.date);
+	if (startMs === null) return null;
+
+	if (ends.length > 0) {
+		// Clamped at startMs: bad data with an end before the start would otherwise produce a
+		// negative-length window, leaving the pin valid only inside the caller's buffer -- i.e.
+		// quietly locking a bartender out mid-shift rather than failing visibly.
+		return { startMs, endMs: Math.max(startMs, ...ends) };
+	}
+
+	const durationMinutes = legacyBarDurationMinutes(event);
+	if (durationMinutes === null) {
 		// No bar hours configured -- nothing to extend by, so the window is just the start instant
 		// (the caller still pads this by its own before/after buffer).
 		return { startMs, endMs: startMs };
 	}
-
-	// Wraps past midnight correctly (open 22:00 / close 02:00 -> 240 minutes, not negative).
-	const durationMinutes = (((closeMinutes - openMinutes) % 1440) + 1440) % 1440;
 	return { startMs, endMs: startMs + durationMinutes * 60 * 1000 };
 }

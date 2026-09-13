@@ -21,6 +21,20 @@ const VALID_ACTIONS = ['event_assigned', 'custom'];
 const PIN_VALID_WINDOW_MS = 60 * 60 * 1000; // matches Verify-Pin's own window exactly
 const FOOTER_HTML = '<p style="color:#999;font-size:0.8em;margin-top:24px;">Questions or concerns? Email <a href="mailto:admin@skullspace.ca">admin@skullspace.ca</a>.</p>';
 
+// The event's start, preferring the real `startsAt` instant and falling back to the legacy `date`
+// for a row that has not been backfilled yet. `date`'s TIME half is junk by the owner's own account
+// ("the date is the date of the event, the time it says is irrelevant"), so an email that renders it
+// can state the wrong hour; `startsAt` is a true instant and renders correctly. Returns null when
+// neither is usable, which is what the 400 below keys on.
+function resolveEventStartIso(event) {
+	for (const value of [event.startsAt, event.date]) {
+		if (value === null || value === undefined || value === '') continue;
+		const ms = value instanceof Date ? value.getTime() : Date.parse(String(value));
+		if (!Number.isNaN(ms)) return new Date(ms).toISOString();
+	}
+	return null;
+}
+
 function escapeHtml(value) {
 	return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 }
@@ -178,7 +192,8 @@ export default async ({ req, res, log, error }) => {
 			error('Failed to read event: ' + err.message);
 			return res.json({ error: 'Event not found' }, 404);
 		}
-		if (!event.date) {
+		const eventStartIso = resolveEventStartIso(event);
+		if (!eventStartIso) {
 			return res.json({ error: "This event has no date set, so a pin-valid-window can't be shown" }, 400);
 		}
 
@@ -192,7 +207,7 @@ export default async ({ req, res, log, error }) => {
 				html: buildEventAssignedHtml({
 					bartenderName: bartender.name || 'there',
 					eventName: event.name,
-					eventDate: event.date,
+					eventDate: eventStartIso,
 					window: computeEventWindow(event),
 					pin: bartender.pin,
 				}),
@@ -218,7 +233,7 @@ export default async ({ req, res, log, error }) => {
 				html: buildCoordinatorNoticeHtml({
 					bartenderName: bartender.name || 'A bartender',
 					eventName: event.name,
-					eventDate: event.date,
+					eventDate: eventStartIso,
 				}),
 			});
 		} catch (err) {

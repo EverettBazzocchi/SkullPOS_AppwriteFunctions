@@ -3,8 +3,9 @@ import { createAppwriteClient } from './appwriteClient.js';
 
 // Returns the currently-active event, reduced to the handful of fields a front-of-house client
 // legitimately needs: the door needs name/price/currency/date/location to sell a ticket, and the
-// register and menu boards need the alcohol gate (sellsAlcohol + the barOpenTime/barCloseTime
-// window) to decide whether the alcohol categories may be displayed and rung up.
+// register and menu boards need the alcohol gate (sellsAlcohol + the bar window -- the
+// barOpensAt/barClosesAt instants, with the legacy barOpenTime/barCloseTime strings still carried
+// alongside them) to decide whether the alcohol categories may be displayed and rung up.
 //
 // Why this exists at all rather than the client querying `Events` directly: every one of those
 // surfaces authenticates as an anonymous or shared session that belongs to no team, while the
@@ -70,7 +71,9 @@ function pickActiveEvent(documents) {
 }
 
 // Deliberately an allowlist, not a denylist: a new financial column added to Events later must
-// not start leaking just because nobody remembered to exclude it here.
+// not start leaking just because nobody remembered to exclude it here. Everything added below is a
+// time or a label; not one financial column is projected, and the test suite pins the key set
+// closed so growing this list stays a deliberate edit.
 function toPublicEvent(doc) {
 	return {
 		$id: doc.$id,
@@ -89,7 +92,30 @@ function toPublicEvent(doc) {
 		sellsAlcohol: doc.sellsAlcohol === true,
 		barOpenTime: doc.barOpenTime ?? null,
 		barCloseTime: doc.barCloseTime ?? null,
+		// The same four instants every server-side reader now prefers, projected through to the
+		// floor so the register and the menu boards can gate on a real timestamp instead of
+		// recombining `date`'s calendar day with an "HH:mm" string -- the recombination that lets
+		// the menu board (which accepts a bare "1800") and the register (which does not) disagree
+		// about the very same event. They are projected ALONGSIDE the legacy strings, never instead
+		// of them: a client that has not migrated yet, and a row that has not been backfilled yet,
+		// both keep working, in any deploy order.
+		//
+		// Normalized to an ISO instant or null -- never an empty string or an unparseable value --
+		// because every client fails the gate closed on null, and that is the safe direction.
+		startsAt: normalizeInstant(doc.startsAt),
+		endsAt: normalizeInstant(doc.endsAt),
+		barOpensAt: normalizeInstant(doc.barOpensAt),
+		barClosesAt: normalizeInstant(doc.barClosesAt),
 	};
+}
+
+// Appwrite hands a datetime attribute back as an ISO string; a Date is accepted too. Anything
+// absent, blank or unparseable becomes null rather than riding through as junk a client would have
+// to defend against on its own.
+function normalizeInstant(value) {
+	if (value === null || value === undefined || value === '') return null;
+	const ms = value instanceof Date ? value.getTime() : Date.parse(String(value));
+	return Number.isNaN(ms) ? null : new Date(ms).toISOString();
 }
 
 // `|| DEFAULT` would rewrite a legitimately free (0-cent) event into a CA$30 charge, so the

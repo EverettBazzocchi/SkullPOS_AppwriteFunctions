@@ -145,9 +145,13 @@ const BARTENDERS_COLLECTION_ID = 'bartenders';
 const PIN_VALID_WINDOW_MS = 60 * 60 * 1000; // buffer on each side of the event's actual window
 
 // True if `now` falls within 1 hour of any of this bartender's assigned events' actual
-// start-to-close window (see eventWindow.js) -- a bartender pin only works for the event(s)
-// they're actually scheduled for, covering their whole shift, not permanently like a
-// POS/self-checkout pin.
+// start-to-close window (see eventWindow.js -- the event's own `startsAt`/`endsAt` and
+// `barOpensAt`/`barClosesAt` instants where they exist, the legacy `date` + bar-hours derivation
+// where they don't) -- a bartender pin only works for the event(s) they're actually scheduled for,
+// covering their whole shift, not permanently like a POS/self-checkout pin.
+//
+// The bartender rows are fetched with Query.select(['*', 'events.*']), so the new attributes come
+// through on the nested events with no query change needed.
 function isWithinAnyEventWindow(events, now = Date.now()) {
 	if (!Array.isArray(events)) return false;
 	return events.some((event) => {
@@ -172,7 +176,7 @@ function isWithinAnyEventWindow(events, now = Date.now()) {
 // Bartender pins are a separate `bartenders` collection (own hash, not
 // mixed into `pins`) -- checked only if nothing in `pins` matched, since a
 // bartender pin has an extra rule none of the others do (only valid within
-// 1 hour of one of their assigned events' `date`) and resolves to a real
+// 1 hour of one of their assigned events' own window) and resolves to a real
 // bartender document id (`bartenderId`) rather than just a display label,
 // so POS can attribute every sale they make back to their own row.
 export default async ({ req, res, log, error }) => {

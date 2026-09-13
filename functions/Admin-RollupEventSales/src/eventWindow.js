@@ -1,5 +1,15 @@
 // Computes the [start, end) window of an event to pull transactions from.
 //
+// PREFERRED -- the event carries real timestamps: `startsAt`/`endsAt` for the event itself and
+// `barOpensAt`/`barClosesAt` for the bar. Each is a full instant written by the admin app, where a
+// real timezone (America/Winnipeg) exists; this function then only ever compares instants, so it
+// needs no zone, no "compose a day with a wall clock" step and none of the guesswork below.
+// The window spans the UNION of the two pairs, because a sale can land any time either the event or
+// the bar is running (a door sale before the bar opens, a last-call ring-up after the event's own
+// end).
+//
+// FALLBACK -- a row that has not been backfilled yet -- is the legacy derivation, unchanged:
+//
 // `date` is trusted as the event's real start instant (it's populated from Zeffy's own
 // occurrence timestamp when synced from there) and used as-is -- deliberately NOT
 // reconstructed from a "calendar day + hour", which would require knowing the venue's timezone.
@@ -16,6 +26,10 @@
 // window; a small hour value (0-11) for event_start is treated there as PM (a nightlife event
 // "starting at 7" means 7pm), while event_end needs no such adjustment since an early-morning value
 // unambiguously means AM. Defaults (7, 4) --> 7pm-4am, a 9-hour window.
+//
+// That small-hour PM guess is exactly the kind of inference the timestamps exist to kill: a row
+// carrying `endsAt`/`barClosesAt` never reaches it. It survives only for rows that have neither,
+// where there is still nothing better to go on.
 const DEFAULT_EVENT_START_HOUR = 7;
 const DEFAULT_EVENT_END_HOUR = 4;
 
@@ -30,6 +44,17 @@ function parseTimeToMinutes(value) {
 	const minute = parseInt(padded.slice(2), 10);
 	if (Number.isNaN(hour) || Number.isNaN(minute) || hour > 23 || minute > 59) return null;
 	return hour * 60 + minute;
+}
+
+/**
+ * Milliseconds for a datetime attribute (ISO string or Date), or null when it is absent, empty or
+ * unparseable -- which is what lets the legacy chain below take over for an un-backfilled row.
+ * Matches Verify-Pin/Admin-EmailBartender's own toMs exactly.
+ */
+function toMs(value) {
+	if (value === null || value === undefined || value === '') return null;
+	const ms = value instanceof Date ? value.getTime() : Date.parse(String(value));
+	return Number.isNaN(ms) ? null : ms;
 }
 
 /** Duration in minutes from the admin-editable bar hours, or null if they aren't usable. */
@@ -54,20 +79,34 @@ function legacyHoursDurationMinutes(event) {
 
 /**
  * @returns {{start: Date, end: Date}|null} null when the event has no usable window at all -- no
- * date, an unparseable date, or a zero-length window (open === close). A zero-length window used
- * to produce start === end, which matched no transactions and then overwrote every one of the
- * event's already-correct rollup figures with zeroes, counted as a successful run; returning null
- * lets main.js skip and report it instead.
+ * start instant of any kind, an unparseable one, or a zero-length window (open === close, or an end
+ * that is not after the start). A zero-length window used to produce start === end, which matched no
+ * transactions and then overwrote every one of the event's already-correct rollup figures with
+ * zeroes, counted as a successful run; returning null lets main.js skip and report it instead.
  */
 export function eventSalesWindow(event) {
-	if (!event || !event.date) return null;
-	const start = new Date(event.date);
-	if (Number.isNaN(start.getTime())) return null;
+	if (!event) return null;
 
-	const barDuration = barHoursDurationMinutes(event);
-	const durationMinutes = barDuration === null ? legacyHoursDurationMinutes(event) : barDuration;
-	if (durationMinutes <= 0) return null;
+	const starts = [toMs(event.startsAt), toMs(event.barOpensAt)].filter((ms) => ms !== null);
+	const ends = [toMs(event.endsAt), toMs(event.barClosesAt)].filter((ms) => ms !== null);
 
-	const end = new Date(start.getTime() + durationMinutes * 60 * 1000);
-	return { start, end };
+	// A half-migrated row (one side written, the other not yet) anchors on whichever side it has and
+	// derives the other the legacy way, so a partial backfill can never void a window.
+	const startMs = starts.length > 0 ? Math.min(...starts) : toMs(event.date);
+	if (startMs === null) return null;
+
+	let endMs;
+	if (ends.length > 0) {
+		endMs = Math.max(...ends);
+	} else {
+		const barDuration = barHoursDurationMinutes(event);
+		const durationMinutes = barDuration === null ? legacyHoursDurationMinutes(event) : barDuration;
+		endMs = startMs + durationMinutes * 60 * 1000;
+	}
+
+	// Covers both the zero-length legacy case and an inverted new-field pair: either way there is no
+	// window to roll up, and reporting it beats silently zeroing the event's figures.
+	if (endMs <= startMs) return null;
+
+	return { start: new Date(startMs), end: new Date(endMs) };
 }
