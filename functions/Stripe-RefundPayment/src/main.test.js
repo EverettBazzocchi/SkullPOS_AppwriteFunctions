@@ -70,6 +70,52 @@ describe("Stripe-RefundPayment", () => {
 		expect(mockStripe.refunds.create).not.toHaveBeenCalled();
 	});
 
+	describe("the durable record a refund leaves behind", () => {
+		const splitSale = {
+			status: "complete",
+			testing: true,
+			payments: JSON.stringify([
+				{ method: "cash", amount: 400 },
+				{ method: "stripe", amount: 600, stripeId: "pi_1" },
+			]),
+		};
+
+		test("records when it happened, how much, and who did it", async () => {
+			// Without these, `status: 'refunded'` is the only trace -- and it is a destructive one:
+			// the rollup recomputes every past event from status === 'complete', so a November
+			// refund silently rewrites September's figures with nothing saying when or why.
+			mockDatabases.getDocument.mockResolvedValue(splitSale);
+			mockDatabases.updateDocument.mockResolvedValue({});
+			mockStripe.refunds.create.mockResolvedValue({ id: "re_1" });
+			const ctx = makeContext({ body: { transactionId: "t1" }, headers: { "x-appwrite-user-id": "manager-7" } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(200);
+			const record = mockDatabases.updateDocument.mock.calls.map((c) => c[3]).find((data) => "refund_amount" in data);
+			expect(record.refund_amount).toBe(1000); // every leg, since this path only does full refunds
+			expect(record.refunded_by).toBe("manager-7");
+			expect(new Date(record.refunded_at).getTime()).not.toBeNaN();
+		});
+
+		test("a project without those attributes yet still gets a completed refund", async () => {
+			// Deploy order must not matter, and a rejected supplemental write must never re-open an
+			// already-reversed refund to a retry.
+			mockDatabases.getDocument.mockResolvedValue(splitSale);
+			mockDatabases.updateDocument.mockImplementation((_db, _col, _id, data) =>
+				"refund_amount" in data ? Promise.reject(new Error("Unknown attribute: refund_amount")) : Promise.resolve({})
+			);
+			mockStripe.refunds.create.mockResolvedValue({ id: "re_1" });
+			const ctx = makeContext({ body: { transactionId: "t1" } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(200);
+			expect(result.body.ok).toBe(true);
+			expect(mockStripe.refunds.create).toHaveBeenCalledWith({ payment_intent: "pi_1", amount: 600 });
+		});
+	});
+
 	test("refuses to refund an already-refunded transaction", async () => {
 		mockDatabases.getDocument.mockResolvedValue({ status: "refunded" });
 		const ctx = makeContext({ body: { transactionId: "t1" } });

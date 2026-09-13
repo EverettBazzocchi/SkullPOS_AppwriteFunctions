@@ -60,6 +60,23 @@ async function isAdmin(users, callerId, error) {
 	}
 }
 
+// Tips are only ever taken on the card reader: Transaction-RecordPayment reads
+// `amount_details.tip.amount` off the captured PaymentIntent, keeps `leg.amount`
+// tip-EXCLUSIVE and carries the tip alongside it as `leg.tip` (main.js:255-327 there). So what
+// Stripe actually deposited for a sale is the stripe leg amount PLUS the stripe leg tip, and
+// that sum is the only figure that reconciles against a payout. Legacy rows predate the
+// per-leg field and carry only `transaction.tip`; by the same reasoning that tip was taken on
+// the reader, so it is attributed to the card leg when the sale had one -- and to nothing at
+// all when it did not, rather than inventing card money that was never deposited.
+function cardTipsFor(transaction, legs) {
+	const perLegTotal = legs.reduce((sum, leg) => sum + (parseInt(leg.tip) || 0), 0);
+	if (perLegTotal > 0) {
+		return legs.reduce((sum, leg) => sum + (leg.method === 'stripe' ? parseInt(leg.tip) || 0 : 0), 0);
+	}
+	const recordedTip = parseInt(transaction.tip) || 0;
+	return legs.some((leg) => leg.method === 'stripe') ? recordedTip : 0;
+}
+
 function emptyReport() {
 	return {
 		ItemsSold: [],
@@ -68,8 +85,10 @@ function emptyReport() {
 		giftcardAmount: 0,
 		cashAmount: 0,
 		cardAmount: 0,
+		cardAmountInclTips: 0,
 		discountAmount: 0,
 		amountPaid: 0,
+		amountPaidInclTips: 0,
 		cogs: 0,
 		alcoholAmount: 0,
 		foodAmount: 0,
@@ -90,6 +109,7 @@ function buildReport(transactions, categoriesById, ingredientCostById) {
 		discountAmount = 0,
 		cogs = 0,
 		amountPaid = 0,
+		cardTips = 0,
 		alcoholAmount = 0,
 		foodAmount = 0,
 		nonAlcoholicDrinksAmount = 0,
@@ -156,7 +176,9 @@ function buildReport(transactions, categoriesById, ingredientCostById) {
 		// Bucket by payment leg rather than the whole transaction's single
 		// payment_method -- a split sale (cash+card, giftcard+card, etc.)
 		// has amounts in more than one bucket.
-		derivePaymentLegs(item).forEach((leg) => {
+		const legs = derivePaymentLegs(item);
+		cardTips += cardTipsFor(item, legs);
+		legs.forEach((leg) => {
 			const amount = parseInt(leg.amount) || 0;
 			amountPaid += amount;
 			if (leg.method === 'cash') cashAmount += amount;
@@ -165,6 +187,14 @@ function buildReport(transactions, categoriesById, ingredientCostById) {
 		});
 	});
 
+	// `cardAmount`/`amountPaid` are what was paid toward the CART, exclusive of tips -- which is
+	// the right number for item/category revenue but reconciles against nothing: the Stripe payout
+	// and the customer's statement both include the tip. So both are also reported tip-inclusive,
+	// as their own fields rather than by redefining the existing ones (every existing caller reads
+	// the tip-exclusive figures and the category breakdown has to keep summing to them).
+	// `cardAmountInclTips` counts only the tips attributable to a card leg -- it is specifically
+	// the Stripe-payout figure -- while `amountPaidInclTips` counts every recorded tip, because it
+	// answers "how much money changed hands", including a tip on a sale that never touched a card.
 	return {
 		ItemsSold,
 		totalSales,
@@ -172,8 +202,10 @@ function buildReport(transactions, categoriesById, ingredientCostById) {
 		giftcardAmount,
 		cashAmount,
 		cardAmount,
+		cardAmountInclTips: cardAmount + cardTips,
 		discountAmount,
 		amountPaid,
+		amountPaidInclTips: amountPaid + tips,
 		cogs,
 		alcoholAmount,
 		foodAmount,

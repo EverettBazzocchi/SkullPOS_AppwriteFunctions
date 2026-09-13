@@ -146,7 +146,11 @@ describe("Verify-Pin", () => {
 			expect(result.body.ok).toBe(true);
 		});
 
-		test("rejects a bartender pin more than 1 hour from its event, with a specific message", async () => {
+		// P2-13: an out-of-window bartender pin must be INDISTINGUISHABLE from a pin that matches
+		// nothing at all. The response used to name the reason ("only valid within 1 hour of your
+		// event's start time"), which identified that one code out of 10,000 as a live bartender
+		// credential to be replayed at the next advertised event.
+		test("rejects a bartender pin outside its event window with the same bare body a wrong pin gets", async () => {
 			const eventDate = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
 			mockDatabases.listDocuments
 				.mockResolvedValueOnce({ documents: [] })
@@ -155,8 +159,32 @@ describe("Verify-Pin", () => {
 
 			const result = await handler(ctx);
 
-			expect(result.body.ok).toBe(false);
-			expect(result.body.error).toMatch(/only valid within 1 hour/i);
+			expect(result).toEqual({ statusCode: 200, body: { ok: false } });
+		});
+
+		test("an out-of-window bartender pin is byte-identical to a pin matching nothing", async () => {
+			const eventDate = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+			mockDatabases.listDocuments
+				.mockResolvedValueOnce({ documents: [] })
+				.mockResolvedValueOnce({ documents: [mockBartenderRow({ pin: "5678", events: [{ date: eventDate }] })] });
+			const outOfWindow = await handler(makeContext({ body: { pin: "5678" } }));
+
+			mockDatabases.listDocuments.mockResolvedValueOnce({ documents: [] }).mockResolvedValueOnce({ documents: [] });
+			const noMatch = await handler(makeContext({ body: { pin: "0001" } }));
+
+			expect(JSON.stringify(outOfWindow)).toBe(JSON.stringify(noMatch));
+		});
+
+		test("the window reason is still written to the execution log for support", async () => {
+			const eventDate = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+			mockDatabases.listDocuments
+				.mockResolvedValueOnce({ documents: [] })
+				.mockResolvedValueOnce({ documents: [mockBartenderRow({ pin: "5678", events: [{ date: eventDate }] })] });
+			const ctx = makeContext({ body: { pin: "5678" } });
+
+			await handler(ctx);
+
+			expect(ctx.log.mock.calls.flat().join("\n")).toMatch(/outside its event's window/i);
 		});
 
 		test("accepts a pin well into a multi-hour shift, past the old fixed 1-hour-from-start cutoff", async () => {
@@ -521,9 +549,10 @@ describe("Verify-Pin", () => {
 					result = await handler(earlyBartenderCtx());
 				}
 
-				// Still the window message, never a lockout -- and nothing was written to the counter.
-				expect(result.statusCode).toBe(200);
-				expect(result.body.error).toMatch(/only valid within 1 hour/i);
+				// Never a lockout, and nothing was written to the counter -- while the body stays
+				// the same bare no-match a wrong PIN gets (P2-13), so the free-of-charge branch
+				// cannot be spotted from the response itself.
+				expect(result).toEqual({ statusCode: 200, body: { ok: false } });
 				expect(mockDatabases.createDocument).not.toHaveBeenCalled();
 				expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
 

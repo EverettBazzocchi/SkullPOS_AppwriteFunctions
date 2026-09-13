@@ -11,6 +11,10 @@ import { derivePaymentLegs } from './paymentLegs.js';
 // (which would otherwise let any session flip a transaction's status
 // directly, cash-paid ones especially, since there's no external payment
 // step to gate a cash refund).
+//
+// Always a FULL refund -- there is no partial-refund path, so the `refund_amount` recorded below
+// is always the whole paid amount. Supporting partials means representing them (a refunded
+// subtotal the reports can subtract), not just passing a smaller number to Stripe.
 const DATABASE_ID = '67c9ffd9003d68236514';
 const TRANSACTIONS_COLLECTION_ID = '68e4cd3500179ce661c6';
 const GIFTCARDS_COLLECTION_ID = 'giftcards';
@@ -114,6 +118,29 @@ export default async ({ req, res, log, error }) => {
 	} catch (err) {
 		error('Failed to mark transaction refunded: ' + err.message);
 		return res.json({ error: `Failed to mark transaction refunded: ${err.message}` }, 500);
+	}
+
+	// The status flip above is the ONLY durable trace a refund leaves today, and it is a
+	// destructive one: Admin-RollupEventSales recomputes every past event from
+	// status === 'complete' on every run, so refunding a September sale in November silently
+	// rewrites September's figures with no record of when it happened or who did it. These three
+	// fields are that record. Written SEPARATELY and best-effort, after the guard above: they are
+	// newer attributes, and until they are created (see the runbook) this update is rejected --
+	// which must never turn a successful refund into a failed one, or re-run reversals on retry.
+	// Once they exist this starts recording with no redeploy.
+	const refundAmount = legs.reduce((sum, leg) => sum + (parseInt(leg.amount) || 0), 0);
+	try {
+		await databases.updateDocument(DATABASE_ID, TRANSACTIONS_COLLECTION_ID, transactionId, {
+			refunded_at: new Date().toISOString(),
+			refund_amount: refundAmount,
+			refunded_by: req.headers['x-appwrite-user-id'],
+		});
+	} catch (err) {
+		error(
+			`Refund of ${transactionId} recorded only as status='refunded' -- could not write refunded_at/` +
+				`refund_amount/refunded_by (${err.message}). Create those three attributes on Transactions to ` +
+				`get a durable, dated refund record.`,
+		);
 	}
 
 	const stripeKey = transaction.testing ? process.env.testKey : process.env.prodKey;

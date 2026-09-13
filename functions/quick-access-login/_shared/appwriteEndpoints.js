@@ -7,9 +7,18 @@
  * resolve/route (confirmed live: each one either DNS-fails or 404s, adding several seconds of
  * dead-end retries per lookup before falling through to the public endpoint, which is the only
  * one that has ever actually worked in production here).
+ *
+ * The first tier reads APPWRITE_FUNCTION_API_ENDPOINT -- the name Appwrite actually injects into a
+ * function's environment, and the one every other function in this repo uses (see
+ * Verify-Pin/src/appwriteClient.js). This used to read APPWRITE_FUNCTION_ENDPOINT, which Appwrite
+ * never sets and which is not among this function's configured variables either, so the tier was
+ * dead: the array collapsed to the single public entry and every rate-limit and PIN lookup left
+ * the box for a public-internet round trip -- which is also the only reason the dns.resolve4
+ * monkey-patch in index.js is needed at all, since that hostname does not resolve normally from
+ * inside the sandbox (P2-14).
  */
 function getAppwriteEndpoints() {
-	return [process.env.APPWRITE_FUNCTION_ENDPOINT, 'https://api.cloud.shotty.tech/v1'].filter(
+	return [process.env.APPWRITE_FUNCTION_API_ENDPOINT, 'https://api.cloud.shotty.tech/v1'].filter(
 		(endpoint, idx, arr) => endpoint && arr.indexOf(endpoint) === idx
 	);
 }

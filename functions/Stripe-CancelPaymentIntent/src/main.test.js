@@ -48,6 +48,60 @@ describe("Stripe-CancelPaymentIntent", () => {
 		expect(mockStripe.lastConstructedWithKey).toBe("sk_test_fake");
 	});
 
+	// P2-19. The live/test decision is the one that picks which Stripe ACCOUNT
+	// the call lands on, and it used to be spelled four different ways across the
+	// four Stripe functions -- resolving the same body in opposite directions.
+	// This table is duplicated verbatim in Stripe-CreatePaymentIntent's test file
+	// and must stay identical to it: that is what "converged" means here. The one
+	// deliberate difference is the last case, an ABSENT mode, where refusing would
+	// strand an uncaptured intent on the reader instead of just declining to mint
+	// one -- see the note at the call site.
+	describe("live/test mode resolution", () => {
+		const cancellable = (mode) => makeContext({ body: { intent: "pi_1", ...mode } });
+
+		beforeEach(() => {
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({ id: "pi_1", status: "requires_payment_method" });
+			mockStripe.paymentIntents.cancel.mockResolvedValue({ id: "pi_1", status: "canceled" });
+		});
+
+		test.each([
+			["{ test: 'test' }", { test: "test" }, "sk_test_fake"],
+			["{ test: '' }", { test: "" }, "sk_live_fake"],
+			["{ isLive: true }", { isLive: true }, "sk_live_fake"],
+			["{ isLive: false }", { isLive: false }, "sk_test_fake"],
+			["{ environment: 'live' }", { environment: "live" }, "sk_live_fake"],
+			["{ environment: 'test' }", { environment: "test" }, "sk_test_fake"],
+			["agreeing spellings", { isLive: false, environment: "test" }, "sk_test_fake"],
+		])("%s selects the right key", async (_label, mode, expectedKey) => {
+			await handler(cancellable(mode));
+
+			expect(mockStripe.lastConstructedWithKey).toBe(expectedKey);
+		});
+
+		test.each([
+			["a stringified isLive", { isLive: "true" }, /isLive must be true or false/],
+			["an unrecognised environment", { environment: "production" }, /environment must be "live" or "test"/],
+			["a non-string test flag", { test: true }, /test must be/],
+			["two spellings that disagree", { isLive: true, environment: "test" }, /Contradictory Stripe mode/],
+		])("%s is refused rather than guessed", async (_label, mode, expectedError) => {
+			const result = await handler(cancellable(mode));
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(expectedError);
+			expect(mockStripe.paymentIntents.cancel).not.toHaveBeenCalled();
+		});
+
+		test("an absent mode still cancels -- against live, and says so", async () => {
+			const ctx = cancellable({});
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(200);
+			expect(mockStripe.lastConstructedWithKey).toBe("sk_live_fake");
+			expect(ctx.error).toHaveBeenCalledWith(expect.stringMatching(/named no Stripe mode -- defaulting to LIVE/));
+		});
+	});
+
 	describe("input validation", () => {
 		test("an unparseable body is a 400, not a thrown execution", async () => {
 			const ctx = makeContext({ body: {} });

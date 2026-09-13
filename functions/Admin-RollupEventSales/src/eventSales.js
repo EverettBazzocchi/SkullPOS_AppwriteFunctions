@@ -15,12 +15,26 @@ import { derivePaymentLegs } from './paymentLegs.js';
 //   tips_earned     <- tips
 //   cash_sales      <- cashAmount
 //   card_sales      <- cardAmount
-//   revenue         <- amountPaid (what actually got paid, net of discount, gross of tips)
+//   revenue         <- amountPaid (what actually got paid, net of discount, and EXCLUSIVE of
+//                      tips -- tips are tracked separately as tips_earned and are not part of
+//                      any of the sales/revenue figures here. The docstring used to claim
+//                      "gross of tips", which was the exact opposite of what the code does and
+//                      of what the live rows show: HAX 7.0's card+cash+giftcard sums to
+//                      pos_revenue exactly, with tips_earned entirely outside it.)
 //   cogs            <- cogs
 //   profit          <- revenue - cogs (not computed by Sales-Report itself; POS's own
 //                      salesReport.js UI derives it the same way for on-screen display only)
+//
+// Also returns `card_tips`, which is NOT an Events attribute -- main.js peels it off and uses
+// it for the tip-inclusive card figure (see its use there). It is the card-reader tip money
+// that landed in the same Stripe payout as card_sales, so card_sales + card_tips is the only
+// number here that can be reconciled against a Stripe deposit.
+//
+// Membership dues (`channel === 'membership'`) are NOT fed to this function -- main.js filters
+// them out before calling it, so an event's bar revenue is bar revenue. See the note there.
 export function emptyEventSales() {
 	return {
+		card_tips: 0,
 		alcohol_sales: 0,
 		food_sales: 0,
 		drink_sales: 0,
@@ -35,10 +49,28 @@ export function emptyEventSales() {
 	};
 }
 
+// Tips are only ever taken on the card reader: Transaction-RecordPayment reads
+// `amount_details.tip.amount` off the captured PaymentIntent, keeps `leg.amount`
+// tip-EXCLUSIVE and carries the tip alongside it as `leg.tip` (main.js:255-327 there). So what
+// Stripe actually deposited for a sale is the stripe leg amount PLUS the stripe leg tip, and
+// that sum is the only figure that reconciles against a payout. Legacy rows predate the
+// per-leg field and carry only `transaction.tip`; by the same reasoning that tip was taken on
+// the reader, so it is attributed to the card leg when the sale had one -- and to nothing at
+// all when it did not, rather than inventing card money that was never deposited.
+function cardTipsFor(transaction, legs) {
+	const perLegTotal = legs.reduce((sum, leg) => sum + (parseInt(leg.tip) || 0), 0);
+	if (perLegTotal > 0) {
+		return legs.reduce((sum, leg) => sum + (leg.method === 'stripe' ? parseInt(leg.tip) || 0 : 0), 0);
+	}
+	const recordedTip = parseInt(transaction.tip) || 0;
+	return legs.some((leg) => leg.method === 'stripe') ? recordedTip : 0;
+}
+
 export function buildEventSales(transactions, categoriesById, ingredientCostById) {
 	if (transactions.length === 0) return emptyEventSales();
 
-	let alcoholAmount = 0,
+	let cardTips = 0,
+		alcoholAmount = 0,
 		foodAmount = 0,
 		nonAlcoholicDrinksAmount = 0,
 		otherAmountSold = 0,
@@ -93,7 +125,9 @@ export function buildEventSales(transactions, categoriesById, ingredientCostById
 
 		// Bucket by payment leg rather than the whole transaction's single payment_method -- a
 		// split sale (cash+card, giftcard+card, etc.) has amounts in more than one bucket.
-		derivePaymentLegs(transaction).forEach((leg) => {
+		const legs = derivePaymentLegs(transaction);
+		cardTips += cardTipsFor(transaction, legs);
+		legs.forEach((leg) => {
 			const amount = parseInt(leg.amount) || 0;
 			amountPaid += amount;
 			if (leg.method === 'cash') cashAmount += amount;
@@ -107,6 +141,7 @@ export function buildEventSales(transactions, categoriesById, ingredientCostById
 	// profit inherits that through the subtraction, so round everything on the way out rather
 	// than special-casing just those two.
 	return {
+		card_tips: Math.round(cardTips),
 		alcohol_sales: Math.round(alcoholAmount),
 		food_sales: Math.round(foodAmount + otherAmountSold),
 		drink_sales: Math.round(nonAlcoholicDrinksAmount),

@@ -6,9 +6,17 @@ import { createAppwriteClient } from './appwriteClient.js';
 // cashier, self-checkout kiosk, ShottyTicketing door staff), all stored as
 // hashed rows in the shared `pins` collection -- read at verification time
 // by Verify-Pin (system in ['pos','self_checkout']) and quick-access-login
-// (system:'ticketing'). Admin-execute-only (enforced by Appwrite's own
-// function execute permission, no in-code check needed -- same pattern as
-// Stripe-RefundPayment).
+// (system:'ticketing').
+//
+// Admin-only twice over: Appwrite's own execute permission restricts this
+// function to the admin team, AND the handler refuses any caller with no
+// user identity (see the guard at the top of the handler). The comment that
+// used to sit here claimed the execute permission was enough "-- same
+// pattern as Stripe-RefundPayment"; that was backwards. Stripe-RefundPayment
+// (main.js:55-64) is precisely the function that documents and enforces the
+// opposite, because a project API key holding `execution.write` invokes any
+// function regardless of its execute allowlist -- and this one hands back a
+// working POS PIN in its response body (P2-12).
 //
 // The raw 4-digit code is generated server-side (crypto.randomInt, never
 // client-supplied). Verify-Pin only ever checks the sha256 hash (`hash`,
@@ -66,6 +74,17 @@ async function generateUniquePin(databases, excludePinId) {
 }
 
 export default async ({ req, res, log, error }) => {
+	// Defence in depth (P2-12): this function's execute scope is restricted to the admin team, but
+	// a project API key with `execution.write` can invoke it directly with no Appwrite user session
+	// at all, bypassing that allowlist entirely -- and a successful call returns a working 4-digit
+	// PIN in the response body. Appwrite sets this header itself for a session-authenticated call;
+	// it is not something a request body or a caller-supplied header map can forge into existence
+	// on a key-only execution. The admin app always has a session, so requiring it costs nothing.
+	if (!req.headers['x-appwrite-user-id']) {
+		error('Refused pin generation with no caller identity (missing x-appwrite-user-id).');
+		return res.json({ error: 'Unauthorized' }, 403);
+	}
+
 	let body;
 	try {
 		body = JSON.parse(req.body || '{}');
@@ -88,12 +107,21 @@ export default async ({ req, res, log, error }) => {
 			return res.json({ error: 'Missing pinId' }, 400);
 		}
 		try {
-			await databases.updateDocument(DATABASE_ID, PINS_COLLECTION_ID, pinId, { active: false });
+			// Revocation scrubs the plaintext as well as flipping the flag (P2-10). This used to
+			// write `{ active: false }` alone, leaving the working 4-digit code sitting in `pin`
+			// forever -- so a code revoked *because it leaked* stayed readable by every principal
+			// that can read this collection, and an accidental `active: true` re-armed a credential
+			// whose plaintext was still on file. `pin` is the one nullable field of the three;
+			// `hash` is required:true so it has to stay, which also keeps this code reserved
+			// against reissue by `hashIsTaken` below. That residual hash is still a 4-digit
+			// preimage away from the code (P2-10 proper); what keeps it safe is the collection's
+			// admin-team-only read permission, not the digest.
+			await databases.updateDocument(DATABASE_ID, PINS_COLLECTION_ID, pinId, { active: false, pin: null });
 		} catch (err) {
 			error('Failed to revoke pin: ' + err.message);
 			return res.json({ error: `Failed to revoke pin: ${err.message}` }, 404);
 		}
-		log(`Revoked pin ${pinId}`);
+		log(`Revoked pin ${pinId} (plaintext scrubbed)`);
 		return res.json({ ok: true });
 	}
 

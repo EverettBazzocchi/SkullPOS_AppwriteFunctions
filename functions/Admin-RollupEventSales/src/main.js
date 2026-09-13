@@ -13,6 +13,9 @@ import { fetchEventTicketRevenue, buildTicketBoundsByEventId } from './ticketRev
 //   - pos_revenue -- POS-only revenue (what buildEventSales calls "revenue")
 //   - revenue -- pos_revenue + ticket sales combined (the event's actual total take)
 //   - profit -- revenue (combined) - cogs (POS-only; tickets have no COGS concept here)
+//   - card_sales_incl_tips -- card_sales plus the card-reader tips taken with it, i.e. what
+//     Stripe deposited. Written separately and best-effort; see TIP_INCLUSIVE_ATTRIBUTE below.
+// Membership dues are excluded from all of the above -- see the filter in the loop.
 // Recomputes every past event on every run (idempotent overwrite) rather than tracking a
 // "already rolled up" flag -- correctness (a late-arriving transaction, a refund, a ticket sale
 // recorded after the fact) matters more than the trivial cost of re-aggregating at this data
@@ -23,6 +26,13 @@ const TRANSACTIONS_COLLECTION_ID = '68e4cd3500179ce661c6';
 const CATEGORIES_COLLECTION_ID = '67c9ffdd0039c4e09c9a';
 const INGREDIENTS_COLLECTION_ID = 'ingredients';
 const PAGE_SIZE = 100;
+
+// `card_sales` + the card-reader tips taken alongside it -- i.e. what Stripe actually deposited
+// for this event. Written as a SECOND, best-effort update rather than folded into the main one
+// because it is a newer Events attribute: until it is created (see the runbook), the write below
+// fails with "unknown attribute" and the figures that already exist must still land. Once the
+// attribute exists this starts populating on the next daily run with no redeploy.
+const TIP_INCLUSIVE_ATTRIBUTE = 'card_sales_incl_tips';
 
 async function fetchAllDocuments(databases, databaseId, collectionId, extraQueries = []) {
 	let allDocuments = [];
@@ -108,6 +118,9 @@ export default async ({ req, res, log, error }) => {
 	const updated = [];
 	const failures = [];
 	const needsReview = [];
+	// Flipped off the first time the tip-inclusive write is rejected, so a project that has not
+	// had the attribute created yet logs it once rather than once per due event per run.
+	let tipInclusiveAttributeMissing = false;
 
 	for (const { event, window } of dueEvents) {
 		try {
@@ -118,7 +131,16 @@ export default async ({ req, res, log, error }) => {
 				Query.lessThanEqual('$createdAt', window.end.toISOString()),
 			]);
 
-			const posSales = buildEventSales(transactions, categoriesById, ingredientCostById);
+			// Membership dues are not bar revenue. They are rung up at the same terminal during the
+			// same hours, so the window catches them, but the Sales Report already treats
+			// `channel === 'membership'` as a separable non-sales channel
+			// (POS/src/components/pos/salesReport.js) -- counting them as an event's revenue/profit
+			// here made the two consumers disagree about the same $40. Filtered in JS, not as a
+			// Query.notEqual, because `channel` is NULL on the 986 pre-attribute rows and a
+			// notEqual would drop every one of those legacy POS sales with it (P1-28).
+			const barTransactions = transactions.filter((transaction) => transaction.channel !== 'membership');
+
+			const { card_tips: cardTips, ...posSales } = buildEventSales(barTransactions, categoriesById, ingredientCostById);
 			const ticketRevenue = await fetchEventTicketRevenue(
 				databases,
 				DATABASE_ID,
@@ -153,6 +175,25 @@ export default async ({ req, res, log, error }) => {
 			};
 			await databases.updateDocument(DATABASE_ID, EVENTS_COLLECTION_ID, event.$id, sales);
 			updated.push(event.$id);
+
+			// Separate, best-effort, and deliberately AFTER the write above: a rejection here (the
+			// attribute not existing yet) must not cost the event its real figures or mark the
+			// rollup as failed.
+			if (!tipInclusiveAttributeMissing) {
+				try {
+					await databases.updateDocument(DATABASE_ID, EVENTS_COLLECTION_ID, event.$id, {
+						[TIP_INCLUSIVE_ATTRIBUTE]: posSales.card_sales + cardTips,
+					});
+				} catch (err) {
+					tipInclusiveAttributeMissing = true;
+					error(
+						`Could not write ${TIP_INCLUSIVE_ATTRIBUTE} (${err.message}) -- the tip-exclusive figures were still ` +
+							`written. Create the attribute to start recording what Stripe actually deposited: ` +
+							`databases create-integer-attribute --database-id ${DATABASE_ID} --collection-id ${EVENTS_COLLECTION_ID} ` +
+							`--key ${TIP_INCLUSIVE_ATTRIBUTE} --required false`,
+					);
+				}
+			}
 		} catch (err) {
 			error(`Failed to roll up sales for event ${event.$id} ("${event.name}"): ` + err.message);
 			failures.push({ id: event.$id, name: event.name, error: err.message });

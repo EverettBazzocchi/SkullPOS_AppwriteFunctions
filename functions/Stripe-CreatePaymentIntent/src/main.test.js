@@ -135,6 +135,65 @@ describe("Stripe-CreatePaymentIntent", () => {
 		expect(result.body.clientSecret).toBe("pi_secret_123");
 	});
 
+	// P2-19. The live/test decision is the one that picks which Stripe ACCOUNT
+	// moves the money, and it used to be spelled four different ways across the
+	// four Stripe functions -- resolving the same body in opposite directions.
+	// This table is duplicated verbatim in Stripe-CancelPaymentIntent's test file
+	// and must stay identical to it: that is what "converged" means here.
+	describe("live/test mode resolution", () => {
+		const ticketing = (overrides) => ({ amount: 3000, currency: "cad", ...overrides });
+
+		test.each([
+			["{ test: 'test' }", { test: "test" }, "sk_test_fake"],
+			["{ test: '' }", { test: "" }, "sk_live_fake"],
+			["{ isLive: true }", { isLive: true }, "sk_live_fake"],
+			["{ isLive: false }", { isLive: false }, "sk_test_fake"],
+			["{ environment: 'live' }", { environment: "live" }, "sk_live_fake"],
+			["{ environment: 'test' }", { environment: "test" }, "sk_test_fake"],
+			["agreeing spellings", { isLive: false, environment: "test" }, "sk_test_fake"],
+		])("%s selects the right key", async (_label, mode, expectedKey) => {
+			mockStripe.paymentIntents.create.mockResolvedValue({ client_secret: "pi_secret" });
+			const ctx = makeContext({ body: ticketing(mode) });
+
+			await handler(ctx);
+
+			expect(mockStripe.lastConstructedWithKey).toBe(expectedKey);
+		});
+
+		test.each([
+			// Both of these used to resolve silently to TEST while the caller
+			// plainly meant live.
+			["a stringified isLive", { isLive: "true" }, /isLive must be true or false/],
+			["an unrecognised environment", { environment: "production" }, /environment must be "live" or "test"/],
+			["a non-string test flag", { test: true }, /test must be/],
+			// Previously decided by whichever `if` came first.
+			["two spellings that disagree", { isLive: true, environment: "test" }, /Contradictory Stripe mode/],
+			// Nothing captured yet, so refusing costs nothing -- and it means no
+			// intent can exist whose Stripe account was ever guessed.
+			["no mode at all", {}, /No Stripe mode given/],
+		])("%s is refused rather than guessed", async (_label, mode, expectedError) => {
+			mockStripe.paymentIntents.create.mockResolvedValue({ client_secret: "pi_secret" });
+			const ctx = makeContext({ body: { amount: 3000, transactionId: "txn_abc", ...mode } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(expectedError);
+			expect(mockStripe.paymentIntents.create).not.toHaveBeenCalled();
+		});
+
+		test("a missing key for the resolved mode is a 500, not a call to Stripe with `undefined`", async () => {
+			delete process.env.prodKey;
+			const ctx = makeContext({ body: { test: "", amount: 500, transactionId: "txn_abc" } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(500);
+			expect(result.body.error).toMatch(/live key is not configured/i);
+			expect(mockStripe.paymentIntents.create).not.toHaveBeenCalled();
+		});
+	});
+
 	test("an invalid JSON body is rejected with a 400", async () => {
 		const ctx = makeContext({ body: {} });
 		ctx.req.body = "not json";

@@ -135,6 +135,61 @@ describe("buildEventSales", () => {
 		expect(Number.isInteger(sales.profit)).toBe(true);
 	});
 
+	describe("card_tips -- the tip money that landed in the same Stripe payout as card_sales", () => {
+		test("is the tip on the card leg, and is kept out of every sales/revenue figure", () => {
+			const transactions = [
+				{
+					cart: cartJson([{ name: "Beer", price: 750, quantity: 1, alcohol: true }]),
+					tip: 100,
+					discount: 0,
+					payments: JSON.stringify([{ method: "stripe", amount: 750, stripeId: "pi_1", tip: 100 }]),
+				},
+			];
+			const sales = buildEventSales(transactions, {}, {});
+
+			expect(sales.card_tips).toBe(100);
+			expect(sales.tips_earned).toBe(100);
+			// The documented invariant the old "gross of tips" docstring denied: the payment buckets
+			// sum to revenue exactly, with the tip sitting entirely outside it.
+			expect(sales.cash_sales + sales.card_sales + sales.gift_card_amount).toBe(sales.revenue);
+			expect(sales.revenue).toBe(750);
+			expect(sales.card_sales + sales.card_tips).toBe(850);
+		});
+
+		test("attributes a legacy row's transaction-level tip to its card leg", () => {
+			const transactions = [{ cart: cartJson([]), tip: 200, discount: 0, total: 1000, stripe_id: "pi_1", payment_due: 1000 }];
+			const sales = buildEventSales(transactions, {}, {});
+			expect(sales.card_sales).toBe(1000);
+			expect(sales.card_tips).toBe(200);
+		});
+
+		test("is zero for a tip recorded on a sale that never touched a card", () => {
+			const transactions = [
+				{ cart: cartJson([]), tip: 200, discount: 0, payments: JSON.stringify([{ method: "cash", amount: 1000 }]) },
+			];
+			const sales = buildEventSales(transactions, {}, {});
+			expect(sales.tips_earned).toBe(200);
+			expect(sales.card_tips).toBe(0);
+		});
+
+		test("counts only the card leg's share of a split sale's tip", () => {
+			const transactions = [
+				{
+					cart: cartJson([]),
+					tip: 300,
+					discount: 0,
+					payments: JSON.stringify([
+						{ method: "cash", amount: 1000 },
+						{ method: "stripe", amount: 1000, stripeId: "pi_2", tip: 300 },
+					]),
+				},
+			];
+			const sales = buildEventSales(transactions, {}, {});
+			expect(sales.card_tips).toBe(300);
+			expect(sales.cash_sales).toBe(1000);
+		});
+	});
+
 	test("tolerates an unparseable cart without throwing", () => {
 		const transactions = [{ cart: "{not json", tip: 50, discount: 0, total: 1000, payment_due: 1000 }];
 		const sales = buildEventSales(transactions, {}, {});

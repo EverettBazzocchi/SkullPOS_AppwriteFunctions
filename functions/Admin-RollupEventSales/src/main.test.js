@@ -105,6 +105,97 @@ describe("Admin-RollupEventSales", () => {
 		);
 	});
 
+	describe("membership dues are not bar revenue", () => {
+		test("a dues payment rung up during the event is left out of the event's figures", async () => {
+			// The Sales Report already treats `membership` as a separable non-sales channel; rolling
+			// it into revenue/profit here made the two consumers disagree about the same $40.
+			wireCollections({
+				events: [pastEvent("e1")],
+				transactions: [
+					{ cart: JSON.stringify([]), tip: 0, discount: 0, total: 1000, payment_due: 1000, channel: "pos" },
+					{ cart: JSON.stringify([]), tip: 0, discount: 0, total: 4000, payment_due: 4000, channel: "membership" },
+				],
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			await handler(ctx);
+
+			expect(mockDatabases.updateDocument).toHaveBeenCalledWith(
+				expect.any(String),
+				EVENTS_ID,
+				"e1",
+				expect.objectContaining({ pos_revenue: 1000, revenue: 1000, cash_sales: 1000 })
+			);
+		});
+
+		test("still counts the legacy rows whose channel was never set", async () => {
+			// `channel` is NULL on 986 of 1,056 rows -- excluding dues with a Query.notEqual would
+			// have dropped every one of those real POS sales along with them.
+			wireCollections({
+				events: [pastEvent("e1")],
+				transactions: [{ cart: JSON.stringify([]), tip: 0, discount: 0, total: 1000, payment_due: 1000 }],
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			await handler(ctx);
+
+			expect(mockDatabases.updateDocument).toHaveBeenCalledWith(
+				expect.any(String),
+				EVENTS_ID,
+				"e1",
+				expect.objectContaining({ pos_revenue: 1000 })
+			);
+		});
+	});
+
+	describe("card_sales_incl_tips -- what Stripe actually deposited", () => {
+		const tippedCardSale = {
+			cart: JSON.stringify([]),
+			tip: 100,
+			discount: 0,
+			total: 750,
+			payments: JSON.stringify([{ method: "stripe", amount: 750, stripeId: "pi_1", tip: 100 }]),
+		};
+
+		function writesFor(eventId) {
+			return mockDatabases.updateDocument.mock.calls.filter((c) => c[1] === EVENTS_ID && c[2] === eventId).map((c) => c[3]);
+		}
+
+		test("is written alongside the tip-exclusive figures", async () => {
+			wireCollections({ events: [pastEvent("e1")], transactions: [tippedCardSale] });
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: {} });
+
+			await handler(ctx);
+
+			const writes = writesFor("e1");
+			expect(writes).toContainEqual(expect.objectContaining({ card_sales: 750, tips_earned: 100, pos_revenue: 750 }));
+			expect(writes).toContainEqual({ card_sales_incl_tips: 850 });
+			// the non-schema helper value must never reach the document
+			writes.forEach((write) => expect(write).not.toHaveProperty("card_tips"));
+		});
+
+		test("a project without the attribute yet still gets its real figures, and is told once", async () => {
+			// Deploy order must not matter: until the attribute is created, this write is rejected,
+			// and a rejected supplemental write must not cost the event the figures that do exist.
+			wireCollections({ events: [pastEvent("e1"), pastEvent("e2")], transactions: [tippedCardSale] });
+			mockDatabases.updateDocument.mockImplementation((_db, _col, _id, data) =>
+				"card_sales_incl_tips" in data ? Promise.reject(new Error("Unknown attribute: card_sales_incl_tips")) : Promise.resolve({})
+			);
+			const ctx = makeContext({ body: {} });
+
+			const result = await handler(ctx);
+
+			expect(result.body.updated).toEqual(["e1", "e2"]);
+			expect(result.body.failures).toEqual([]);
+			expect(writesFor("e2")).toEqual([expect.objectContaining({ card_sales: 750 })]); // not retried
+			expect(ctx.error).toHaveBeenCalledTimes(1);
+			expect(ctx.error.mock.calls[0][0]).toMatch(/card_sales_incl_tips/);
+		});
+	});
+
 	test("combines ticket sales into revenue and profit, keeping pos_revenue as the POS-only figure", async () => {
 		const transactions = [{ cart: JSON.stringify([]), tip: 0, discount: 0, total: 1000, payment_due: 1000 }];
 		const tickets = [

@@ -31,8 +31,20 @@ const sha256 = (value) => crypto.createHash('sha256').update(String(value)).dige
  * documents in memory, and rejects an off-schema document payload with the same 400 the live
  * structure validator returns.
  */
-function makeAppwrite({ pins = [], tokenStatus = 201, rateLimitWriteStatus = null } = {}) {
+function makeAppwrite({ pins = [], tokenStatus = 201, rateLimitWriteStatus = null, incrementStatus = null } = {}) {
 	const state = { rateLimits: {}, requests: [] };
+
+	// Appwrite 1.7+ serves PATCH .../documents/{id}/{attribute}/increment, applied server-side, so
+	// concurrent callers each get their own distinct resulting value instead of all reading the
+	// same one (P2-16). Modelled here the same way: read-add-store happens inside the single
+	// synchronous `route` call, which is atomic with respect to the interleaved async handlers.
+	function handleIncrement(docId, attribute, value) {
+		if (incrementStatus) return { status: incrementStatus, body: { message: 'increment unavailable' } };
+		const row = state.rateLimits[docId];
+		if (!row) return { status: 404, body: { message: 'Document not found' } };
+		row[attribute] = (row[attribute] || 0) + (typeof value === 'number' ? value : 1);
+		return { status: 200, body: row };
+	}
 
 	function handleRateLimitWrite(docId, data) {
 		if (rateLimitWriteStatus) {
@@ -55,7 +67,12 @@ function makeAppwrite({ pins = [], tokenStatus = 201, rateLimitWriteStatus = nul
 			state.requests.push(request);
 			const { method, path, body } = request;
 
-			const rateLimitDoc = path.match(/\/collections\/rate_limits\/documents\/([^/?]+)/);
+			const increment = path.match(/\/collections\/rate_limits\/documents\/([^/?]+)\/([^/?]+)\/increment$/);
+			if (increment && method === 'PATCH') {
+				return handleIncrement(increment[1], increment[2], body && body.value);
+			}
+
+			const rateLimitDoc = path.match(/\/collections\/rate_limits\/documents\/([^/?]+)$/);
 			if (rateLimitDoc) {
 				const docId = rateLimitDoc[1];
 				if (method === 'GET') {
@@ -115,6 +132,7 @@ function installAppwrite(appwrite) {
 			setImmediate(() => {
 				const outcome = appwrite.route({
 					method: options.method,
+					hostname: options.hostname,
 					path: options.path,
 					headers: options.headers,
 					body: written ? JSON.parse(written) : null,
@@ -150,7 +168,35 @@ describe('quick-access-login', () => {
 		jest.clearAllMocks();
 		process.env.QUICK_ACCESS_USER_ID = QUICK_ACCESS_USER_ID;
 		process.env.APPWRITE_API_KEY = 'test-api-key';
+		delete process.env.APPWRITE_FUNCTION_API_ENDPOINT;
 		delete process.env.APPWRITE_FUNCTION_ENDPOINT;
+	});
+
+	// P2-14: the "try the function-provided endpoint first" tier read APPWRITE_FUNCTION_ENDPOINT,
+	// a name Appwrite does not inject and this function does not define, so it was dead and every
+	// lookup went out to the public endpoint instead.
+	describe('endpoint selection', () => {
+		test('prefers the endpoint Appwrite actually injects, under the name it actually uses', async () => {
+			process.env.APPWRITE_FUNCTION_API_ENDPOINT = 'https://appwrite-internal/v1';
+			const appwrite = installAppwrite(makeAppwrite({ pins: [activeTicketingPin('4321')] }));
+
+			const result = await handler(loginCtx('4321'));
+
+			expect(result.statusCode).toBe(200);
+			expect(appwrite.state.requests[0].hostname).toBe('appwrite-internal');
+			// an internal address sits behind a Host-routed proxy, so it still carries the public Host
+			expect(appwrite.state.requests[0].headers.Host).toBe('api.cloud.shotty.tech');
+		});
+
+		test('the old, never-injected variable name no longer steers anything', async () => {
+			process.env.APPWRITE_FUNCTION_ENDPOINT = 'https://legacy-name/v1';
+			const appwrite = installAppwrite(makeAppwrite({ pins: [activeTicketingPin('4321')] }));
+
+			await handler(loginCtx('4321'));
+
+			expect(appwrite.state.requests.some((request) => request.hostname === 'legacy-name')).toBe(false);
+			expect(appwrite.state.requests.every((request) => request.hostname === 'api.cloud.shotty.tech')).toBe(true);
+		});
 	});
 
 	describe('the PIN gate', () => {
@@ -307,7 +353,8 @@ describe('quick-access-login', () => {
 			await handler(loginCtx('9999'));
 
 			const writes = appwrite.state.requests.filter(
-				(request) => request.method !== 'GET' && request.path.includes('/collections/rate_limits/'),
+				(request) =>
+					request.method !== 'GET' && request.path.includes('/collections/rate_limits/') && request.body && request.body.data,
 			);
 			expect(writes.length).toBeGreaterThan(0);
 			for (const write of writes) {
@@ -411,6 +458,73 @@ describe('quick-access-login', () => {
 
 			expect(result.statusCode).toBe(503);
 			expect(result.body.error).toMatch(/temporarily unavailable/i);
+		});
+
+		// P2-16: the counter used to be a read-modify-write with no conditional write and no version
+		// check. A burst of concurrent executions all read the same `attempts`, all passed the
+		// lockout check, and all wrote back the same successor -- so the persisted counter moved by
+		// one no matter how many PINs were tried at once, and the whole 4-digit space could be
+		// walked in bursts while the limiter recorded a single failure.
+		describe('concurrent bursts (the counter must not collapse)', () => {
+			test('ten simultaneous wrong PINs persist as ten attempts, not one', async () => {
+				const appwrite = installAppwrite(makeAppwrite({ pins: [activeTicketingPin('4321')] }));
+
+				await Promise.all(Array.from({ length: 10 }, (_, i) => handler(loginCtx(String(1000 + i)))));
+
+				const callerRow = Object.entries(appwrite.state.rateLimits).find(([docId]) => docId.startsWith('qa_c_'))[1];
+				const ipRow = Object.entries(appwrite.state.rateLimits).find(([docId]) => docId.startsWith('qa_ip_'))[1];
+				expect(callerRow.attempts).toBe(10);
+				expect(ipRow.attempts).toBe(10);
+			});
+
+			test('a burst that crosses the threshold leaves the bucket actually locked', async () => {
+				const appwrite = installAppwrite(makeAppwrite({ pins: [activeTicketingPin('4321')] }));
+
+				await Promise.all(Array.from({ length: 8 }, (_, i) => handler(loginCtx(String(2000 + i)))));
+
+				// Every one of the 8 read the counter before any of them wrote, so none could be
+				// refused at the door -- but the burst must not be repeatable: the next attempt is.
+				const result = await handler(loginCtx('9999'));
+				expect(result.statusCode).toBe(429);
+				const callerRow = Object.entries(appwrite.state.rateLimits).find(([docId]) => docId.startsWith('qa_c_'))[1];
+				expect(callerRow.lockedUntil).not.toBeNull();
+			});
+
+			test('the increment is asked of the server, not computed here', async () => {
+				const appwrite = installAppwrite(makeAppwrite({ pins: [activeTicketingPin('4321')] }));
+
+				await handler(loginCtx('9999'));
+				await handler(loginCtx('8888'));
+
+				const increments = appwrite.state.requests.filter((request) => request.path.endsWith('/attempts/increment'));
+				expect(increments.length).toBeGreaterThan(0);
+				for (const increment of increments) {
+					expect(increment.method).toBe('PATCH');
+					expect(increment.body).toEqual({ value: 1 });
+				}
+			});
+		});
+
+		// The increment route only exists from Appwrite 1.7. On anything older it 404s, and a
+		// racily-counted limiter is still better than refusing every wrong PIN with a 503.
+		test('falls back to read-modify-write when the server has no increment route', async () => {
+			const appwrite = installAppwrite(makeAppwrite({ pins: [activeTicketingPin('4321')], incrementStatus: 404 }));
+
+			await handler(loginCtx('9999'));
+			const second = await handler(loginCtx('8888'));
+
+			expect(second.statusCode).toBe(401);
+			expect(Object.values(appwrite.state.rateLimits).some((row) => row.attempts === 2)).toBe(true);
+		});
+
+		test('an increment rejected for any other reason fails closed rather than going uncounted', async () => {
+			const appwrite = installAppwrite(makeAppwrite({ pins: [activeTicketingPin('4321')], incrementStatus: 500 }));
+
+			expect((await handler(loginCtx('9999'))).statusCode).toBe(401);
+			const second = await handler(loginCtx('8888'));
+
+			expect(second.statusCode).toBe(503);
+			expect(appwrite.state.requests.some((request) => request.path.includes('/tokens'))).toBe(false);
 		});
 
 		test('an unreachable rate-limit store refuses a wrong PIN but still honours a correct one', async () => {

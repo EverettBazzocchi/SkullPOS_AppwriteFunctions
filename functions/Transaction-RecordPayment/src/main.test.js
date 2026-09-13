@@ -111,7 +111,8 @@ describe("Transaction-RecordPayment", () => {
 		test("applies a giftcard leg and decrements its balance", async () => {
 			mockDatabases.getDocument
 				.mockResolvedValueOnce(baseTransaction()) // transaction
-				.mockResolvedValueOnce({ balance: 5000 }); // giftcard
+				.mockResolvedValueOnce({ balance: 5000 }) // giftcard
+				.mockResolvedValueOnce(baseTransaction()); // pre-commit re-read (P2-4)
 			mockDatabases.updateDocument.mockResolvedValue({});
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "giftcard", amount: 400, giftcardId: "gc1" },
@@ -174,6 +175,22 @@ describe("Transaction-RecordPayment", () => {
 			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
 		});
 
+		test("rejects a revoked card that no longer carries an events link", async () => {
+			// P2-5. `giftcards.events` is onDelete:setNull, so deleting an Event
+			// strips the link off its vouchers -- and with the revocation check
+			// inside the voucher branch, that un-revoked every one of them. Live
+			// today, no giftcard row has an events link at all.
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockResolvedValueOnce({ balance: 2000, active: false });
+
+			const result = await handler(voucherCtx());
+
+			expect(result.statusCode).toBe(400);
+			expect(result.body.error).toMatch(/deactivated/i);
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
 		test("rejects a voucher leg when a discount is applied to the sale", async () => {
 			mockDatabases.getDocument
 				.mockResolvedValueOnce(baseTransaction({ discount: 200 }))
@@ -214,7 +231,8 @@ describe("Transaction-RecordPayment", () => {
 		test("accepts a voucher leg when active, matching event, and no discount", async () => {
 			mockDatabases.getDocument
 				.mockResolvedValueOnce(baseTransaction())
-				.mockResolvedValueOnce({ balance: 2000, events: "event1", active: true });
+				.mockResolvedValueOnce({ balance: 2000, events: "event1", active: true })
+				.mockResolvedValueOnce(baseTransaction()); // pre-commit re-read (P2-4)
 			mockCollectionReads({ events: [{ $id: "event1" }] });
 			mockDatabases.updateDocument.mockResolvedValue({});
 
@@ -228,7 +246,8 @@ describe("Transaction-RecordPayment", () => {
 		test("a standing giftcard (no events link) is unaffected by the discount rule", async () => {
 			mockDatabases.getDocument
 				.mockResolvedValueOnce(baseTransaction({ discount: 500 }))
-				.mockResolvedValueOnce({ balance: 2000 }); // no `events`, no `active` -- a standard giftcard
+				.mockResolvedValueOnce({ balance: 2000 }) // no `events`, no `active` -- a standard giftcard
+				.mockResolvedValueOnce(baseTransaction({ discount: 500 })); // pre-commit re-read (P2-4)
 			mockCollectionReads({ discounts: [{ type: "cents", amount: 500 }] });
 			mockDatabases.updateDocument.mockResolvedValue({});
 
@@ -831,7 +850,8 @@ describe("Transaction-RecordPayment", () => {
 			const debitThenFailTheLegWrite = () => {
 				mockDatabases.getDocument
 					.mockResolvedValueOnce(baseTransaction()) // transaction
-					.mockResolvedValueOnce({ balance: 5000 }); // giftcard, pre-debit
+					.mockResolvedValueOnce({ balance: 5000 }) // giftcard, pre-debit
+					.mockResolvedValueOnce(baseTransaction()); // pre-commit re-read (P2-4)
 				mockDatabases.updateDocument
 					.mockResolvedValueOnce({}) // the debit itself succeeds
 					.mockRejectedValueOnce(new Error("db down")); // the leg write does not
@@ -1298,7 +1318,8 @@ describe("Transaction-RecordPayment", () => {
 			// get reported (and refunded) as cash by the legacy leg derivation.
 			mockDatabases.getDocument
 				.mockResolvedValueOnce(baseTransaction())
-				.mockResolvedValueOnce({ balance: 5000 });
+				.mockResolvedValueOnce({ balance: 5000 })
+				.mockResolvedValueOnce(baseTransaction()); // pre-commit re-read (P2-4)
 			mockDatabases.updateDocument.mockResolvedValue({});
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "giftcard", amount: 400, giftcardId: "gc1" },
@@ -1311,15 +1332,16 @@ describe("Transaction-RecordPayment", () => {
 		});
 
 		test("a second giftcard leg adds to the recorded giftcard_amount", async () => {
+			const partlyPaid = () =>
+				baseTransaction({
+					payment_due: 600,
+					giftcard_amount: 400,
+					payments: JSON.stringify([{ method: "giftcard", amount: 400, giftcardId: "gc1" }]),
+				});
 			mockDatabases.getDocument
-				.mockResolvedValueOnce(
-					baseTransaction({
-						payment_due: 600,
-						giftcard_amount: 400,
-						payments: JSON.stringify([{ method: "giftcard", amount: 400, giftcardId: "gc1" }]),
-					}),
-				)
-				.mockResolvedValueOnce({ balance: 5000 });
+				.mockResolvedValueOnce(partlyPaid())
+				.mockResolvedValueOnce({ balance: 5000 })
+				.mockResolvedValueOnce(partlyPaid()); // pre-commit re-read (P2-4)
 			mockDatabases.updateDocument.mockResolvedValue({});
 			const ctx = makeContext({
 				body: { transactionId: "t1", method: "giftcard", amount: 600, giftcardId: "gc2" },
@@ -1340,6 +1362,165 @@ describe("Transaction-RecordPayment", () => {
 
 			const [, , , data] = mockDatabases.updateDocument.mock.calls[0];
 			expect(data).not.toHaveProperty("giftcard_amount");
+		});
+	});
+
+	// P2-4. The transaction is read once at the top of the handler, and up to
+	// three network round-trips happen before the write (the Stripe retrieve, the
+	// reuse query, the giftcard debit). The write is a read-modify-write of the
+	// `payments` blob plus a `status`, so anything that touched the row in that
+	// window used to be silently erased. These cover the pre-commit re-read:
+	// the first getDocument is the opening snapshot, the LAST one is the state
+	// the row is actually in by the time the leg is committed.
+	describe("a row that changed while the leg was in flight", () => {
+		const transactionWrite = () => mockDatabases.updateDocument.mock.calls.find((c) => c[2] === "t1");
+
+		test("a leg recorded concurrently does not lose the other execution's leg", async () => {
+			// The lost update itself: this execution opened on an unpaid sale, a
+			// concurrent one recorded 300 of it, and the 700 leg committed here has
+			// to land on top of that 300 -- not replace it.
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockResolvedValueOnce(
+					baseTransaction({
+						payment_due: 700,
+						payments: JSON.stringify([{ method: "cash", amount: 300, legId: "leg-other" }]),
+					}),
+				);
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: { transactionId: "t1", method: "cash", amount: 700, legId: "leg-mine" } });
+
+			const result = await handler(ctx);
+
+			expect(JSON.parse(transactionWrite()[3].payments)).toEqual([
+				{ method: "cash", amount: 300, legId: "leg-other" },
+				{ method: "cash", amount: 700, legId: "leg-mine" },
+			]);
+			expect(transactionWrite()[3].payment_due).toBe(0);
+			expect(transactionWrite()[3].status).toBe("complete");
+			expect(transactionWrite()[3].payment_method).toBe("split");
+			expect(result.body).toEqual({ ok: true, remaining: 0, status: "complete" });
+		});
+
+		test("this same leg, recorded concurrently, is not appended a second time", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockResolvedValueOnce(
+					baseTransaction({
+						status: "complete",
+						payment_due: 0,
+						payments: JSON.stringify([{ method: "cash", amount: 1000, legId: "leg-mine" }]),
+					}),
+				);
+			const ctx = makeContext({ body: { transactionId: "t1", method: "cash", amount: 1000, legId: "leg-mine" } });
+
+			const result = await handler(ctx);
+
+			expect(result.body).toEqual({ ok: true, remaining: 0, status: "complete", replay: true });
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("a giftcard leg that lost that race has its debit credited back", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockResolvedValueOnce({ balance: 5000 }) // giftcard, pre-debit
+				.mockResolvedValueOnce(
+					baseTransaction({
+						payment_due: 600,
+						payments: JSON.stringify([{ method: "giftcard", amount: 400, giftcardId: "gc1", legId: "leg-mine" }]),
+					}),
+				)
+				.mockResolvedValueOnce({ balance: 4600 }); // giftcard, for the credit-back
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "giftcard", amount: 400, giftcardId: "gc1", legId: "leg-mine" },
+			});
+
+			const result = await handler(ctx);
+
+			expect(result.body.replay).toBe(true);
+			expect(transactionWrite()).toBeUndefined();
+			const giftcardWrites = mockDatabases.updateDocument.mock.calls.filter((c) => c[2] === "gc1");
+			expect(giftcardWrites.map((c) => c[3])).toEqual([{ balance: 4600 }, { balance: 5000 }]);
+		});
+
+		test("a cash leg is refused, not applied, when the sale was cancelled mid-payment", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockResolvedValueOnce(baseTransaction({ status: "cancelled" }));
+			const ctx = makeContext({ body: { transactionId: "t1", method: "cash", amount: 1000 } });
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(409);
+			expect(result.body.error).toMatch(/no longer pending \(status: cancelled\)/i);
+			expect(mockDatabases.updateDocument).not.toHaveBeenCalled();
+		});
+
+		test("a giftcard leg refused for the same reason gets its debit back", async () => {
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockResolvedValueOnce({ balance: 5000 })
+				.mockResolvedValueOnce(baseTransaction({ status: "cancelled" }))
+				.mockResolvedValueOnce({ balance: 4600 });
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "giftcard", amount: 400, giftcardId: "gc1" },
+			});
+
+			const result = await handler(ctx);
+
+			expect(result.statusCode).toBe(409);
+			expect(result.body.giftcardRestored).toBe(true);
+			expect(transactionWrite()).toBeUndefined();
+			const giftcardWrites = mockDatabases.updateDocument.mock.calls.filter((c) => c[2] === "gc1");
+			expect(giftcardWrites.map((c) => c[3])).toEqual([{ balance: 4600 }, { balance: 5000 }]);
+		});
+
+		test("a captured card leg is still recorded on a refunded sale, without resurrecting its status", async () => {
+			// The one leg that must never be refused here: Stripe has the money
+			// already. Record it so the row someone has to refund shows it, but
+			// leave `status`/`payment_due` exactly as the refund left them.
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockResolvedValueOnce(baseTransaction({ status: "refunded", payment_due: 0 }));
+			mockStripe.paymentIntents.retrieve.mockResolvedValue({
+				id: "pi_1",
+				status: "succeeded",
+				amount: 1000,
+				metadata: { transactionId: "t1" },
+			});
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({
+				body: { transactionId: "t1", method: "stripe", amount: 1000, paymentIntentId: "pi_1" },
+			});
+
+			const result = await handler(ctx);
+
+			const written = transactionWrite()[3];
+			expect(written).not.toHaveProperty("status");
+			expect(written).not.toHaveProperty("payment_due");
+			expect(JSON.parse(written.payments)).toEqual([
+				{ method: "stripe", amount: 1000, stripeId: "pi_1", tip: 0, statusAtRecord: "refunded" },
+			]);
+			expect(result.body.status).toBe("refunded");
+			expect(result.body.warning).toMatch(/needs a refund/i);
+		});
+
+		test("a re-read that fails still records the leg, from the snapshot already in hand", async () => {
+			// Refusing here would be the P0-1 failure all over again: this handler
+			// runs after the reader has captured.
+			mockDatabases.getDocument
+				.mockResolvedValueOnce(baseTransaction())
+				.mockRejectedValueOnce(new Error("db blip"));
+			mockDatabases.updateDocument.mockResolvedValue({});
+			const ctx = makeContext({ body: { transactionId: "t1", method: "cash", amount: 1000 } });
+
+			const result = await handler(ctx);
+
+			expect(result.body).toEqual({ ok: true, remaining: 0, status: "complete" });
+			expect(JSON.parse(transactionWrite()[3].payments)).toEqual([{ method: "cash", amount: 1000 }]);
+			expect(ctx.error).toHaveBeenCalledWith(expect.stringMatching(/pre-commit re-read did not answer/i));
 		});
 	});
 });

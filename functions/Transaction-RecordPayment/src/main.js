@@ -79,13 +79,7 @@ export default async ({ req, res, log, error }) => {
 		return res.json({ error: 'Transaction not found' }, 404);
 	}
 
-	let payments;
-	try {
-		payments = JSON.parse(transaction.payments || '[]');
-	} catch (err) {
-		payments = [];
-	}
-	if (!Array.isArray(payments)) payments = [];
+	let payments = parsePayments(transaction.payments);
 
 	// Replay protection. The client retries a leg whose response never arrived
 	// (an Appwrite execution that already committed its writes isn't cancelled
@@ -194,10 +188,24 @@ export default async ({ req, res, log, error }) => {
 		// actually applied: a voucher only works during its own event, and never alongside a
 		// discount.
 		const voucherEventId = giftcard.events?.$id || giftcard.events || null;
+
+		// Revocation is checked for EVERY giftcard row, not only the ones still
+		// carrying an `events` link (P2-5). `giftcards.events` is
+		// `onDelete: setNull`, so deleting an Event silently strips the link off
+		// its vouchers -- and with this check inside the voucher branch below,
+		// that single console action un-revoked every revoked voucher attached to
+		// it: `active: false`, a non-zero balance, no event link, and the card
+		// spends normally again. Live right now, all 38 giftcard rows have no
+		// `events` link at all, so as written the check could never run for any of
+		// them. Before the balance check and long before the debit.
+		if (giftcard.active === false) {
+			return res.json(
+				{ error: voucherEventId ? 'This voucher has been revoked' : 'This gift card has been deactivated' },
+				400,
+			);
+		}
+
 		if (voucherEventId) {
-			if (giftcard.active === false) {
-				return res.json({ error: 'This voucher has been revoked' }, 400);
-			}
 			if ((parseInt(transaction.discount) || 0) > 0) {
 				return res.json({ error: "DJ vouchers can't be combined with a discount" }, 400);
 			}
@@ -333,26 +341,134 @@ export default async ({ req, res, log, error }) => {
 	// wherever that sale is, not only in one function's execution log.
 	if (priceWarning) leg.priceWarning = priceWarning;
 
-	payments.push(leg);
+	// ---- Commit against a freshly-read row (P2-4) ---------------------------
+	//
+	// Everything above was decided from `transaction`, read at the top of this
+	// handler -- and up to three network round-trips have happened since (the
+	// Stripe retrieve, the reuse query, the giftcard debit). The write below is a
+	// read-modify-write of the `payments` blob plus an unconditional `status`, and
+	// Appwrite offers no conditional update here, so writing it from that stale
+	// snapshot is a plain lost update: a second RecordPayment overlapping via the
+	// client's auto-retry drops the other execution's leg (while the money it
+	// moved is already gone), and a Transaction-SetStatus cancel or a
+	// Stripe-RefundPayment that landed in the window is silently undone --
+	// `cancelled` comes back as `complete`.
+	//
+	// So re-read the row now and commit against THAT. It does not make the write
+	// atomic (nothing available in this runtime does), but it narrows the window
+	// from "three network calls wide" to "one call wide", and `status` is no
+	// longer ever written from a snapshot taken before a Stripe round-trip.
+	let current = transaction;
+	let reReadFailed = false;
+	try {
+		const fresh = await databases.getDocument(DATABASE_ID, TRANSACTIONS_COLLECTION_ID, transactionId);
+		if (fresh) {
+			current = fresh;
+		} else {
+			reReadFailed = true;
+		}
+	} catch (err) {
+		reReadFailed = true;
+		error(`Failed to re-read ${transactionId} before committing the leg: ` + err.message);
+	}
+	if (reReadFailed) {
+		// Deliberately NOT a refusal. This function runs after the reader has
+		// captured, so a leg carrying money that is already gone must still be
+		// written down even when the concurrency check cannot run -- refusing here
+		// is exactly the failure this file exists to prevent. Fall back to the
+		// snapshot already in hand (the pre-P2-4 behaviour) and say so out loud.
+		error(
+			`Committing ${transactionId} from the original snapshot -- the pre-commit re-read did not answer, so a concurrent write cannot be detected.`,
+		);
+	}
+
+	const basePayments = reReadFailed ? payments : parsePayments(current.payments);
+
+	// Another execution of this same leg won the race while this one was in
+	// flight. Appending ours would record the same money twice -- and if this
+	// execution debited a giftcard, that debit is now the duplicate, so put it
+	// back. (The same-leg checks near the top of this handler ran against a
+	// snapshot taken before all of the above, so they cannot see this.)
+	const duplicate = basePayments.some(
+		(recorded) => recorded && ((legId && recorded.legId === legId) || (leg.stripeId && recorded.stripeId === leg.stripeId)),
+	);
+	if (duplicate) {
+		error(
+			`Leg ${legId || leg.stripeId} was recorded on ${transactionId} by a concurrent execution -- returning that state instead of appending it twice.`,
+		);
+		const restored =
+			method === 'giftcard'
+				? await creditBackGiftcardDebit(databases, leg.giftcardId, amount, transactionId, 'the same leg was already recorded concurrently', log, error)
+				: true;
+		return res.json({
+			ok: true,
+			remaining: parseInt(current.payment_due) || 0,
+			status: current.status,
+			replay: true,
+			...(restored ? {} : { manualCredit: { giftcardId: leg.giftcardId, amount } }),
+		});
+	}
+
+	// The row stopped being payable while this leg was in flight -- a cancel, a
+	// refund, or another leg that finished the sale. The old code overwrote
+	// `status` regardless, which is how a cancelled sale came back as `complete`.
+	const conflicted = current.status !== 'pending';
+	if (conflicted) {
+		if (method !== 'stripe') {
+			// Nothing irreversible has happened for these: cash is still in the
+			// drawer, and the giftcard debit is this function's own to undo.
+			const restored =
+				method === 'giftcard'
+					? await creditBackGiftcardDebit(databases, leg.giftcardId, amount, transactionId, `the transaction became ${current.status} mid-payment`, log, error)
+					: true;
+			error(`Refusing to record a ${method} leg on ${transactionId}: it became ${current.status} while this leg was in flight.`);
+			return res.json(
+				{
+					error: `This sale is no longer pending (status: ${current.status}) -- the payment was not applied.`,
+					...(method === 'giftcard' ? { giftcardRestored: restored } : {}),
+					...(restored ? {} : { manualCredit: { giftcardId: leg.giftcardId, amount } }),
+				},
+				409,
+			);
+		}
+		// A card leg, on the other hand, is money Stripe has already captured.
+		// Record it -- without touching `status` or `payment_due` -- so it is
+		// visible on the row somebody now has to refund, rather than existing only
+		// in Stripe. Stamped onto the leg for the same reason `priceWarning` is.
+		leg.statusAtRecord = current.status;
+		error(
+			`Recording a captured card leg on ${transactionId} even though it is ${current.status}: the charge cannot be un-captured from here and must not be left off the record.`,
+		);
+	}
+
+	const finalPayments = basePayments.concat([leg]);
 
 	// The transaction is only finished once BOTH ledgers are satisfied: what
 	// the document says is outstanding, and what the cart is actually worth
 	// server-side. A forged `payment_due` therefore no longer buys a
-	// `complete` sale -- the remainder stays visible as payment_due.
-	const newPaymentDue = Math.max(Math.max(storedDue - amount, 0), Math.max(pricing.total - alreadyPaid - amount, 0));
+	// `complete` sale -- the remainder stays visible as payment_due. Both halves
+	// are now taken from the re-read row, never from the opening snapshot.
+	const committedDue = reReadFailed ? storedDue : parseInt(current.payment_due) || 0;
+	const committedPaid = reReadFailed
+		? alreadyPaid
+		: basePayments.reduce((sum, recorded) => sum + (parseInt(recorded && recorded.amount) || 0), 0);
+	const newPaymentDue = Math.max(Math.max(committedDue - amount, 0), Math.max(pricing.total - committedPaid - amount, 0));
 	const newStatus = newPaymentDue <= 0 ? 'complete' : 'pending';
+	// What this execution actually leaves the row at: on the conflicted card path
+	// above it leaves `status` alone, so the answer is whatever it already was.
+	const committedStatus = conflicted ? current.status : newStatus;
+	const committedRemaining = conflicted ? parseInt(current.payment_due) || 0 : newPaymentDue;
 	// Only one leg so far -> keep the legacy single-method label for
 	// backward-compatible display; more than one -> "split". Purely
 	// cosmetic (the real breakdown lives in `payments`).
-	const newPaymentMethod = payments.length > 1 ? 'split' : method;
+	const newPaymentMethod = finalPayments.length > 1 ? 'split' : method;
 
 	try {
 		await databases.updateDocument(DATABASE_ID, TRANSACTIONS_COLLECTION_ID, transactionId, {
-			payments: JSON.stringify(payments),
-			payment_due: newPaymentDue,
-			status: newStatus,
+			payments: JSON.stringify(finalPayments),
+			...(conflicted ? {} : { payment_due: newPaymentDue, status: newStatus }),
 			payment_method: newPaymentMethod,
-			tip: (parseInt(transaction.tip) || 0) + tipDelta,
+			tip: (parseInt(current.tip) || 0) + tipDelta,
 			// Kept in sync (not just appended into `payments`) so the reuse-guard
 			// Query.equal lookup above can find this leg from a future request.
 			...(method === 'stripe' ? { stripe_id: leg.stripeId } : {}),
@@ -365,7 +481,7 @@ export default async ({ req, res, log, error }) => {
 			// leaving the column silently wrong for new rows is what created
 			// the problem in the first place.
 			...(method === 'giftcard'
-				? { giftcard_amount: (parseInt(transaction.giftcard_amount) || 0) + amount }
+				? { giftcard_amount: (parseInt(current.giftcard_amount) || 0) + amount }
 				: {}),
 		});
 	} catch (err) {
@@ -378,31 +494,28 @@ export default async ({ req, res, log, error }) => {
 		// fails, say so in terms someone can act on rather than returning a bare
 		// "Failed to update transaction" over a customer's missing money (P0-13).
 		if (method === 'giftcard') {
-			try {
-				const current = await databases.getDocument(DATABASE_ID, GIFTCARDS_COLLECTION_ID, leg.giftcardId);
-				await databases.updateDocument(DATABASE_ID, GIFTCARDS_COLLECTION_ID, leg.giftcardId, {
-					balance: (parseInt(current.balance) || 0) + amount,
-				});
-				log(`Credited ${amount} back to giftcard ${leg.giftcardId} after the leg write failed`);
-				return res.json({ error: 'Failed to update transaction', giftcardRestored: true }, 500);
-			} catch (creditErr) {
-				error(
-					`ORPHANED GIFTCARD DEBIT -- giftcard ${leg.giftcardId} was debited ${amount} for transaction ${transactionId}, the leg could not be recorded, and the credit-back also failed (${creditErr.message}). This balance must be restored by hand.`,
-				);
-				return res.json(
-					{
-						error: 'Failed to update transaction',
-						giftcardRestored: false,
-						manualCredit: { giftcardId: leg.giftcardId, amount },
-					},
-					500,
-				);
-			}
+			const restored = await creditBackGiftcardDebit(
+				databases,
+				leg.giftcardId,
+				amount,
+				transactionId,
+				'the leg write failed',
+				log,
+				error,
+			);
+			return res.json(
+				{
+					error: 'Failed to update transaction',
+					giftcardRestored: restored,
+					...(restored ? {} : { manualCredit: { giftcardId: leg.giftcardId, amount } }),
+				},
+				500,
+			);
 		}
 		return res.json({ error: 'Failed to update transaction' }, 500);
 	}
 
-	log(`Recorded ${method} leg of ${amount} on ${transactionId}: ${newPaymentDue} remaining, status ${newStatus}`);
+	log(`Recorded ${method} leg of ${amount} on ${transactionId}: ${committedRemaining} remaining, status ${committedStatus}`);
 
 	// A completed membership-dues payment automatically notifies finance --
 	// this fires as a direct consequence of the payment completing here,
@@ -410,7 +523,7 @@ export default async ({ req, res, log, error }) => {
 	// kiosk loses connectivity right after the card is charged. Never
 	// fatal: the payment already succeeded and must not be reported as
 	// failed, or rolled back, over a notification issue.
-	if (transaction.channel === 'membership' && newStatus === 'complete') {
+	if (transaction.channel === 'membership' && committedStatus === 'complete' && !conflicted) {
 		try {
 			// Same testing-flag switch already used for the Stripe key above --
 			// a testing:true transaction (self-checkout is always run this way
@@ -437,13 +550,51 @@ export default async ({ req, res, log, error }) => {
 	// outstanding -- never a silent rejection of money that was taken.
 	return res.json({
 		ok: true,
-		remaining: newPaymentDue,
-		status: newStatus,
+		remaining: committedRemaining,
+		status: committedStatus,
 		...(priceWarning
 			? { warning: `Recorded, but this sale could not be fully verified server-side: ${priceWarning}` }
-			: {}),
+			: conflicted
+				? {
+						warning: `Recorded, but this sale had already become ${current.status} -- this card charge needs a refund, not a completion.`,
+					}
+				: {}),
 	});
 };
+
+// Parses the `payments` blob defensively: it is a JSON string column, so a row
+// written by something older (or by hand) must degrade to "no legs recorded"
+// rather than throwing on the money path.
+function parsePayments(raw) {
+	let parsed;
+	try {
+		parsed = JSON.parse(raw || '[]');
+	} catch (err) {
+		parsed = [];
+	}
+	return Array.isArray(parsed) ? parsed : [];
+}
+
+// Undoes this execution's own giftcard debit. Used wherever the leg that debit
+// was for does not end up on the transaction -- the leg write failing, or the
+// pre-commit re-read showing the row was cancelled or already carries this leg.
+// Returns whether the money actually made it back; a false here is a human's
+// problem, so it is logged in those terms.
+async function creditBackGiftcardDebit(databases, giftcardId, amount, transactionId, reason, log, error) {
+	try {
+		const giftcard = await databases.getDocument(DATABASE_ID, GIFTCARDS_COLLECTION_ID, giftcardId);
+		await databases.updateDocument(DATABASE_ID, GIFTCARDS_COLLECTION_ID, giftcardId, {
+			balance: (parseInt(giftcard.balance) || 0) + amount,
+		});
+		log(`Credited ${amount} back to giftcard ${giftcardId} after ${reason}`);
+		return true;
+	} catch (creditErr) {
+		error(
+			`ORPHANED GIFTCARD DEBIT -- giftcard ${giftcardId} was debited ${amount} for transaction ${transactionId}, ${reason}, and the credit-back also failed (${creditErr.message}). This balance must be restored by hand.`,
+		);
+		return false;
+	}
+}
 
 // Resolves what this transaction is actually worth, server-side. Never throws:
 // a pos_items/discounts collection this function cannot read is reported as an

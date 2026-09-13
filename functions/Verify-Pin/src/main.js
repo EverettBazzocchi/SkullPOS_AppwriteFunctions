@@ -93,6 +93,17 @@ async function loadRateLimitState(databases, databaseId, docId, error) {
 // limiter ran for its entire life persisting nothing at all: `justLocked` was passed straight
 // through as a document attribute, `rate_limits` has no such attribute, and Appwrite 400'd every
 // single write (P0-4a). Only `toPersistedState`'s three attributes are ever sent now.
+//
+// KNOWN GAP (P2-16): this is still a read-modify-write, not an atomic increment, so a burst of
+// concurrent executions all read the same `attempts` and all write back the same successor -- the
+// persisted counter climbs by one no matter how wide the burst. The server side of the fix exists
+// (this instance runs Appwrite 1.9.0, which serves
+// `PATCH .../documents/{id}/{attribute}/increment`), but reaching it from here needs
+// `Databases.incrementDocumentAttribute`, which arrived in node-appwrite 17 -- this function pins
+// ^14.1.0 and runs on the node-16.0 runtime, and node-appwrite 17+ needs Node 18+. So closing this
+// is a runtime bump plus an SDK major, not an edit to this file. quick-access-login, which talks
+// raw HTTP and so is not bound by the SDK version, calls that endpoint directly today; see
+// `recordFailureForBucket` there for the shape this should take once the runtime moves.
 async function saveRateLimitState(databases, databaseId, docId, existed, state, error) {
     const data = toPersistedState(state);
     try {
@@ -281,13 +292,24 @@ export default async ({ req, res, log, error }) => {
         }
 
         if (!isWithinAnyEventWindow(bartender.events)) {
-            // Deliberately NOT a failed attempt: the credential itself was correct, it was just
-            // presented outside its shift. A bartender who arrives early and taps their own real
-            // PIN five times used to burn the whole budget and lock out every other device sharing
-            // the venue's egress (P1-14). This branch is only reachable by someone who already
-            // holds a valid bartender PIN, so it is not a free-guess path.
-            log(`Bartender pin for ${bartender.name} rejected -- outside its event's 1-hour window (no failed attempt recorded)`);
-            return res.json({ ok: false, error: "This pin is only valid within 1 hour of your event's start time" });
+            // The response body here is deliberately IDENTICAL, byte for byte, to the no-match
+            // response above. It used to read "This pin is only valid within 1 hour of your event's
+            // start time", which made this endpoint a PIN-existence oracle (P2-13): walk the
+            // 10,000-code space at any hour, get that message back on exactly one code, and you
+            // have positively identified a live bartender PIN to replay at the venue's next
+            // advertised event -- reducing the window check, the only extra protection a bartender
+            // PIN has, to a scheduling inconvenience. The human-readable reason now exists only in
+            // the execution log, where support can read it and a caller cannot.
+            //
+            // Still deliberately NOT counted as a failed attempt: the credential was correct, just
+            // presented outside its shift, and a bartender who arrives early and taps her own real
+            // PIN five times must not burn the budget for every other device sharing the venue's
+            // egress (P1-14). That leaves a far weaker residual side-channel -- this one code costs
+            // the caller no budget -- but reading it means running a full 15-minute lockout cycle
+            // per batch and spotting an off-by-one in the remaining allowance, instead of getting
+            // the answer from a single response.
+            log(`Bartender pin for ${bartender.name} rejected -- outside its event's window (answered as a plain no-match; no failed attempt recorded)`);
+            return res.json({ ok: false });
         }
 
         resolved = { label: bartender.name || null, selfCheckout: false, bartenderId: bartender.$id };

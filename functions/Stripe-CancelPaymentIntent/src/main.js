@@ -4,15 +4,63 @@ import Stripe from 'stripe';
 // sitting on the reader's screen. Called by POS/src/utils/stripe.js's
 // handleCancelStripePayment when the cashier backs out of a charge.
 //
-// Same test/live request shape as the other three Stripe functions
-// (SkullPOS sends `{ test: "test" }` or omits it; the isLive/environment
-// spelling is accepted too so a Ticketing-shaped caller doesn't need a
-// separate function).
-function resolveIsLive(body) {
-	if ('isLive' in body || 'environment' in body) {
-		return body.isLive === true || body.environment === 'live';
+// The live/test decision. Stripe-CreatePaymentIntent carries this function
+// character-for-character, and its test file carries the identical table of
+// cases -- change one, change both.
+//
+// NOT YET ADOPTED by stripe-getConnectionToken or Stripe-RefundPayment, which
+// still carry their own older spellings. The refund one is the urgent copy: it
+// resolves a mode-less body to TEST where this resolves it to LIVE, so a refund
+// that omits the flag asks the test account to refund a live PaymentIntent.
+//
+// Three accepted spellings of the same question, one answer:
+//   SkullPOS:        { test: "test" } -> test,  { test: "" } -> live
+//   ShottyTicketing: { isLive: true | false }
+//   either:          { environment: "live" | "test" }
+//
+// Everything else is an ERROR rather than a default (P2-19). These functions had
+// drifted into four near-copies of this logic that resolved the SAME body in
+// opposite directions, and the failure mode is the worst kind there is: the
+// wrong Stripe ACCOUNT moves the money. `isLive: "true"` (a string, e.g.
+// straight out of a query string or a form) and `environment: "production"` both
+// used to fall silently through to TEST while the caller plainly meant live, and
+// vice versa. Contradictions between two spellings in one body used to be
+// resolved by which `if` came first.
+//
+// Returns { isLive, source } or { error }.
+function resolveStripeMode(body) {
+	const signals = [];
+	if ('isLive' in body) {
+		if (typeof body.isLive !== 'boolean') {
+			return { error: `isLive must be true or false, not ${JSON.stringify(body.isLive)}` };
+		}
+		signals.push({ source: 'isLive', isLive: body.isLive });
 	}
-	return !(body.test && body.test === 'test');
+	if ('environment' in body) {
+		if (body.environment !== 'live' && body.environment !== 'test') {
+			return { error: `environment must be "live" or "test", not ${JSON.stringify(body.environment)}` };
+		}
+		signals.push({ source: 'environment', isLive: body.environment === 'live' });
+	}
+	if ('test' in body) {
+		if (typeof body.test !== 'string') {
+			return { error: `test must be "test" (test mode) or "" (live mode), not ${JSON.stringify(body.test)}` };
+		}
+		// "test" means test mode; anything else (POS sends "") means live.
+		signals.push({ source: 'test', isLive: body.test !== 'test' });
+	}
+	// No signal at all is reported as such -- `isLive: null` -- rather than being
+	// answered with a default, because the right answer differs by operation and
+	// belongs at the call site: see the note where this is called.
+	if (signals.length === 0) {
+		return { isLive: null, source: null };
+	}
+	if (signals.some((signal) => signal.isLive !== signals[0].isLive)) {
+		return {
+			error: `Contradictory Stripe mode: ${signals.map((s) => `${s.source} says ${s.isLive ? 'live' : 'test'}`).join(', ')}`,
+		};
+	}
+	return { isLive: signals[0].isLive, source: signals.map((signal) => signal.source).join('+') };
 }
 
 // ShottyTicketing generates synthetic `pi_tkt_...` ids for card_present
@@ -49,9 +97,27 @@ export default async ({ req, res, log, error }) => {
 		return res.json({ error: msg }, 400);
 	}
 
-	const isLive = resolveIsLive(body);
+	// A MALFORMED mode is refused (a typo'd `environment: "production"` must not
+	// quietly become "test"), but an ABSENT one still defaults to live here rather
+	// than 400ing, unlike Stripe-CreatePaymentIntent. The asymmetry is deliberate
+	// and it is not a re-run of the drift this converged: Create refuses an unnamed
+	// mode, so no intent can exist whose account was ever guessed -- there is
+	// nothing left here to guess ABOUT. And on this path refusing is the strictly
+	// worse failure, the same argument the ownership check below makes: the
+	// alternative to cancelling an uncaptured intent is leaving it live on the
+	// reader with the cashier unable to back out. So default, and say so loudly.
+	const resolved = resolveStripeMode(body);
+	if (resolved.error) {
+		error(`Refusing to cancel a payment intent: ${resolved.error}`);
+		return res.json({ error: resolved.error }, 400);
+	}
+	const isLive = resolved.isLive === null ? true : resolved.isLive;
 	const mode = isLive ? 'live' : 'test';
-	log(isLive ? 'production key used' : 'test key used');
+	if (resolved.source) {
+		log(`${mode} key used (from ${resolved.source})`);
+	} else {
+		error(`Cancel request for ${intentId} named no Stripe mode -- defaulting to LIVE. The caller should send test/isLive/environment.`);
+	}
 	const key = isLive ? process.env.prodKey : process.env.testKey;
 	if (!key) {
 		error(`No Stripe key configured for ${mode} mode (${isLive ? 'prodKey' : 'testKey'} is unset).`);

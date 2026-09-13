@@ -21,9 +21,11 @@
  * Failed attempts are throttled and persisted in the 'rate_limits' collection, since a short PIN
  * on a public endpoint is otherwise brute-forceable. Two buckets are counted per attempt (see
  * rateLimitBuckets): a small per-caller budget, and a much larger per-IP backstop keyed on the
- * *trusted* (rightmost) forwarding element. A failed attempt that cannot be persisted refuses the
- * login rather than answering it, since an attempt that isn't counted is an attempt that doesn't
- * exist.
+ * *trusted* (rightmost) forwarding element. The counter itself is advanced server-side via
+ * Appwrite's attribute-increment route (see recordFailureForBucket), so a concurrent burst persists
+ * as N attempts rather than collapsing to one. A failed attempt that cannot be persisted refuses
+ * the login rather than answering it, since an attempt that isn't counted is an attempt that
+ * doesn't exist.
  *
  * Ported from ShottyTicketing's own standalone project, now that it shares SkullPOS's Appwrite
  * project: DB_ID points at the shared database's 'rate_limits'/'pins' collections, and
@@ -50,6 +52,8 @@ const {
   toPersistedState,
   MAX_ATTEMPTS,
   IP_MAX_ATTEMPTS,
+  WINDOW_MS,
+  LOCKOUT_MS,
 } = require('./_shared/rateLimit');
 
 // This self-hosted instance's function-execution sandbox can't resolve its own public
@@ -250,6 +254,119 @@ async function saveRateLimitState(endpoint, headers, docId, existed, state, log,
   }
 }
 
+// An Appwrite older than 1.7 has no `.../{attribute}/increment` route at all; these are the
+// statuses that mean "no such route" rather than "the write was rejected". Anything else from the
+// increment is a genuine write failure and fails closed like any other.
+const INCREMENT_UNSUPPORTED_STATUSES = [404, 405, 501];
+
+/**
+ * Records one failed attempt against one bucket and reports whether the counter actually moved.
+ *
+ * The counter increment is done SERVER-side (`PATCH .../documents/{id}/attempts/increment`, served
+ * by Appwrite 1.7+; this instance runs 1.9.0) rather than as a read-modify-write. The old shape --
+ * read `attempts`, add one in JS, write the successor back -- had no conditional write and no
+ * version check, so a burst of concurrent executions all read the same value and all wrote the same
+ * successor: fire 200 requests in parallel with 200 candidate PINs and every one of them reads
+ * `attempts: 0`, passes the lockout check, tries its PIN, and writes back `attempts: 1`. Repeat and
+ * the whole 4-digit space falls while the persisted counter never exceeds 1, no matter how the
+ * bucket key is derived (P2-16). With a server-side increment, N concurrent failures persist as N.
+ *
+ * Two paths are still plain writes, because there is nothing to add to yet:
+ *   - no row for this bucket -- create the opening counter. A concurrent creator wins the 409 and
+ *     this attempt hands off to the increment instead of clobbering theirs with its own `1`.
+ *   - the 15-minute window has aged out -- the counter starts over. Reachable at most once per
+ *     window per bucket, so the race it leaves is bounded to a window rollover instead of being
+ *     the steady state.
+ *
+ * @returns {Promise<{persisted: boolean, lockedUntil: string|null}>} `persisted: false` means the
+ *   attempt left no trace, which the caller turns into a refusal (fail closed).
+ */
+async function recordFailureForBucket(endpoint, headers, bucket, now, log, error) {
+  const collectionPath = `${endpoint}/databases/${DB_ID}/collections/${RATE_LIMIT_COLLECTION}/documents`;
+  const report = (message) => {
+    if (error) error(message);
+    else if (log) log(message);
+  };
+
+  const openingState = () => ({ attempts: 1, windowStart: new Date(now).toISOString(), lockedUntil: null });
+
+  if (!bucket.state) {
+    let created;
+    try {
+      created = await httpRequest(collectionPath, 'POST', headers, {
+        documentId: bucket.id,
+        data: toPersistedState(openingState()),
+      });
+    } catch (err) {
+      report(`RATE-LIMIT-WRITE-FAILED doc=${bucket.id} via ${endpoint}: ${err.message}`);
+      return { persisted: false, lockedUntil: null };
+    }
+    if (created.ok) return { persisted: true, lockedUntil: null };
+    if (created.status !== 409) {
+      report(
+        `RATE-LIMIT-WRITE-FAILED doc=${bucket.id} via ${endpoint} [HTTP ${created.status}] ` +
+          (typeof created.data === 'string' ? created.data : JSON.stringify(created.data))
+      );
+      return { persisted: false, lockedUntil: null };
+    }
+    // 409: another execution opened this bucket between our read and our write. Count against
+    // theirs rather than replacing it.
+  } else {
+    const windowStartMs = Date.parse(bucket.state.windowStart);
+    const windowIsLive = !isNaN(windowStartMs) && now - windowStartMs <= WINDOW_MS;
+    if (!windowIsLive) {
+      const persisted = await saveRateLimitState(endpoint, headers, bucket.id, true, openingState(), log, error);
+      return { persisted, lockedUntil: null };
+    }
+  }
+
+  let incremented;
+  try {
+    incremented = await httpRequest(`${collectionPath}/${bucket.id}/attempts/increment`, 'PATCH', headers, { value: 1 });
+  } catch (err) {
+    report(`RATE-LIMIT-INCREMENT-FAILED doc=${bucket.id} via ${endpoint}: ${err.message}`);
+    return { persisted: false, lockedUntil: null };
+  }
+
+  if (!incremented.ok) {
+    if (INCREMENT_UNSUPPORTED_STATUSES.includes(incremented.status)) {
+      // Server predates the increment route. Fall back to the old read-modify-write so the limiter
+      // still counts (racily) instead of failing the endpoint closed on every wrong PIN.
+      if (log) log(`Rate-limit increment unsupported (HTTP ${incremented.status}); falling back to read-modify-write.`);
+      const next = recordFailedAttempt(bucket.state, now, bucket.max);
+      const persisted = await saveRateLimitState(endpoint, headers, bucket.id, !!bucket.state, next, log, error);
+      return { persisted, lockedUntil: persisted && next.justLocked ? next.lockedUntil : null };
+    }
+    report(
+      `RATE-LIMIT-INCREMENT-FAILED doc=${bucket.id} via ${endpoint} [HTTP ${incremented.status}] ` +
+        (typeof incremented.data === 'string' ? incremented.data : JSON.stringify(incremented.data))
+    );
+    return { persisted: false, lockedUntil: null };
+  }
+
+  const attempts = Number(incremented.data && incremented.data.attempts);
+  if (!Number.isFinite(attempts)) {
+    // The write landed but we cannot read the resulting count, so we cannot tell whether this
+    // caller is now over the line. Treated as unrecorded rather than assumed safe.
+    report(`RATE-LIMIT-INCREMENT-FAILED doc=${bucket.id} via ${endpoint}: no attempts value in the response`);
+    return { persisted: false, lockedUntil: null };
+  }
+  if (attempts < bucket.max) return { persisted: true, lockedUntil: null };
+
+  const lockedUntil = new Date(now + LOCKOUT_MS).toISOString();
+  const windowStart = (bucket.state && bucket.state.windowStart) || new Date(now).toISOString();
+  const persisted = await saveRateLimitState(
+    endpoint,
+    headers,
+    bucket.id,
+    true,
+    { attempts, windowStart, lockedUntil },
+    log,
+    error
+  );
+  return { persisted, lockedUntil: persisted ? lockedUntil : null };
+}
+
 function encodeQuery(method, values, attribute) {
   return encodeURIComponent(JSON.stringify({ method, attribute, values }));
 }
@@ -375,18 +492,16 @@ module.exports = async function (context) {
 
     if (rateLimitLookup) {
       for (const bucket of buckets) {
-        const nextState = recordFailedAttempt(bucket.state, now, bucket.max);
-        const persisted = await saveRateLimitState(
+        const { persisted, lockedUntil } = await recordFailureForBucket(
           rateLimitLookup.endpoint,
           rateLimitLookup.headers,
-          bucket.id,
-          !!bucket.state,
-          nextState,
+          bucket,
+          now,
           log,
           error
         );
         persistedAll = persistedAll && persisted;
-        if (persisted && nextState.justLocked && !locked) locked = nextState;
+        if (lockedUntil && !locked) locked = { lockedUntil };
       }
     }
 

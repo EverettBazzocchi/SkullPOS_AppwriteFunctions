@@ -109,6 +109,81 @@ describe("Sales-Report", () => {
 		);
 	});
 
+	describe("reconciling against the Stripe deposit", () => {
+		const start = "2026-01-01T00:00:00.000Z";
+		const end = "2026-01-02T00:00:00.000Z";
+
+		async function report(transactions) {
+			wireCollections({ transactionsByRangeStart: { [start]: transactions } });
+			mockUsers.listMemberships.mockResolvedValue({ memberships: [] });
+			const ctx = makeContext({
+				body: { startDate: start, endDate: end, test: true },
+				headers: { "x-appwrite-user-id": "u1" },
+			});
+			return (await handler(ctx)).body;
+		}
+
+		test("adds the reader tip to the card figure, since that is what Stripe actually deposited", async () => {
+			// A $7.50 cart with a $1.00 tip on the reader: Stripe captured 850 and deposited 850,
+			// but every figure the report had was tip-exclusive, so "Card $7.50" reconciled
+			// against nothing.
+			const body = await report([
+				{
+					cart: cartJson([{ name: "Beer", quantity: 1, price: 750, alcohol: true }]),
+					total: 750,
+					discount: 0,
+					tip: 100,
+					payments: JSON.stringify([{ method: "stripe", amount: 750, stripeId: "pi_1", tip: 100 }]),
+				},
+			]);
+
+			expect(body.cardAmount).toBe(750); // unchanged: cart revenue, what the categories sum to
+			expect(body.cardAmountInclTips).toBe(850);
+			expect(body.amountPaidInclTips).toBe(850);
+			expect(body.alcoholAmount).toBe(750);
+		});
+
+		test("counts only the tips on card legs toward the card figure, not a split sale's whole tip", async () => {
+			const body = await report([
+				{
+					cart: cartJson([{ name: "Round", quantity: 1, price: 2000, alcohol: true }]),
+					total: 2000,
+					discount: 0,
+					tip: 300,
+					payments: JSON.stringify([
+						{ method: "cash", amount: 1000 },
+						{ method: "stripe", amount: 1000, stripeId: "pi_2", tip: 300 },
+					]),
+				},
+			]);
+
+			expect(body.cardAmountInclTips).toBe(1300);
+			expect(body.cashAmount).toBe(1000);
+			expect(body.amountPaidInclTips).toBe(2300);
+		});
+
+		test("attributes a legacy row's transaction-level tip to its card leg", async () => {
+			// Pre-`payments` rows carry no per-leg tip -- only transaction.tip -- but the tip was
+			// still taken on the reader, so it is part of that row's deposit.
+			const body = await report([
+				{ cart: "[]", total: 1000, discount: 0, tip: 200, stripe_id: "pi_legacy", payment_due: 1000 },
+			]);
+
+			expect(body.cardAmount).toBe(1000);
+			expect(body.cardAmountInclTips).toBe(1200);
+		});
+
+		test("does not invent card revenue for a tip recorded on a sale that never touched a card", async () => {
+			const body = await report([
+				{ cart: "[]", total: 1000, discount: 0, tip: 200, payments: JSON.stringify([{ method: "cash", amount: 1000 }]) },
+			]);
+
+			expect(body.cardAmount).toBe(0);
+			expect(body.cardAmountInclTips).toBe(0);
+			expect(body.amountPaidInclTips).toBe(1200); // the cash tip still changed hands
+		});
+	});
+
 	test("clamps a non-admin caller's start date to 24h before the end date, ignoring what was requested", async () => {
 		const end = "2026-01-10T00:00:00.000Z";
 		const requestedStart = "2020-01-01T00:00:00.000Z"; // years back
