@@ -1,10 +1,3 @@
-import { installDnsPatch } from './_shared/dnsPatch.js';
-
-// This deployment's sandbox cannot resolve its own domain through getaddrinfo (EAI_AGAIN after
-// ~5s), which is the path Stripe's SDK and node-appwrite both use underneath. This function had NO
-// resolver workaround at all -- it is why a card sale could log its key selection and then hang for
-// the whole timeout without another line. Installed synchronously at import; it never blocks.
-installDnsPatch();
 /**
  * @file index.js
  * @description Appwrite Serverless Function: Quick Access Login
@@ -52,6 +45,13 @@ const https = require('https');
 const crypto = require('crypto');
 const dns = require('dns');
 const { getAppwriteEndpoints, needsHostOverride } = require('./_shared/appwriteEndpoints');
+
+// This deployment's sandbox cannot resolve its own domain through getaddrinfo (EAI_AGAIN after
+// ~5s) -- the path node-appwrite uses underneath. Installed synchronously; it never blocks, and
+// falls back to the original resolver per host. require(), not import: this function is
+// CommonJS (no "type": "module"), and an ESM import here is a hard 503 at load time.
+const { installDnsPatch } = require('./_shared/dnsPatch');
+installDnsPatch();
 const {
   checkLockout,
   recordFailedAttempt,

@@ -1,4 +1,4 @@
-import dns from 'dns';
+const dns = require('dns');
 
 /**
  * Makes hostname resolution survive this VPS's broken getaddrinfo path, WITHOUT ever blocking the
@@ -56,7 +56,7 @@ function resolveWithTimeout(host) {
 	});
 }
 
-export function installDnsPatch() {
+function installDnsPatch() {
 	if (installed) return;
 	installed = true;
 	const originalLookup = dns.lookup;
@@ -89,7 +89,10 @@ export function installDnsPatch() {
 }
 
 /** Test seam: forget everything learned, so a test can assert the resolve path rather than a cache hit. */
-export function __resetDnsPatchForTests() {
+function __resetDnsPatchForTests() {
 	cache.clear();
 	installed = false;
 }
+
+// CommonJS: this function has no "type": "module" and requires its dependencies.
+module.exports = { installDnsPatch, __resetDnsPatchForTests };
